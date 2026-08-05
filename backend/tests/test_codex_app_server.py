@@ -356,6 +356,39 @@ async def test_start_turn_requires_explicit_idle_before_model_turn(status_type):
 
 
 @pytest.mark.asyncio
+async def test_start_turn_allows_terminal_system_error_thread():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-system-error",
+                "status": {"type": "systemError"},
+            },
+        },
+        {"turn": {"id": "turn-after-error"}},
+    ])
+
+    process, thread_id = await server.start_turn(
+        prompt="retry after upstream recovery",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-system-error",
+        git_env=None,
+        task_id=90,
+    )
+
+    assert thread_id == "thread-system-error"
+    assert process.returncode is None
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "thread/resume",
+        "turn/start",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)

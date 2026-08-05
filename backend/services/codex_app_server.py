@@ -298,11 +298,16 @@ def _require_idle_thread_status(
     thread_id: str,
     operation: str,
 ) -> None:
-    """Require the v2 protocol's explicit idle proof for one native thread."""
+    """Require proof that one native thread has no turn still executing.
+
+    ``systemError`` is a terminal app-server status: its status manager only
+    publishes it after clearing the native running-turn fact.  A failed turn
+    may therefore be followed by a new turn just like an ``idle`` thread.
+    """
 
     status = thread.get("status") if isinstance(thread, dict) else None
     status_type = status.get("type") if isinstance(status, dict) else None
-    if status_type != "idle":
+    if status_type not in {"idle", "systemError"}:
         raise CodexThreadNotIdleError(
             thread_id,
             str(status_type or "unknown"),

@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class MonitorSessionCreate(BaseModel):
@@ -60,6 +60,25 @@ class MonitorCheckCreate(BaseModel):
 
 class MonitorCompleteRequest(BaseModel):
     reason: str
+    turn_generation: int | None = None
+
+
+class MonitorFailureRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+    turn_generation: int | None = None
+
+
+class MonitorRemoteReadRequest(BaseModel):
+    profile: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    operation: str = Field(min_length=1, max_length=40)
+    path: str | None = Field(default=None, max_length=1000)
+    job_id: str | None = Field(default=None, max_length=32)
+    tmux_session: str | None = Field(default=None, max_length=80)
+    lines: int = Field(default=100, ge=1, le=500)
     turn_generation: int | None = None
 
 

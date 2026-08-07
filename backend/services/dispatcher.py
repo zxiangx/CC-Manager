@@ -9774,20 +9774,29 @@ class GlobalDispatcher:
   报告状态。重要变化设 is_important=True
 - mark_complete / mcp__ccm_monitor_agent__mark_complete(reason):
   监控目标已经结束或无需继续监控时调用
+- report_failure / mcp__ccm_monitor_agent__report_failure(reason):
+  缺少必要权限、命令或读取能力，无法继续监控时调用并终止
+- read_remote_status / mcp__ccm_monitor_agent__read_remote_status(...):
+  通过 CCM 预配置的只读 SSH profile 检查远端。operation 支持 connection、
+  process_status、gpu_status、slurm_queue、slurm_job、log_tail、file_stat、
+  tmux_sessions、tmux_pane
 - get_context / mcp__ccm_monitor_agent__get_context(): 获取最新监控配置
 
 Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 必须使用对应工具，不要因为名称带前缀而声称工具不可用。
 
 ## 行为准则
-1. 用 Bash 执行 ps、tail、cat 等只读命令检查一次当前状态
+1. 本机状态可用 Bash 执行 ps、tail、cat 等只读命令；远端状态必须调用
+   read_remote_status，禁止直接运行 ssh、scp、sftp 或读取 SSH 私钥/config
 2. 如果目标仍需继续监控，调用一次 report_status
 3. 如果目标已经完成、失败或不再需要监控，改为调用一次 mark_complete
-4. report_status 与 mark_complete 二选一；成功调用后立即结束本回合
-5. 你是只读观察者，严禁修改文件、启动后台任务或改变系统状态
-6. 不要 sleep，不要等待 {interval} 秒；下一轮由 CCM Scheduler 定时启动
-7. 禁止使用 Agent、Task、Monitor、ScheduleWakeup 或 run_in_background
-8. 结束本回合前必须成功调用上述两个回调之一
+4. 如果必要的监控能力永久不可用，调用一次 report_failure；
+   read_remote_status 返回 session_ended 时不要再调用其他回调
+5. report_status、mark_complete 与 report_failure 三选一；成功调用后立即结束本回合
+6. 你是只读观察者，严禁修改文件、启动后台任务或改变系统状态
+7. 不要 sleep，不要等待 {interval} 秒；下一轮由 CCM Scheduler 定时启动
+8. 禁止使用 Agent、Task、Monitor、ScheduleWakeup 或 run_in_background
+9. 结束本回合前必须成功调用上述三个回调之一
 
 现在执行一次检查，完成回调后立即结束。""")
         return "\n".join(parts)

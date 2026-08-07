@@ -20,8 +20,14 @@ from backend.schemas.monitor_session import (
     MonitorCheckCreate,
     MonitorCheckResponse,
     MonitorCompleteRequest,
+    MonitorFailureRequest,
+    MonitorRemoteReadRequest,
 )
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.monitor_remote_read import (
+    MonitorRemoteReadError,
+    execute_monitor_remote_read,
+)
 
 router = APIRouter(prefix="/api/tasks/{task_id}/monitor-sessions", tags=["monitor"])
 
@@ -29,6 +35,9 @@ MAX_CONCURRENT_MONITORS = 5
 _monitor_admission_locks: WeakValueDictionary[int, asyncio.Lock] = (
     WeakValueDictionary()
 )
+_REMOTE_READ_CALL_LIMIT = 8
+_remote_read_calls: dict[int, tuple[int | None, int]] = {}
+_remote_read_calls_lock = asyncio.Lock()
 
 
 def _monitor_admission_lock(task_id: int) -> asyncio.Lock:
@@ -161,6 +170,122 @@ async def _monitor_callback_error(
     raise HTTPException(
         409,
         "Monitor turn generation is no longer active",
+    )
+
+
+async def _admit_monitor_remote_read(
+    db: AsyncSession,
+    task_id: int,
+    session_id: int,
+    turn_generation: int | None,
+) -> None:
+    """Fence and rate-limit one read without consuming the callback turn."""
+
+    active = await db.scalar(
+        select(MonitorSession.id).where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+            MonitorSession.remote_id.is_(None),
+            MonitorSession.status == "running",
+            _monitor_callback_generation_predicate(turn_generation),
+        )
+    )
+    if active is None:
+        await db.rollback()
+        await _monitor_callback_error(db, task_id, session_id)
+    await db.rollback()
+
+    async with _remote_read_calls_lock:
+        generation, count = _remote_read_calls.get(
+            session_id,
+            (turn_generation, 0),
+        )
+        if generation != turn_generation:
+            count = 0
+        if count >= _REMOTE_READ_CALL_LIMIT:
+            raise HTTPException(
+                429,
+                "Monitor remote-read call limit reached for this turn",
+            )
+        _remote_read_calls[session_id] = (turn_generation, count + 1)
+
+
+async def _terminalize_monitor_failure(
+    db: AsyncSession,
+    *,
+    task_id: int,
+    session_id: int,
+    turn_generation: int | None,
+    reason: str,
+) -> None:
+    """Persist one exact terminal failure and its final report."""
+
+    normalized_reason = reason.strip()[:2000]
+    failed = await db.execute(
+        update(MonitorSession)
+        .where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+            MonitorSession.status == "running",
+            _monitor_callback_generation_predicate(turn_generation),
+        )
+        .values(
+            status="failed",
+            completed_at=datetime.utcnow(),
+            last_summary=normalized_reason,
+            last_error=normalized_reason,
+            checks_done=MonitorSession.checks_done + 1,
+            active_turn_generation=None,
+            turn_started_at=None,
+            next_check_at=None,
+        )
+    )
+    if not failed.rowcount:
+        await db.rollback()
+        await _monitor_callback_error(db, task_id, session_id)
+    checks_done = await db.scalar(
+        select(MonitorSession.checks_done).where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+        )
+    )
+    db.add(MonitorCheck(
+        monitor_session_id=session_id,
+        check_number=checks_done,
+        status="failed",
+        summary=normalized_reason,
+    ))
+    await db.commit()
+
+    async with _remote_read_calls_lock:
+        _remote_read_calls.pop(session_id, None)
+
+    from backend.main import dispatcher
+
+    await dispatcher.broadcaster.broadcast(
+        f"task:{task_id}",
+        {
+            "event": "monitor_check",
+            "monitor_session_id": session_id,
+            "check_number": checks_done,
+            "status": "failed",
+            "summary": normalized_reason,
+            "is_important": True,
+            "chat_injected": False,
+            "source": "monitor",
+        },
+    )
+    await dispatcher.broadcaster.broadcast(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": session_id,
+            "status": "failed",
+        },
     )
 
 
@@ -792,3 +917,89 @@ async def complete_monitor_session(
         )
 
     return {"ok": True, "message": "Session completed. Your task is done — stop all activity now."}
+
+
+@router.post("/{session_id}/fail")
+async def fail_monitor_session(
+    task_id: int,
+    session_id: int,
+    body: MonitorFailureRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Allow an exact Monitor turn to report a permanent capability failure."""
+
+    require_internal_service(request)
+    await _terminalize_monitor_failure(
+        db,
+        task_id=task_id,
+        session_id=session_id,
+        turn_generation=body.turn_generation,
+        reason=body.reason,
+    )
+    return {"ok": True}
+
+
+@router.post("/{session_id}/remote-read")
+async def read_monitor_remote_status(
+    task_id: int,
+    session_id: int,
+    body: MonitorRemoteReadRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Execute one bounded structured read through a server-owned profile."""
+
+    require_internal_service(request)
+    await _admit_monitor_remote_read(
+        db,
+        task_id,
+        session_id,
+        body.turn_generation,
+    )
+    from backend.config import settings
+
+    try:
+        result = await execute_monitor_remote_read(
+            raw_profiles=settings.monitor_ssh_profiles,
+            profile_name=body.profile,
+            operation=body.operation,
+            path=body.path,
+            job_id=body.job_id,
+            tmux_session=body.tmux_session,
+            lines=body.lines,
+        )
+    except MonitorRemoteReadError as exc:
+        if exc.permanent:
+            reason = f"{exc.code}: {exc.detail}"
+            await _terminalize_monitor_failure(
+                db,
+                task_id=task_id,
+                session_id=session_id,
+                turn_generation=body.turn_generation,
+                reason=reason,
+            )
+            raise HTTPException(
+                424,
+                {
+                    "code": exc.code,
+                    "message": exc.detail,
+                    "permanent": True,
+                    "session_ended": True,
+                },
+            ) from exc
+        raise HTTPException(
+            503,
+            {
+                "code": exc.code,
+                "message": exc.detail,
+                "permanent": False,
+            },
+        ) from exc
+    return {
+        "success": True,
+        "profile": result.profile,
+        "operation": result.operation,
+        "exit_code": result.exit_code,
+        "output": result.output,
+    }

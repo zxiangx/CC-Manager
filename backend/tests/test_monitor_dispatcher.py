@@ -289,7 +289,10 @@ def test_build_monitor_agent_prompt(dispatcher):
     assert "mark_complete" in prompt
     assert "mcp__ccm_monitor_agent__report_status" in prompt
     assert "mcp__ccm_monitor_agent__mark_complete" in prompt
+    assert "mcp__ccm_monitor_agent__report_failure" in prompt
+    assert "mcp__ccm_monitor_agent__read_remote_status" in prompt
     assert "mcp__ccm_monitor_agent__get_context" in prompt
+    assert "禁止直接运行 ssh" in prompt
     assert "只执行一次状态检查" in prompt
     assert "不要 sleep" in prompt
 
@@ -1661,6 +1664,8 @@ async def test_codex_monitor_reuses_thread_with_read_only_generation_specs(
         assert set(monitor_spec.enabled_tools) == {
             "get_context",
             "mark_complete",
+            "read_remote_status",
+            "report_failure",
             "report_status",
         }
         assert "skill_context" not in kwargs

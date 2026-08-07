@@ -1303,6 +1303,176 @@ async def test_monitor_callback_requires_exact_active_turn_generation(
 
 
 @pytest.mark.asyncio
+async def test_monitor_remote_read_requires_exact_active_generation(
+    client,
+    session_factory,
+):
+    from backend.services.monitor_remote_read import MonitorRemoteReadResult
+
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="remote generation fence",
+            status="running",
+            turn_generation=4,
+            active_turn_generation=4,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    remote_read = AsyncMock(return_value=MonitorRemoteReadResult(
+        profile="yc_h100",
+        operation="connection",
+        exit_code=0,
+        output="hostname: h100",
+    ))
+    with patch(
+        "backend.api.monitor.execute_monitor_remote_read",
+        remote_read,
+    ):
+        stale = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/remote-read",
+            json={
+                "profile": "yc_h100",
+                "operation": "connection",
+                "turn_generation": 3,
+            },
+        )
+        current = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/remote-read",
+            json={
+                "profile": "yc_h100",
+                "operation": "connection",
+                "turn_generation": 4,
+            },
+        )
+
+    assert stale.status_code == 409
+    assert current.status_code == 200, current.text
+    assert current.json() == {
+        "success": True,
+        "profile": "yc_h100",
+        "operation": "connection",
+        "exit_code": 0,
+        "output": "hostname: h100",
+    }
+    remote_read.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_permanent_remote_capability_failure_terminalizes_once(
+    client,
+    session_factory,
+):
+    from backend.services.monitor_remote_read import MonitorRemoteReadError
+
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="missing remote profile",
+            status="running",
+            turn_generation=2,
+            active_turn_generation=2,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    dispatcher = MagicMock()
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    failure = MonitorRemoteReadError(
+        "profile_not_found",
+        "Requested Monitor SSH profile is not configured",
+        permanent=True,
+    )
+    with (
+        patch(
+            "backend.api.monitor.execute_monitor_remote_read",
+            AsyncMock(side_effect=failure),
+        ),
+        patch("backend.main.dispatcher", dispatcher),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/remote-read",
+            json={
+                "profile": "missing",
+                "operation": "connection",
+                "turn_generation": 2,
+            },
+        )
+        duplicate = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/remote-read",
+            json={
+                "profile": "missing",
+                "operation": "connection",
+                "turn_generation": 2,
+            },
+        )
+
+    assert response.status_code == 424
+    assert response.json()["detail"]["permanent"] is True
+    assert duplicate.status_code == 400
+    async with session_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        reports = list((await db.execute(
+            select(MonitorCheck).where(
+                MonitorCheck.monitor_session_id == session_id
+            )
+        )).scalars().all())
+    assert session.status == "failed"
+    assert session.active_turn_generation is None
+    assert session.next_check_at is None
+    assert session.last_error == "profile_not_found: Requested Monitor SSH profile is not configured"
+    assert len(reports) == 1
+    assert reports[0].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_monitor_can_report_terminal_capability_failure(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="remote command unavailable",
+            status="running",
+            turn_generation=5,
+            active_turn_generation=5,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    dispatcher = MagicMock()
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/fail",
+            json={
+                "reason": "squeue is unavailable on the configured host",
+                "turn_generation": 5,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+    assert session.status == "failed"
+    assert session.last_error == "squeue is unavailable on the configured host"
+
+
+@pytest.mark.asyncio
 async def test_scheduled_monitor_rejects_callback_before_generation_claim(
     client,
     session_factory,

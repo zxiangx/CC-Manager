@@ -53,6 +53,8 @@ EXPECTED_MAIN_TOOLS = (
 EXPECTED_MONITOR_TOOLS = (
     "report_status",
     "mark_complete",
+    "report_failure",
+    "read_remote_status",
     "get_context",
 )
 EXPECTED_SUB_AGENT_TOOLS = (

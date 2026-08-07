@@ -102,6 +102,112 @@ async def mark_complete(reason: str) -> str:
 
 
 @mcp.tool()
+async def report_failure(reason: str) -> str:
+    """报告无法继续监控的永久能力或环境错误，并终止 Monitor。
+
+    Args:
+        reason: 简短说明无法继续监控的原因。
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                _api_url("/fail"),
+                headers=_headers(),
+                json={
+                    "reason": reason,
+                    "turn_generation": _TURN_GENERATION,
+                },
+            )
+            if resp.status_code in (400, 404, 409):
+                return "Session already ended. Stop all activity now."
+            resp.raise_for_status()
+            return "Session failed and ended. Stop all activity now."
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def read_remote_status(
+    profile: str,
+    operation: str,
+    path: str | None = None,
+    job_id: str | None = None,
+    tmux_session: str | None = None,
+    lines: int = 100,
+) -> str:
+    """通过 CCM 的受限只读 SSH 代理读取预配置服务器状态。
+
+    Args:
+        profile: 服务端预配置名称，例如 yc_h100。
+        operation: connection, process_status, gpu_status, slurm_queue,
+            slurm_job, log_tail, file_stat, tmux_sessions, tmux_pane 之一。
+        path: log_tail/file_stat 使用的白名单内绝对路径。
+        job_id: slurm_job 使用的纯数字任务 ID。
+        tmux_session: tmux_pane 使用的 session/pane 目标。
+        lines: 日志或 pane 尾部行数，1-500。
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                _api_url("/remote-read"),
+                headers=_headers(),
+                json={
+                    "profile": profile,
+                    "operation": operation,
+                    "path": path,
+                    "job_id": job_id,
+                    "tmux_session": tmux_session,
+                    "lines": lines,
+                    "turn_generation": _TURN_GENERATION,
+                },
+            )
+            if resp.status_code == 424:
+                detail = resp.json().get("detail", {})
+                return json.dumps({
+                    "success": False,
+                    "session_ended": True,
+                    "permanent": True,
+                    "error_code": detail.get("code", "capability_failure"),
+                    "error": detail.get(
+                        "message", "Remote capability failed"
+                    ),
+                }, ensure_ascii=False)
+            if resp.status_code in (400, 404, 409):
+                return json.dumps({
+                    "success": False,
+                    "session_ended": True,
+                    "error": (
+                        "Session or turn is no longer active "
+                        f"(HTTP {resp.status_code}). Stop all activity now."
+                    ),
+                }, ensure_ascii=False)
+            if resp.status_code in (429, 503):
+                detail = resp.json().get("detail", {})
+                return json.dumps({
+                    "success": False,
+                    "permanent": False,
+                    "error_code": (
+                        detail.get("code", "remote_read_unavailable")
+                        if isinstance(detail, dict)
+                        else "remote_read_unavailable"
+                    ),
+                    "error": (
+                        detail.get("message", str(detail))
+                        if isinstance(detail, dict)
+                        else str(detail)
+                    ),
+                }, ensure_ascii=False)
+            resp.raise_for_status()
+            return json.dumps(resp.json(), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "permanent": False,
+            "error": str(e),
+        }, ensure_ascii=False)
+
+
+@mcp.tool()
 async def get_context() -> str:
     """获取当前监控会话的配置和上下文信息。
 

@@ -47,6 +47,8 @@ CCM_SKILLS_TOOLS = (
 CCM_MONITOR_AGENT_TOOLS = (
     "report_status",
     "mark_complete",
+    "report_failure",
+    "read_remote_status",
     "get_context",
 )
 CCM_SUB_AGENT_TOOLS = (

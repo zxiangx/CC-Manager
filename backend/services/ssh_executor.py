@@ -413,7 +413,14 @@ class SSHExecutor:
         self,
         command: str,
         timeout: int,
-        max_output_bytes: int | None = None,
+    ) -> tuple[int, str]:
+        return self._execute_sync(command, timeout, None)
+
+    def _run_sync_limited(
+        self,
+        command: str,
+        timeout: int,
+        max_output_bytes: int,
     ) -> tuple[int, str]:
         return self._execute_sync(
             command,
@@ -440,8 +447,14 @@ class SSHExecutor:
             "ssh %s: %s", self.host,
             "[sensitive command redacted]" if sensitive else command[:200],
         )
+        if max_output_bytes is None:
+            return await asyncio.to_thread(
+                self._run_sync,
+                command,
+                timeout,
+            )
         return await asyncio.to_thread(
-            self._run_sync,
+            self._run_sync_limited,
             command,
             timeout,
             max_output_bytes,

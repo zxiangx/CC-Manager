@@ -44,6 +44,16 @@ class SSHKeyPreflightError(ValueError):
         self.detail = detail
 
 
+class SSHOutputLimitError(RuntimeError):
+    """The remote process exceeded the caller's bounded output budget."""
+
+    def __init__(self, max_output_bytes: int):
+        super().__init__(
+            f"SSH command output exceeded {max_output_bytes} bytes"
+        )
+        self.max_output_bytes = max_output_bytes
+
+
 @dataclass(frozen=True)
 class SSHKeyMaterial:
     """Validated local key material safe to pass to Paramiko/OpenSSH."""
@@ -281,12 +291,18 @@ class SSHExecutor:
         user: str,
         key_path: str,
         *,
+        port: int = 22,
         known_hosts_path: str | None = None,
+        strict_host_key_checking: bool = False,
     ):
+        if isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError("SSH port must be between 1 and 65535")
         self.host = host
         self.user = user
         self.key_path = os.path.expandvars(os.path.expanduser(key_path))
+        self.port = port
         self.known_hosts_path = known_hosts_path
+        self.strict_host_key_checking = strict_host_key_checking
         self.last_probe_result: SSHProbeResult | None = None
 
     def _execute_sync(
@@ -294,11 +310,20 @@ class SSHExecutor:
         command: str,
         timeout: int,
         input_data: bytes | None,
+        max_output_bytes: int | None = None,
     ) -> tuple[int, str]:
         import paramiko
 
         if isinstance(timeout, bool) or timeout <= 0:
             raise ValueError("SSH timeout must be positive")
+        if (
+            max_output_bytes is not None
+            and (
+                isinstance(max_output_bytes, bool)
+                or max_output_bytes <= 0
+            )
+        ):
+            raise ValueError("SSH output limit must be positive")
         deadline = time.monotonic() + float(timeout)
         key = preflight_private_key(self.key_path)
         client = paramiko.SSHClient()
@@ -306,11 +331,16 @@ class SSHExecutor:
             client.load_host_keys(_prepare_known_hosts_file(self.known_hosts_path))
         else:
             client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.set_missing_host_key_policy(
+            paramiko.RejectPolicy()
+            if self.strict_host_key_checking
+            else paramiko.AutoAddPolicy()
+        )
         try:
             connect_timeout = max(1.0, min(float(timeout), 15.0))
             client.connect(
                 self.host,
+                port=self.port,
                 username=self.user,
                 key_filename=key.private_key_path,
                 timeout=connect_timeout,
@@ -332,13 +362,32 @@ class SSHExecutor:
 
             out_chunks: list[bytes] = []
             err_chunks: list[bytes] = []
+            output_bytes = 0
+
+            def append_bounded(
+                chunks: list[bytes],
+                chunk: bytes,
+            ) -> None:
+                nonlocal output_bytes
+                output_bytes += len(chunk)
+                if (
+                    max_output_bytes is not None
+                    and output_bytes > max_output_bytes
+                ):
+                    channel.close()
+                    raise SSHOutputLimitError(max_output_bytes)
+                chunks.append(chunk)
+
             while True:
                 made_progress = False
                 while channel.recv_ready():
-                    out_chunks.append(channel.recv(65536))
+                    append_bounded(out_chunks, channel.recv(65536))
                     made_progress = True
                 while channel.recv_stderr_ready():
-                    err_chunks.append(channel.recv_stderr(65536))
+                    append_bounded(
+                        err_chunks,
+                        channel.recv_stderr(65536),
+                    )
                     made_progress = True
                 if (
                     channel.exit_status_ready()
@@ -360,8 +409,18 @@ class SSHExecutor:
         finally:
             client.close()
 
-    def _run_sync(self, command: str, timeout: int) -> tuple[int, str]:
-        return self._execute_sync(command, timeout, None)
+    def _run_sync(
+        self,
+        command: str,
+        timeout: int,
+        max_output_bytes: int | None = None,
+    ) -> tuple[int, str]:
+        return self._execute_sync(
+            command,
+            timeout,
+            None,
+            max_output_bytes=max_output_bytes,
+        )
 
     def _run_with_input_sync(
         self, command: str, input_data: bytes, timeout: int,
@@ -369,14 +428,24 @@ class SSHExecutor:
         return self._execute_sync(command, timeout, input_data)
 
     async def run(
-        self, command: str, timeout: int = 300, *, sensitive: bool = False,
+        self,
+        command: str,
+        timeout: int = 300,
+        *,
+        sensitive: bool = False,
+        max_output_bytes: int | None = None,
     ) -> tuple[int, str]:
         """执行远程命令，返回 (exit_code, output)。"""
         logger.debug(
             "ssh %s: %s", self.host,
             "[sensitive command redacted]" if sensitive else command[:200],
         )
-        return await asyncio.to_thread(self._run_sync, command, timeout)
+        return await asyncio.to_thread(
+            self._run_sync,
+            command,
+            timeout,
+            max_output_bytes,
+        )
 
     async def run_with_input(
         self,
@@ -424,12 +493,17 @@ class SSHExecutor:
 
     def _rsync_ssh_command(self) -> str:
         key = preflight_private_key(self.key_path)
-        host_key_options = "-o StrictHostKeyChecking=accept-new"
+        host_key_options = (
+            "-o StrictHostKeyChecking=yes"
+            if self.strict_host_key_checking
+            else "-o StrictHostKeyChecking=accept-new"
+        )
         if self.known_hosts_path:
             known_hosts = _prepare_known_hosts_file(self.known_hosts_path)
             host_key_options += f" -o UserKnownHostsFile={shlex.quote(known_hosts)}"
         return (
             f"ssh -i {shlex.quote(key.private_key_path)} "
+            f"-p {self.port} "
             "-o IdentitiesOnly=yes -o BatchMode=yes "
             f"{host_key_options} -o ConnectTimeout=15"
         )

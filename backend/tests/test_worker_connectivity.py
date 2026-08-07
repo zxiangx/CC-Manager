@@ -23,6 +23,7 @@ from backend.services.worker_provisioner import (
 from backend.services.ssh_executor import (
     SSHExecutor,
     SSHKeyPreflightError,
+    SSHOutputLimitError,
     derive_openssh_public_key,
     preflight_private_key,
     validate_openssh_public_key,
@@ -155,6 +156,7 @@ class _FakeChannel:
         self.stderr = bytearray(stderr)
         self.input = b""
         self.write_shutdown = False
+        self.closed = False
 
     def sendall(self, data: bytes):
         self.input += data
@@ -185,7 +187,7 @@ class _FakeChannel:
         return 7
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class _FakeSSHClient:
@@ -240,6 +242,52 @@ def test_ssh_uses_only_selected_key_and_drains_both_streams(tmp_path, monkeypatc
     assert client.connect_kwargs["key_filename"] == str(key_path)
     assert client.connect_kwargs["allow_agent"] is False
     assert client.connect_kwargs["look_for_keys"] is False
+
+
+def test_ssh_supports_custom_port_and_strict_host_key_policy(
+    tmp_path,
+    monkeypatch,
+):
+    key_path = _private_key_file(tmp_path)
+    known_hosts = tmp_path / "known-hosts"
+    channel = _FakeChannel(b"ok", b"")
+    client = _FakeSSHClient(channel)
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: client)
+    executor = SSHExecutor(
+        "121.46.19.4",
+        "remote-user",
+        str(key_path),
+        port=8001,
+        known_hosts_path=str(known_hosts),
+        strict_host_key_checking=True,
+    )
+
+    code, output = executor._execute_sync("hostname", 5, None)
+
+    assert (code, output) == (7, "ok")
+    assert client.connect_kwargs["port"] == 8001
+    assert isinstance(client.policy, paramiko.RejectPolicy)
+
+
+def test_ssh_aborts_when_combined_output_exceeds_limit(tmp_path, monkeypatch):
+    channel = _FakeChannel(b"o" * 70_000, b"e" * 70_000)
+    client = _FakeSSHClient(channel)
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: client)
+    executor = SSHExecutor(
+        "worker.internal",
+        "ubuntu",
+        str(_private_key_file(tmp_path)),
+    )
+
+    with pytest.raises(SSHOutputLimitError):
+        executor._execute_sync(
+            "large-output",
+            5,
+            None,
+            max_output_bytes=64 * 1024,
+        )
+
+    assert channel.closed is True
 
 
 async def test_run_with_input_keeps_payload_out_of_logs(tmp_path, monkeypatch, caplog):

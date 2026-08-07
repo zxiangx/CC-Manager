@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     goal_evaluation_timeout: int = 120
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
 
+    # Structured, server-owned read-only SSH profiles available to CCM
+    # Monitor. JSON object keyed by profile name; credentials and hosts are
+    # never accepted from an agent tool call.
+    monitor_ssh_profiles: str = ""
+
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
     worker_enabled: bool = True
     worker_cloud_provider: str = "aws"  # 目前仅 aws

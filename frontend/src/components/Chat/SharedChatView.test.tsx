@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SharedChatView } from './SharedChatView';
@@ -53,6 +53,19 @@ describe('SharedChatView', () => {
     vi.unstubAllGlobals();
     vi.clearAllMocks();
     MockWebSocket.latest = null;
+  });
+
+  it('sends with Enter but ignores IME composition Enter', async () => {
+    render(<SharedChatView shared={shared} onBack={vi.fn()} />);
+    await waitFor(() => expect(api.getSharedHistory).toHaveBeenCalled());
+    const input = screen.getByPlaceholderText('Send a message...');
+
+    fireEvent.change(input, { target: { value: '中文' } });
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true, keyCode: 229 });
+    expect(api.sendSharedChat).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(api.sendSharedChat).toHaveBeenCalledWith(3, '中文'));
   });
 
   it('reconciles the server echo with its optimistic user bubble', async () => {

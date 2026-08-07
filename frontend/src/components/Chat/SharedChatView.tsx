@@ -373,7 +373,18 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+            onKeyDown={(e) => {
+              const nativeEvent = e.nativeEvent as KeyboardEvent;
+              if (
+                e.key === 'Enter'
+                && !e.shiftKey
+                && !nativeEvent.isComposing
+                && nativeEvent.keyCode !== 229
+              ) {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
             placeholder="Send a message..."
             className="flex-1 bg-gray-700 text-foreground rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
             disabled={sending}

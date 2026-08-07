@@ -339,6 +339,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const chatRootRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const [userMessageNavigation, setUserMessageNavigation] = useState({
+    labels: [] as string[],
+    activeIndex: 0,
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [starred, setStarred] = useState(task.starred);
@@ -559,6 +563,60 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
     }
   }, []);
+
+  const scrollToUserMessage = useCallback((index: number) => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>('[data-user-msg]'));
+    const node = nodes[index];
+    if (!node) return;
+    setUserMessageNavigation((current) => ({ ...current, activeIndex: index }));
+    container.scrollTo({ top: node.offsetTop, behavior: 'smooth' });
+  }, []);
+
+  // Keep the compact request rail in sync with both loaded history and scrolling.
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    const syncNavigation = () => {
+      const nodes = Array.from(container.querySelectorAll<HTMLElement>('[data-user-msg]'));
+      const labels = nodes.map((node, index) => (
+        node.dataset.userMsgLabel?.trim() || `User message ${index + 1}`
+      ));
+      const containerRect = container.getBoundingClientRect();
+      const viewportAnchor = containerRect.top + Math.min(120, container.clientHeight * 0.25);
+      let activeIndex = 0;
+      for (let index = 0; index < nodes.length; index += 1) {
+        if (nodes[index].getBoundingClientRect().top <= viewportAnchor) activeIndex = index;
+        else break;
+      }
+      if (
+        nodes.length > 0
+        && container.scrollTop + container.clientHeight >= container.scrollHeight - 4
+      ) {
+        activeIndex = nodes.length - 1;
+      }
+      setUserMessageNavigation((current) => {
+        const sameLabels = current.labels.length === labels.length
+          && current.labels.every((label, index) => label === labels[index]);
+        return sameLabels && current.activeIndex === activeIndex
+          ? current
+          : { labels, activeIndex };
+      });
+    };
+
+    syncNavigation();
+    container.addEventListener('scroll', syncNavigation, { passive: true });
+    const resizeObserver = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(syncNavigation);
+    resizeObserver?.observe(container);
+    return () => {
+      container.removeEventListener('scroll', syncNavigation);
+      resizeObserver?.disconnect();
+    };
+  }, [messages, task.description]);
 
   // Message queue: pre-queue messages to auto-send after current turn completes
   const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>(() => {
@@ -1668,7 +1726,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   handleSendRef.current = (text: string, uploadResults?: UploadResult[]) => handleSend(text, true, uploadResults);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
+    const nativeEvent = e.nativeEvent as KeyboardEvent;
+    if (
+      e.key === 'Enter'
+      && !e.shiftKey
+      && !nativeEvent.isComposing
+      && nativeEvent.keyCode !== 229
+    ) {
       e.preventDefault();
       handleSend();
     }
@@ -2136,7 +2200,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )}
 
       {/* Messages */}
-      <div ref={messagesContainerRef} className="flex-1 overflow-y-auto overscroll-contain p-4 space-y-3 min-h-0">
+      <div className="relative flex-1 min-h-0">
+        <div ref={messagesContainerRef} className="h-full overflow-y-auto overscroll-contain p-4 pr-9 sm:pr-10 space-y-3 min-h-0">
         {messages.length === 0 && historyLoading && (
           <div className="flex items-center justify-center gap-2 text-gray-500 mt-20">
             <Loader2 size={16} className="animate-spin" />
@@ -2155,7 +2220,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         )}
         {/* Initial prompt bubble */}
         {task.description && (
-          <div data-user-msg>
+          <div data-user-msg data-user-msg-label={task.description.slice(0, 100)}>
             <div className="text-center text-xs text-gray-600 py-1 mb-1">— Initial Prompt —</div>
             <div className="flex justify-end">
               <div className="max-w-[85%] group">
@@ -2212,7 +2277,35 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <span>{providerLabel} is thinking...</span>
           </div>
         )}
-        <div ref={bottomRef} className="h-4" />
+          <div ref={bottomRef} className="h-4" />
+        </div>
+        {userMessageNavigation.labels.length > 1 && (
+          <nav
+            aria-label="User message navigation"
+            className="absolute right-1 sm:right-2 top-1/2 -translate-y-1/2 z-10 max-h-[65%] overflow-y-auto overscroll-contain rounded-full bg-gray-950/65 py-1 shadow-sm backdrop-blur-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          >
+            {userMessageNavigation.labels.map((label, index) => {
+              const active = index === userMessageNavigation.activeIndex;
+              return (
+                <button
+                  key={`${index}-${label}`}
+                  type="button"
+                  aria-label={`Jump to user message ${index + 1} of ${userMessageNavigation.labels.length}: ${label}`}
+                  aria-current={active ? 'location' : undefined}
+                  title={`${index + 1}/${userMessageNavigation.labels.length} · ${label}`}
+                  onClick={() => scrollToUserMessage(index)}
+                  className="group flex h-4 w-7 items-center justify-end pr-1"
+                >
+                  <span className={`block h-0.5 rounded-full transition-all ${
+                    active
+                      ? 'w-4 bg-indigo-400'
+                      : 'w-2 bg-gray-600 group-hover:w-3 group-hover:bg-gray-400'
+                  }`} />
+                </button>
+              );
+            })}
+          </nav>
+        )}
       </div>
 
       {/* Error */}
@@ -2523,8 +2616,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
                 : isProcessing && canInject
-                ? '发送到运行中的 turn (Ctrl+Enter)'
-                : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
+                ? '发送到运行中的 turn (Enter)'
+                : isProcessing ? 'Add to queue (Enter)' : 'Send (Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 isProcessing && canInject ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
@@ -3254,7 +3347,13 @@ const MessageBubble = memo(function MessageBubble({
   const isInjected = message.source === 'inject' && isUser;
 
   return (
-    <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`} {...(isUser ? { 'data-user-msg': '' } : {})}>
+    <div
+      className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
+      {...(isUser ? {
+        'data-user-msg': '',
+        'data-user-msg-label': (message.raw_content || message.content || '').replace(/\s+/g, ' ').slice(0, 100),
+      } : {})}
+    >
       <div className="max-w-[85%] group">
         {isMonitor && !isUser && (
           <div className="flex items-center gap-1 mb-0.5 pl-1">

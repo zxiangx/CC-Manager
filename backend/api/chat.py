@@ -1817,6 +1817,62 @@ async def get_chat_history(
     return messages
 
 
+@router.get("/{task_id}/chat/user-message-index")
+async def get_user_message_index(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a lightweight, complete index for the request navigation rail.
+
+    This intentionally excludes assistant/tool rows. A long task can contain
+    thousands of large tool results while only having a small number of user
+    requests; loading full chat history merely to draw the rail is wasteful.
+    """
+
+    task = await db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+
+    result = await db.execute(
+        select(
+            LogEntry.id,
+            LogEntry.content,
+            LogEntry.raw_json,
+            LogEntry.timestamp,
+        )
+        .where(
+            LogEntry.task_id == task_id,
+            LogEntry.event_type == "user_message",
+        )
+        .order_by(LogEntry.id.asc())
+    )
+    entries = []
+    for row in result.all():
+        content = row.content or ""
+        if row.raw_json:
+            try:
+                raw = json.loads(row.raw_json)
+                if isinstance(raw, dict) and isinstance(
+                    raw.get("raw_content"), str
+                ):
+                    content = raw["raw_content"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        entries.append({
+            "id": row.id,
+            # Enough for a useful hover preview while keeping pasted logs or
+            # giant prompts from turning this lightweight index into history.
+            "content": content[:1000],
+            "timestamp": (
+                row.timestamp.isoformat() + "Z"
+                if row.timestamp else None
+            ),
+        })
+    return entries
+
+
 @router.get("/{task_id}/chat/{message_id}/detail")
 async def get_message_detail(
     task_id: int,

@@ -827,6 +827,60 @@ async def test_chat_history_noisy_rows_do_not_consume_limit(client, session_fact
 
 
 @pytest.mark.asyncio
+async def test_user_message_index_is_complete_lightweight_and_uses_raw_content(
+    client, session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "initial", "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+
+    async with session_factory() as db:
+        db.add_all([
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="user_message",
+                role="user",
+                content="[Admin] displayed prefix",
+                raw_json=json.dumps({"raw_content": "first real request"}),
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="tool_result",
+                role="user",
+                content="must not be indexed",
+                tool_output="x" * 100_000,
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="user_message",
+                role="user",
+                content="second request",
+                is_error=False,
+            ),
+        ])
+        await db.commit()
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/chat/user-message-index"
+    )
+
+    assert response.status_code == 200
+    entries = response.json()
+    assert [entry["content"] for entry in entries] == [
+        "first real request",
+        "second request",
+    ]
+    assert all(set(entry) == {"id", "content", "timestamp"} for entry in entries)
+    assert entries[0]["id"] < entries[1]["id"]
+
+
+@pytest.mark.asyncio
 async def test_chat_history_no_limit_returns_all(client, session_factory):
     """Default limit=0 should return all messages for a task."""
     create_resp = await client.post("/api/tasks", json={

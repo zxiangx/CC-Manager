@@ -12,6 +12,7 @@ vi.mock('../../api/client', () => ({
   ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
+    getTaskUserMessageIndex: vi.fn().mockResolvedValue([]),
     sendTaskChat: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
     stopTaskSession: vi.fn().mockResolvedValue({}),
@@ -147,6 +148,7 @@ describe('ChatView', () => {
     localStorage.clear();
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getTaskUserMessageIndex as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -2255,7 +2257,7 @@ describe('ChatView', () => {
       const rail = await screen.findByRole('navigation', { name: 'User message navigation' });
       const jumpButtons = Array.from(rail.querySelectorAll('button'));
       expect(jumpButtons).toHaveLength(3);
-      expect(jumpButtons[1]).toHaveAttribute('title', expect.stringContaining('User message 1'));
+      expect(jumpButtons[1]).toHaveAccessibleName(expect.stringContaining('User message 1'));
 
       const scrollContainer = container.querySelector<HTMLElement>('.overscroll-contain')!;
       const userMessages = scrollContainer.querySelectorAll<HTMLElement>('[data-user-msg]');
@@ -2267,6 +2269,94 @@ describe('ChatView', () => {
 
       expect(scrollToMock).toHaveBeenCalledWith({ top: 321, behavior: 'smooth' });
       expect(jumpButtons[1]).toHaveAttribute('aria-current', 'location');
+    });
+
+    it('shows the complete request text in a custom hover preview', async () => {
+      const requestText = 'Explain why the remote A100 queue stopped and propose a safe repair.';
+      (api.getTaskUserMessageIndex as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 10, content: requestText, timestamp: null },
+        { id: 20, content: 'Continue after the repair.', timestamp: null },
+      ]);
+      render(
+        <ChatView
+          task={makeTask({ description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const jump = await screen.findByRole('button', {
+        name: /Explain why the remote A100 queue stopped/,
+      });
+      fireEvent.mouseEnter(jump);
+
+      const tooltip = await screen.findByRole('tooltip');
+      expect(tooltip).toHaveTextContent('Request 1/2');
+      expect(tooltip).toHaveTextContent(requestText);
+      expect(jump).not.toHaveAttribute('title');
+    });
+
+    it('indexes unloaded requests and loads older pages until the target exists', async () => {
+      const latest: ChatMessage[] = Array.from({ length: 200 }, (_, index) => ({
+        id: 201 + index,
+        role: index === 199 ? 'user' : 'assistant',
+        event_type: index === 199 ? 'user_message' : 'message',
+        content: index === 199 ? 'latest loaded request' : `assistant-${index}`,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      }));
+      const oldRequest: ChatMessage = {
+        id: 10,
+        role: 'user',
+        event_type: 'user_message',
+        content: 'very old indexed request',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      };
+      (api.getTaskUserMessageIndex as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 10, content: oldRequest.content, timestamp: null },
+        { id: 400, content: 'latest loaded request', timestamp: null },
+      ]);
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(latest)
+        .mockResolvedValueOnce([oldRequest]);
+      render(
+        <ChatView
+          task={makeTask({ id: 81, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const oldJump = await screen.findByRole('button', {
+        name: /very old indexed request/,
+      });
+      expect(screen.queryByText('very old indexed request')).not.toBeInTheDocument();
+
+      await userEvent.click(oldJump);
+
+      await waitFor(() => {
+        expect(api.getTaskChatHistory).toHaveBeenNthCalledWith(
+          2,
+          81,
+          true,
+          200,
+          201,
+        );
+      });
+      expect(await screen.findByText('very old indexed request')).toBeInTheDocument();
     });
 
     it('does not mark assistant messages with data-user-msg attribute', async () => {

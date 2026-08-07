@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
@@ -43,6 +43,24 @@ interface ChatViewProps {
 interface QueuedMessage {
   text: string;
   uploadResults?: UploadResult[];
+}
+
+interface UserMessageNavigationItem {
+  key: string;
+  messageId: number | null;
+  label: string;
+}
+
+interface RequestRailTooltip {
+  key: string;
+  label: string;
+  position: string;
+  left: number;
+  top: number;
+}
+
+function requestNavigationLabel(content: string | null | undefined): string {
+  return (content || '').replace(/\s+/g, ' ').trim() || 'Empty user message';
 }
 
 interface LiveStreamCacheEntry {
@@ -339,10 +357,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const chatRootRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const [userMessageNavigation, setUserMessageNavigation] = useState({
-    labels: [] as string[],
-    activeIndex: 0,
-  });
+  const navigationTaskIdRef = useRef(task.id);
+  navigationTaskIdRef.current = task.id;
+  const [userMessageIndex, setUserMessageIndex] = useState<UserMessageIndexEntry[]>([]);
+  const [activeUserMessageKey, setActiveUserMessageKey] = useState<string | null>(null);
+  const [pendingNavigationKey, setPendingNavigationKey] = useState<string | null>(null);
+  const [loadingNavigationKey, setLoadingNavigationKey] = useState<string | null>(null);
+  const [requestRailTooltip, setRequestRailTooltip] = useState<RequestRailTooltip | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [starred, setStarred] = useState(task.starred);
@@ -531,48 +552,155 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }
   const HISTORY_PAGE_SIZE = 200;
 
+  const userMessageNavigationItems = useMemo<UserMessageNavigationItem[]>(() => {
+    const indexed = new Map<number, UserMessageIndexEntry>();
+    for (const entry of userMessageIndex) indexed.set(entry.id, entry);
+    for (const message of messages) {
+      if (message.event_type !== 'user_message') continue;
+      indexed.set(message.id, {
+        id: message.id,
+        content: message.raw_content || message.content || '',
+        timestamp: message.timestamp,
+      });
+    }
+    const items: UserMessageNavigationItem[] = [];
+    if (task.description) {
+      items.push({
+        key: 'initial',
+        messageId: null,
+        label: requestNavigationLabel(task.description),
+      });
+    }
+    for (const entry of Array.from(indexed.values()).sort((a, b) => a.id - b.id)) {
+      items.push({
+        key: `message-${entry.id}`,
+        messageId: entry.id,
+        label: requestNavigationLabel(entry.content),
+      });
+    }
+    return items;
+  }, [messages, task.description, userMessageIndex]);
+
+  const scrollToLoadedUserMessage = useCallback((key: string): boolean => {
+    const container = messagesContainerRef.current;
+    if (!container) return false;
+    const node = Array.from(
+      container.querySelectorAll<HTMLElement>('[data-user-msg-key]'),
+    ).find((candidate) => candidate.dataset.userMsgKey === key);
+    if (!node) return false;
+    setActiveUserMessageKey(key);
+    if (typeof container.scrollTo === 'function') {
+      container.scrollTo({ top: node.offsetTop, behavior: 'smooth' });
+    } else {
+      container.scrollTop = node.offsetTop;
+    }
+    return true;
+  }, []);
+
+  const scrollToUserMessage = useCallback(async (item: UserMessageNavigationItem) => {
+    setRequestRailTooltip(null);
+    if (scrollToLoadedUserMessage(item.key)) return;
+    if (item.messageId === null || loadingNavigationKey || loadingMore) return;
+
+    const initialTaskId = task.id;
+    setLoadingNavigationKey(item.key);
+    setPendingNavigationKey(item.key);
+    try {
+      let cursor = historyCursorRef.current.taskId === initialTaskId
+        ? historyCursorRef.current.beforeId
+        : null;
+      let more = hasMoreHistory;
+      let found = false;
+      let collected: ChatMessage[] = [];
+
+      while (more && cursor !== null && cursor > item.messageId && !found) {
+        const page = await api.getTaskChatHistory(
+          initialTaskId,
+          true,
+          HISTORY_PAGE_SIZE,
+          cursor,
+        );
+        const filtered = page
+          .filter((message) =>
+            !isLegacyCodexCollabCompleted(message) &&
+            !((message.event_type === 'message' || message.event_type === 'result') && !message.content)
+          )
+          .map((message) => ({ ...message, persisted: true }));
+        collected = mergeChatHistory(filtered, collected);
+        found = filtered.some((message) => message.id === item.messageId);
+        if (filtered.length > 0) {
+          cursor = filtered.reduce(
+            (oldest, message) => Math.min(oldest, message.id),
+            filtered[0].id,
+          );
+          if (historyCursorRef.current.taskId === initialTaskId) {
+            historyCursorRef.current.beforeId = cursor;
+          }
+        } else {
+          more = false;
+        }
+        if (page.length < HISTORY_PAGE_SIZE) more = false;
+      }
+
+      if (initialTaskId !== navigationTaskIdRef.current) return;
+      if (collected.length > 0) {
+        setMessages((current) => mergeChatHistory(collected, current));
+      }
+      setHasMoreHistory(more);
+      if (!found) {
+        setPendingNavigationKey(null);
+        setError('That request could not be loaded from chat history.');
+      }
+    } catch (loadError) {
+      setPendingNavigationKey(null);
+      setError(loadError instanceof Error ? loadError.message : 'Failed to load older messages');
+    } finally {
+      if (initialTaskId === navigationTaskIdRef.current) {
+        setLoadingNavigationKey(null);
+      }
+    }
+  }, [hasMoreHistory, loadingMore, loadingNavigationKey, scrollToLoadedUserMessage, task.id]);
+
+  useEffect(() => {
+    if (!pendingNavigationKey) return;
+    if (scrollToLoadedUserMessage(pendingNavigationKey)) {
+      setPendingNavigationKey(null);
+    }
+  }, [messages, pendingNavigationKey, scrollToLoadedUserMessage]);
+
   const navigateUserMessage = useCallback((direction: 'up' | 'down') => {
     const container = messagesContainerRef.current;
     if (!container) return;
-    const nodes = Array.from(container.querySelectorAll<HTMLElement>('[data-user-msg]'));
+    const nodes = Array.from(
+      container.querySelectorAll<HTMLElement>('[data-user-msg-key]'),
+    );
     if (nodes.length === 0) return;
-
     const containerRect = container.getBoundingClientRect();
     const threshold = 30;
-
-    const scrollToNode = (node: HTMLElement) => {
-      const nodeTop = node.offsetTop;
-      container.scrollTo({ top: nodeTop, behavior: 'smooth' });
-    };
-
-    if (direction === 'up') {
-      for (let i = nodes.length - 1; i >= 0; i--) {
-        const rect = nodes[i].getBoundingClientRect();
-        if (rect.top < containerRect.top - threshold) {
-          scrollToNode(nodes[i]);
-          return;
-        }
-      }
-    } else {
-      for (const node of nodes) {
-        const rect = node.getBoundingClientRect();
-        if (rect.top > containerRect.top + threshold) {
-          scrollToNode(node);
-          return;
-        }
-      }
+    const candidates = direction === 'up' ? [...nodes].reverse() : nodes;
+    const visibleTarget = candidates.find((node) => {
+      const top = node.getBoundingClientRect().top;
+      return direction === 'up'
+        ? top < containerRect.top - threshold
+        : top > containerRect.top + threshold;
+    });
+    if (visibleTarget) {
+      const key = visibleTarget.dataset.userMsgKey;
+      if (key) scrollToLoadedUserMessage(key);
+      return;
     }
-  }, []);
 
-  const scrollToUserMessage = useCallback((index: number) => {
-    const container = messagesContainerRef.current;
-    if (!container) return;
-    const nodes = Array.from(container.querySelectorAll<HTMLElement>('[data-user-msg]'));
-    const node = nodes[index];
-    if (!node) return;
-    setUserMessageNavigation((current) => ({ ...current, activeIndex: index }));
-    container.scrollTo({ top: node.offsetTop, behavior: 'smooth' });
-  }, []);
+    // At a loaded-history boundary, continue through the complete lightweight
+    // index. This preserves the familiar viewport-relative arrows while also
+    // allowing "previous" to cross the Load older messages boundary.
+    const boundaryNode = direction === 'up' ? nodes[0] : nodes[nodes.length - 1];
+    const boundaryIndex = userMessageNavigationItems.findIndex(
+      (item) => item.key === boundaryNode.dataset.userMsgKey,
+    );
+    const targetIndex = boundaryIndex + (direction === 'up' ? -1 : 1);
+    const target = userMessageNavigationItems[targetIndex];
+    if (target) void scrollToUserMessage(target);
+  }, [scrollToLoadedUserMessage, scrollToUserMessage, userMessageNavigationItems]);
 
   // Keep the compact request rail in sync with both loaded history and scrolling.
   useEffect(() => {
@@ -581,9 +709,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     const syncNavigation = () => {
       const nodes = Array.from(container.querySelectorAll<HTMLElement>('[data-user-msg]'));
-      const labels = nodes.map((node, index) => (
-        node.dataset.userMsgLabel?.trim() || `User message ${index + 1}`
-      ));
       const containerRect = container.getBoundingClientRect();
       const viewportAnchor = containerRect.top + Math.min(120, container.clientHeight * 0.25);
       let activeIndex = 0;
@@ -597,13 +722,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       ) {
         activeIndex = nodes.length - 1;
       }
-      setUserMessageNavigation((current) => {
-        const sameLabels = current.labels.length === labels.length
-          && current.labels.every((label, index) => label === labels[index]);
-        return sameLabels && current.activeIndex === activeIndex
-          ? current
-          : { labels, activeIndex };
-      });
+      const activeKey = nodes[activeIndex]?.dataset.userMsgKey || null;
+      setActiveUserMessageKey((current) => current === activeKey ? current : activeKey);
     };
 
     syncNavigation();
@@ -1271,6 +1391,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         return next;
       });
     }).catch(() => {}).finally(() => setHistoryLoading(false));
+  }, [task.id]);
+  useEffect(() => {
+    let current = true;
+    setUserMessageIndex([]);
+    setActiveUserMessageKey(null);
+    setPendingNavigationKey(null);
+    setLoadingNavigationKey(null);
+    setRequestRailTooltip(null);
+    api.getTaskUserMessageIndex(task.id)
+      .then((entries) => {
+        if (current) setUserMessageIndex(entries);
+      })
+      .catch(() => {
+        // Loaded messages still provide a functional partial rail if an older
+        // Worker has not received the lightweight index endpoint yet.
+      });
+    return () => { current = false; };
   }, [task.id]);
   useEffect(() => {
     refreshHistoryRef.current = fetchHistory;
@@ -2220,7 +2357,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         )}
         {/* Initial prompt bubble */}
         {task.description && (
-          <div data-user-msg data-user-msg-label={task.description.slice(0, 100)}>
+          <div
+            data-user-msg
+            data-user-msg-key="initial"
+            data-user-msg-label={requestNavigationLabel(task.description)}
+          >
             <div className="text-center text-xs text-gray-600 py-1 mb-1">— Initial Prompt —</div>
             <div className="flex justify-end">
               <div className="max-w-[85%] group">
@@ -2279,25 +2420,52 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         )}
           <div ref={bottomRef} className="h-4" />
         </div>
-        {userMessageNavigation.labels.length > 1 && (
+        {userMessageNavigationItems.length > 1 && (
           <nav
             aria-label="User message navigation"
             className="absolute right-1 sm:right-2 top-1/2 -translate-y-1/2 z-10 max-h-[65%] overflow-y-auto overscroll-contain rounded-full bg-gray-950/65 py-1 shadow-sm backdrop-blur-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
-            {userMessageNavigation.labels.map((label, index) => {
-              const active = index === userMessageNavigation.activeIndex;
+            {userMessageNavigationItems.map((item, index) => {
+              const active = item.key === activeUserMessageKey;
+              const loading = item.key === loadingNavigationKey;
               return (
                 <button
-                  key={`${index}-${label}`}
+                  key={item.key}
                   type="button"
-                  aria-label={`Jump to user message ${index + 1} of ${userMessageNavigation.labels.length}: ${label}`}
+                  aria-label={`Jump to user message ${index + 1} of ${userMessageNavigationItems.length}: ${item.label}`}
                   aria-current={active ? 'location' : undefined}
-                  title={`${index + 1}/${userMessageNavigation.labels.length} · ${label}`}
-                  onClick={() => scrollToUserMessage(index)}
+                  aria-busy={loading || undefined}
+                  onMouseEnter={(event) => {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    setRequestRailTooltip({
+                      key: item.key,
+                      label: item.label,
+                      position: `${index + 1}/${userMessageNavigationItems.length}`,
+                      left: rect.left - 8,
+                      top: Math.max(32, Math.min(window.innerHeight - 32, rect.top + rect.height / 2)),
+                    });
+                  }}
+                  onMouseLeave={() => setRequestRailTooltip((current) => (
+                    current?.key === item.key ? null : current
+                  ))}
+                  onFocus={(event) => {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    setRequestRailTooltip({
+                      key: item.key,
+                      label: item.label,
+                      position: `${index + 1}/${userMessageNavigationItems.length}`,
+                      left: rect.left - 8,
+                      top: Math.max(32, Math.min(window.innerHeight - 32, rect.top + rect.height / 2)),
+                    });
+                  }}
+                  onBlur={() => setRequestRailTooltip(null)}
+                  onClick={() => void scrollToUserMessage(item)}
                   className="group flex h-4 w-7 items-center justify-end pr-1"
                 >
                   <span className={`block h-0.5 rounded-full transition-all ${
-                    active
+                    loading
+                      ? 'w-4 animate-pulse bg-amber-400'
+                      : active
                       ? 'w-4 bg-indigo-400'
                       : 'w-2 bg-gray-600 group-hover:w-3 group-hover:bg-gray-400'
                   }`} />
@@ -2305,6 +2473,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               );
             })}
           </nav>
+        )}
+        {requestRailTooltip && (
+          <div
+            role="tooltip"
+            className="pointer-events-none fixed z-50 w-max max-w-[min(22rem,calc(100vw-4rem))] -translate-x-full -translate-y-1/2 rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-left shadow-xl"
+            style={{ left: requestRailTooltip.left, top: requestRailTooltip.top }}
+          >
+            <div className="mb-0.5 text-[10px] font-medium text-indigo-300">
+              Request {requestRailTooltip.position}
+            </div>
+            <div className="max-h-28 overflow-hidden whitespace-pre-wrap break-words text-xs leading-5 text-gray-200">
+              {requestRailTooltip.label}
+            </div>
+          </div>
         )}
       </div>
 
@@ -3351,7 +3533,8 @@ const MessageBubble = memo(function MessageBubble({
       className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
       {...(isUser ? {
         'data-user-msg': '',
-        'data-user-msg-label': (message.raw_content || message.content || '').replace(/\s+/g, ' ').slice(0, 100),
+        'data-user-msg-key': `message-${message.id}`,
+        'data-user-msg-label': requestNavigationLabel(message.raw_content || message.content),
       } : {})}
     >
       <div className="max-w-[85%] group">

@@ -318,6 +318,12 @@ export interface ChatMessage {
   ask_status?: 'pending' | 'answered' | 'timed_out' | 'expired' | null;
 }
 
+export interface UserMessageIndexEntry {
+  id: number;
+  content: string;
+  timestamp: string | null;
+}
+
 export interface CodexForkAnchor {
   type: 'initial' | 'latest' | 'user_message';
   id: number | null;
@@ -1362,6 +1368,8 @@ export const api = {
   // 分页翻旧消息不传，避免后台轮询/旧版客户端把任务在列表里来回顶到最前
   getTaskChatHistory: (taskId: number, compact = true, limit = 0, beforeId = 0, touch = false) =>
     request<ChatMessage[]>(`/api/tasks/${taskId}/chat/history?compact=${compact}${limit ? `&limit=${limit}` : ''}${beforeId ? `&before_id=${beforeId}` : ''}${touch ? '&touch=true' : ''}`),
+  getTaskUserMessageIndex: (taskId: number) =>
+    request<UserMessageIndexEntry[]>(`/api/tasks/${taskId}/chat/user-message-index`),
   getMessageDetail: (taskId: number, messageId: number) =>
     request<{ id: number; tool_input: string | null; tool_output: string | null; content: string | null }>(`/api/tasks/${taskId}/chat/${messageId}/detail`),
 

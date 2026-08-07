@@ -121,6 +121,10 @@ async def test_local_codex_accepts_monitor_when_main_mcp_is_enabled(
     from backend.config import settings
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
     response = await client.post("/api/tasks", json={
         "title": "Local Codex Monitor",
         "description": "d",
@@ -133,6 +137,25 @@ async def test_local_codex_accepts_monitor_when_main_mcp_is_enabled(
 
 
 @pytest.mark.asyncio
+async def test_local_codex_rejects_monitor_while_user_switch_is_off(
+    client,
+    monkeypatch,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks", json={
+        "title": "Closed Codex Monitor",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"monitor": True},
+    })
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+
+
+@pytest.mark.asyncio
 async def test_local_codex_accepts_monitor_command_without_persisting_skill(
     client,
     monkeypatch,
@@ -140,6 +163,10 @@ async def test_local_codex_accepts_monitor_command_without_persisting_skill(
     from backend.config import settings
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
     response = await client.post("/api/tasks", json={
         "title": "Local Codex Monitor command",
         "description": "$monitor watch the build",
@@ -159,6 +186,10 @@ async def test_local_codex_accepts_monitor_command_added_by_task_update(
     from backend.config import settings
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
     created = await client.post("/api/tasks", json={
         "title": "Updated local Codex Monitor command",
         "description": "ordinary task",
@@ -336,6 +367,10 @@ async def test_local_provider_switch_accepts_inherited_monitor(
     from backend.config import settings
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
     created = await client.post("/api/tasks", json={
         "title": "Claude Monitor",
         "description": "d",

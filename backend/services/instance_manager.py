@@ -923,6 +923,7 @@ class InstanceManager:
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
+                from backend.services.monitor_feature import monitor_enabled
 
                 codex_monitor_enabled = codex_monitor_supported_for_scope(
                     provider=provider,
@@ -930,6 +931,7 @@ class InstanceManager:
                     shared_from_id=task.shared_from_id,
                     metadata=task.metadata_,
                     codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+                    monitor_feature_enabled=await monitor_enabled(db),
                 )
                 if (
                     provider == "claude"

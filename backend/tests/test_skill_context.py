@@ -6,6 +6,7 @@ import pytest
 
 from backend.models.task import Task
 from backend.models.user_skill import UserSkill
+from backend.models.global_settings import GlobalSettings
 from backend.services.skill_context import (
     USER_SKILL_SNAPSHOTS_METADATA_KEY,
     WORKER_MANAGED_TASK_METADATA_KEY,
@@ -67,6 +68,7 @@ async def test_local_claude_and_codex_share_task_directory_semantics(
     from backend.config import settings
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    db_session.add(GlobalSettings(id=1, codex_monitor_enabled=True))
     user_skill = UserSkill(
         name="Personal review",
         description="Apply my review checklist",
@@ -120,30 +122,41 @@ def test_codex_monitor_scope_is_local_and_fail_closed():
     assert codex_monitor_supported_for_scope(
         provider="codex",
         codex_main_mcp_enabled=True,
+        monitor_feature_enabled=True,
     )
     assert not codex_monitor_supported_for_scope(
         provider="codex",
         worker_id=3,
         codex_main_mcp_enabled=True,
+        monitor_feature_enabled=True,
     )
     assert not codex_monitor_supported_for_scope(
         provider="codex",
         shared_from_id=4,
         codex_main_mcp_enabled=True,
+        monitor_feature_enabled=True,
     )
     assert not codex_monitor_supported_for_scope(
         provider="codex",
         metadata={WORKER_MANAGED_TASK_METADATA_KEY: True},
         codex_main_mcp_enabled=True,
+        monitor_feature_enabled=True,
     )
     assert not codex_monitor_supported_for_scope(
         provider="codex",
         metadata={USER_SKILL_SNAPSHOTS_METADATA_KEY: []},
         codex_main_mcp_enabled=True,
+        monitor_feature_enabled=True,
     )
     assert not codex_monitor_supported_for_scope(
         provider="codex",
         codex_main_mcp_enabled=False,
+        monitor_feature_enabled=True,
+    )
+    assert not codex_monitor_supported_for_scope(
+        provider="codex",
+        codex_main_mcp_enabled=True,
+        monitor_feature_enabled=False,
     )
 
 

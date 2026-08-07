@@ -19,6 +19,14 @@ class GlobalSettings(Base):
     git_https_token: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # Runtime mode switches (None = follow env default)
     use_pty_mode: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # CCM's custom Monitor is opt-in. This is independent from native Codex
+    # automations and remains fail-closed when the row predates the migration.
+    codex_monitor_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
     # Task sort: auto-move accessed task to top of its group (None = True)
     auto_sort_on_access: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # Context compaction threshold (0-1); None = follow env default

@@ -556,6 +556,11 @@ async def test_codex_monitor_migration_race_rejects_without_proxy_or_row(
     from backend.schemas.monitor_session import MonitorSessionCreate
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    settings_resp = await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
+    assert settings_resp.status_code == 200
     response = await client.post("/api/tasks", json={
         "title": "Codex monitor migration race",
         "description": "d",
@@ -1673,6 +1678,11 @@ async def test_create_monitor_accepts_local_codex_task(
     from backend.config import settings
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    settings_resp = await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
+    assert settings_resp.status_code == 200
     resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
         "provider": "codex",

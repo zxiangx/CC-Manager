@@ -146,6 +146,7 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
         42,
         {"monitor": True},
         api_base="http://manager:8321",
+        codex_monitor_enabled=True,
     ) == (
         McpServerSpec(
             name="ccm_skills",
@@ -383,7 +384,11 @@ def test_default_api_base_and_empty_auth_token(monkeypatch):
 
 
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():
-    (claude_spec,) = build_mcp_server_specs(42, provider="claude")
+    (claude_spec,) = build_mcp_server_specs(
+        42,
+        provider="claude",
+        codex_monitor_enabled=True,
+    )
     (closed_codex_spec,) = build_mcp_server_specs(42, provider="codex")
     (local_codex_spec,) = build_mcp_server_specs(
         42,

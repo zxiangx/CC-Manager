@@ -289,13 +289,17 @@ async def _terminalize_monitor_failure(
     )
 
 
-def _require_monitor_capability(task: Task) -> None:
+async def _require_monitor_capability(
+    task: Task,
+    db: AsyncSession,
+) -> None:
     """Enforce the same exact Task scope used by Task/Chat/MCP admission."""
 
     from backend.config import settings
     from backend.services.skill_context import (
         codex_monitor_supported_for_scope,
     )
+    from backend.services.monitor_feature import monitor_enabled
 
     if codex_monitor_supported_for_scope(
         provider=task.provider,
@@ -303,12 +307,13 @@ def _require_monitor_capability(task: Task) -> None:
         shared_from_id=task.shared_from_id,
         metadata=task.metadata_,
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+        monitor_feature_enabled=await monitor_enabled(db),
     ):
         return
     raise HTTPException(
         400,
-        "Codex Monitor requires a local, non-shared Task and enabled "
-        "Codex main-task MCP",
+        "CCM Monitor is disabled, or Codex Monitor requires a local, "
+        "non-shared Task and enabled Codex main-task MCP",
     )
 
 
@@ -327,7 +332,7 @@ async def create_monitor_session(
     await require_task_control(request, task, db)
     # Codex Worker and shared Tasks must fail before a proxy/network side
     # effect. Claude Worker routing remains unchanged.
-    _require_monitor_capability(task)
+    await _require_monitor_capability(task, db)
     if task.worker_id is not None:
         # Worker task：monitor 子进程依赖 task 所在机器的文件系统（ps/tail/signal
         # file），必须在 worker 上跑。本地镜像行由 relay 的 monitor_session_created
@@ -365,7 +370,7 @@ async def create_monitor_session(
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise HTTPException(404, "Task not found")
-                _require_monitor_capability(task)
+                await _require_monitor_capability(task, db)
                 if task.worker_id is not None:
                     from backend.main import worker_proxy
                     if worker_proxy is None:
@@ -386,7 +391,7 @@ async def create_monitor_session(
             task = await db.get(Task, task_id)
             if task is None:
                 raise HTTPException(404, "Task not found")
-            _require_monitor_capability(task)
+            await _require_monitor_capability(task, db)
             skills = task.enabled_skills or {}
             if not skills.get("monitor"):
                 raise HTTPException(

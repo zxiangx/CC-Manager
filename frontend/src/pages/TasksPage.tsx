@@ -10,7 +10,7 @@ import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
 import { resolveTagColor } from '../components/TagColors';
 import { ChevronLeft, ChevronRight, ChevronDown, Filter, PanelLeftClose, PanelLeftOpen, Search, X, Star, Archive, ArchiveRestore, Share2, Pin } from '../components/icons';
-import { PluginsBadge, SubAgentsBadge } from '../components/Tasks/TaskBadges';
+import { PluginsBadge, SubAgentsBadge, refreshCodexTaskSkillsCapability } from '../components/Tasks/TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../components/TagColors';
 import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
 import { useTaskSearch } from '../hooks/useTaskSearch';
@@ -72,6 +72,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
     if (msg.channel === 'system' && msg.data?.event === 'runtime_settings_changed') {
       setAutoSortOnAccess(Boolean(msg.data.auto_sort_on_access));
+      refreshCodexTaskSkillsCapability();
       return;
     }
     // Real-time status updates. This also keeps tasks that fell out of the

@@ -38,11 +38,24 @@ async def _get_task_data() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _codex_monitor_enabled(task_data: dict) -> bool:
+async def _monitor_enabled(task_data: dict) -> bool:
     from backend.config import settings
     from backend.services.skill_context import (
         codex_monitor_supported_for_scope,
     )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                f"{_API_BASE}/api/settings/runtime",
+                headers=_headers(),
+            )
+            response.raise_for_status()
+            feature_enabled = (
+                response.json().get("codex_monitor_enabled") is True
+            )
+    except Exception:
+        feature_enabled = False
 
     return codex_monitor_supported_for_scope(
         provider=task_data.get("provider"),
@@ -50,6 +63,7 @@ def _codex_monitor_enabled(task_data: dict) -> bool:
         shared_from_id=task_data.get("shared_from_id"),
         metadata=task_data.get("metadata_"),
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+        monitor_feature_enabled=feature_enabled,
     )
 
 
@@ -70,7 +84,7 @@ async def ccm_command_help() -> str:
         task_data = await _get_task_data()
         enabled_skills = task_data.get("enabled_skills") or {}
         provider = task_data.get("provider") or "claude"
-        codex_monitor_enabled = _codex_monitor_enabled(task_data)
+        codex_monitor_enabled = await _monitor_enabled(task_data)
 
         # Built-in commands
         commands = []
@@ -135,7 +149,7 @@ async def ccm_read_skill(skill_name: str) -> str:
         if not skill_supported(
             provider,
             skill_name,
-            codex_monitor_enabled=_codex_monitor_enabled(task_data),
+            codex_monitor_enabled=await _monitor_enabled(task_data),
         ):
             return json.dumps({
                 "success": False,
@@ -399,7 +413,7 @@ async def ccm_enable_skill(skill_name: str) -> str:
             if not skill_supported(
                 provider,
                 skill_name,
-                codex_monitor_enabled=_codex_monitor_enabled(task_data),
+                codex_monitor_enabled=await _monitor_enabled(task_data),
             ):
                 return json.dumps({
                     "success": False,

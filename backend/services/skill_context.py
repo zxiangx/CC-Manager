@@ -74,6 +74,7 @@ def codex_monitor_supported_for_scope(
     shared_from_id: int | None = None,
     metadata: Mapping[str, Any] | None = None,
     codex_main_mcp_enabled: bool = False,
+    monitor_feature_enabled: bool = False,
 ) -> bool:
     """Return whether this exact Task scope may expose CCM Monitor.
 
@@ -85,6 +86,8 @@ def codex_monitor_supported_for_scope(
 
     if (provider or "claude").lower() != "codex":
         return True
+    if not monitor_feature_enabled:
+        return False
     return bool(
         codex_main_mcp_enabled
         and worker_id is None
@@ -291,6 +294,7 @@ async def build_task_skill_context(
         return ""
     provider = (provider or task.provider or "claude").lower()
     from backend.config import settings
+    from backend.services.monitor_feature import monitor_enabled
 
     codex_monitor_enabled = codex_monitor_supported_for_scope(
         provider=provider,
@@ -298,6 +302,7 @@ async def build_task_skill_context(
         shared_from_id=task.shared_from_id,
         metadata=task.metadata_,
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+        monitor_feature_enabled=await monitor_enabled(db),
     )
     effective_skills = filter_enabled_skills(
         provider,

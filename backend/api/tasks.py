@@ -424,6 +424,7 @@ async def _validate_skill_configuration(
         skill_supported,
         user_skill_snapshot_from_mapping,
     )
+    from backend.services.monitor_feature import monitor_enabled
 
     provider = (provider or "claude").lower()
     codex_monitor_enabled = codex_monitor_supported_for_scope(
@@ -432,6 +433,7 @@ async def _validate_skill_configuration(
         shared_from_id=shared_from_id,
         metadata=metadata,
         codex_main_mcp_enabled=app_settings.codex_main_mcp_enabled,
+        monitor_feature_enabled=await monitor_enabled(db),
     )
     unsupported = sorted(
         name

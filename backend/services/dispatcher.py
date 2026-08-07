@@ -8304,8 +8304,10 @@ class GlobalDispatcher:
         """Rehydrate every durable local CCM Monitor after startup cleanup."""
 
         from backend.models.monitor_session import MonitorSession
+        from backend.services.monitor_feature import monitor_enabled
 
         async with self.db_factory() as db:
+            feature_enabled = await monitor_enabled(db)
             result = await db.execute(
                 select(MonitorSession).where(
                     MonitorSession.agent_type == "monitor",
@@ -8316,7 +8318,46 @@ class GlobalDispatcher:
                 )
             )
             sessions = list(result.scalars().all())
+            disabled_sessions = (
+                [session for session in sessions if session.provider == "codex"]
+                if not feature_enabled
+                else []
+            )
+            if disabled_sessions:
+                session_ids = [session.id for session in disabled_sessions]
+                await db.execute(
+                    update(MonitorSession)
+                    .where(MonitorSession.id.in_(session_ids))
+                    .values(
+                        status="cancelled",
+                        completed_at=datetime.utcnow(),
+                        next_check_at=None,
+                        active_turn_generation=None,
+                        turn_started_at=None,
+                    )
+                )
+                await db.commit()
+        if disabled_sessions:
+            from backend.services.mcp_config import (
+                cleanup_monitor_agent_mcp_config,
+            )
+
+            for session in disabled_sessions:
+                try:
+                    await self.stop_monitor_session_process(
+                        session.id,
+                        terminal=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Disabled Monitor cleanup failed at startup: %s",
+                        session.id,
+                    )
+                cleanup_monitor_agent_mcp_config(session.id)
+        disabled_ids = {session.id for session in disabled_sessions}
         for session in sessions:
+            if session.id in disabled_ids:
+                continue
             self.start_monitor_session(session)
 
     def start_monitor_session(self, monitor_session):

@@ -1,13 +1,19 @@
+import asyncio
+import logging
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from backend.api.deps import require_admin
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.database import get_db
 from backend.models.global_settings import GlobalSettings
+from backend.models.monitor_session import MonitorSession
+from backend.models.task import Task
 from backend.schemas.global_settings import (
     GlobalSettingsUpdate,
     GlobalSettingsResponse,
@@ -16,6 +22,7 @@ from backend.schemas.global_settings import (
 )
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+logger = logging.getLogger(__name__)
 
 
 async def _get_or_create(db: AsyncSession) -> GlobalSettings:
@@ -62,6 +69,75 @@ def _effective_compact_threshold(row: GlobalSettings) -> float:
     return settings.context_compact_threshold
 
 
+def _effective_monitor_enabled(row: GlobalSettings) -> bool:
+    from backend.services.monitor_feature import effective_monitor_enabled
+
+    return effective_monitor_enabled(row)
+
+
+async def _cancel_running_monitors(db: AsyncSession) -> None:
+    """Make the global off transition durable before stopping runtimes."""
+
+    rows = (
+        await db.execute(
+            select(MonitorSession.id, MonitorSession.task_id)
+            .join(Task, Task.id == MonitorSession.task_id)
+            .where(
+                Task.worker_id.is_(None),
+                MonitorSession.agent_type == "monitor",
+                MonitorSession.source == "ccm",
+                MonitorSession.provider == "codex",
+                MonitorSession.status == "running",
+            )
+        )
+    ).all()
+    if not rows:
+        return
+
+    session_ids = [session_id for session_id, _task_id in rows]
+    await db.execute(
+        update(MonitorSession)
+        .where(MonitorSession.id.in_(session_ids))
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
+    )
+    await db.commit()
+
+    from backend.main import broadcaster, dispatcher
+    from backend.services.mcp_config import cleanup_monitor_agent_mcp_config
+
+    async def stop_one(session_id: int, task_id: int) -> None:
+        try:
+            await dispatcher.stop_monitor_session_process(
+                session_id,
+                terminal=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Monitor runtime cleanup failed after global disable: %s",
+                session_id,
+            )
+        finally:
+            cleanup_monitor_agent_mcp_config(session_id)
+        await broadcaster.broadcast(
+            f"task:{task_id}",
+            {
+                "event": "monitor_session_status",
+                "monitor_session_id": session_id,
+                "status": "cancelled",
+            },
+        )
+
+    await asyncio.gather(*(stop_one(*row) for row in rows))
+
+
 @router.get("/runtime", response_model=RuntimeSettingsResponse)
 async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
     from backend.main import instance_manager
@@ -71,7 +147,7 @@ async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
         pty_available=_pty_available(),
         codex_app_server_enabled=settings.codex_app_server_enabled,
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
-        codex_monitor_enabled=settings.codex_main_mcp_enabled,
+        codex_monitor_enabled=_effective_monitor_enabled(row),
         auto_sort_on_access=row.auto_sort_on_access if row.auto_sort_on_access is not None else True,
         context_compact_threshold=_effective_compact_threshold(row),
     )
@@ -79,10 +155,13 @@ async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
 
 @router.put("/runtime", response_model=RuntimeSettingsResponse)
 async def update_runtime_settings(
-    body: RuntimeSettingsUpdate, db: AsyncSession = Depends(get_db)
+    request: Request,
+    body: RuntimeSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
 ):
     from backend.main import instance_manager
 
+    require_admin(request)
     row = await _get_or_create(db)
 
     if body.use_pty_mode is not None:
@@ -96,6 +175,9 @@ async def update_runtime_settings(
                 )
         row.use_pty_mode = effective
 
+    if body.codex_monitor_enabled is not None:
+        row.codex_monitor_enabled = body.codex_monitor_enabled
+
     if body.auto_sort_on_access is not None:
         row.auto_sort_on_access = body.auto_sort_on_access
 
@@ -103,6 +185,10 @@ async def update_runtime_settings(
         row.context_compact_threshold = body.context_compact_threshold
 
     await db.commit()
+
+    monitor_enabled = _effective_monitor_enabled(row)
+    if body.codex_monitor_enabled is False:
+        await _cancel_running_monitors(db)
 
     auto_sort = row.auto_sort_on_access if row.auto_sort_on_access is not None else True
     compact_threshold = _effective_compact_threshold(row)
@@ -113,7 +199,7 @@ async def update_runtime_settings(
         "use_pty_mode": instance_manager.pty_mode_enabled,
         "codex_app_server_enabled": settings.codex_app_server_enabled,
         "codex_main_mcp_enabled": settings.codex_main_mcp_enabled,
-        "codex_monitor_enabled": settings.codex_main_mcp_enabled,
+        "codex_monitor_enabled": monitor_enabled,
         "auto_sort_on_access": auto_sort,
         "context_compact_threshold": compact_threshold,
     })
@@ -122,7 +208,7 @@ async def update_runtime_settings(
         pty_available=_pty_available(),
         codex_app_server_enabled=settings.codex_app_server_enabled,
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
-        codex_monitor_enabled=settings.codex_main_mcp_enabled,
+        codex_monitor_enabled=monitor_enabled,
         auto_sort_on_access=auto_sort,
         context_compact_threshold=compact_threshold,
     )

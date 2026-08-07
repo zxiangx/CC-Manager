@@ -191,6 +191,10 @@ async def test_local_codex_can_read_enabled_monitor_skill(monkeypatch):
         mcp_mod,
         "_get_task_data",
         new=AsyncMock(return_value=task_data),
+    ), patch.object(
+        mcp_mod,
+        "_monitor_enabled",
+        new=AsyncMock(return_value=True),
     ), patch(
         "backend.services.skill_loader.discover_skills",
         return_value=skills,

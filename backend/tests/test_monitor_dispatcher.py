@@ -152,6 +152,10 @@ async def _seed_codex_monitor(
     codex_home: str | None = None,
 ):
     async with db_factory() as db:
+        from backend.models.global_settings import GlobalSettings
+
+        if await db.get(GlobalSettings, 1) is None:
+            db.add(GlobalSettings(id=1, codex_monitor_enabled=True))
         task = Task(
             title="codex monitor parent",
             description="d",
@@ -946,6 +950,37 @@ async def test_recover_monitor_sessions_rehydrates_only_safe_schedules(
     assert [call.args[0].id for call in start.call_args_list] == [
         scheduled_id
     ]
+
+
+@pytest.mark.asyncio
+async def test_recover_monitor_sessions_cancels_codex_when_feature_is_off(
+    dispatcher,
+    db_factory,
+):
+    from backend.models.global_settings import GlobalSettings
+
+    _task_id, session_id = await _seed_codex_monitor(db_factory)
+    async with db_factory() as db:
+        settings_row = await db.get(GlobalSettings, 1)
+        settings_row.codex_monitor_enabled = False
+        await db.commit()
+
+    with (
+        patch.object(dispatcher, "start_monitor_session") as start,
+        patch.object(
+            dispatcher,
+            "stop_monitor_session_process",
+            new=AsyncMock(),
+        ) as stop,
+    ):
+        await dispatcher._recover_monitor_sessions()
+
+    start.assert_not_called()
+    stop.assert_awaited_once_with(session_id, terminal=True)
+    async with db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        assert session.status == "cancelled"
+        assert session.completed_at is not None
 
 
 def test_scheduled_monitor_without_active_turn_is_not_restart_blocker(

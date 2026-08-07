@@ -14,6 +14,11 @@ let _codexTaskSkillsCapability:
   | Promise<CodexTaskSkillsCapability>
   | null = null;
 
+export function refreshCodexTaskSkillsCapability(): void {
+  _codexTaskSkillsCapability = null;
+  window.dispatchEvent(new Event('ccm-runtime-capability-changed'));
+}
+
 export async function loadPlugins(): Promise<{ key: string; label: string }[]> {
   if (_pluginsCache) return _pluginsCache;
   try {
@@ -47,6 +52,7 @@ async function loadCodexTaskSkillsCapability(): Promise<CodexTaskSkillsCapabilit
 export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () => void }) {
   const [open, setOpen] = useState(false);
   const [tools, setTools] = useState<{ key: string; label: string }[]>([]);
+  const [capabilityRevision, setCapabilityRevision] = useState(0);
   const remoteTaskScope = task.worker_id != null
     || task.shared_from_id != null
     || task.metadata_?.ccm_worker_managed_task === true
@@ -80,7 +86,13 @@ export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () =>
           ))
           .catch(() => {});
       });
-  }, [task.provider, remoteTaskScope]);
+  }, [task.provider, remoteTaskScope, capabilityRevision]);
+
+  useEffect(() => {
+    const refresh = () => setCapabilityRevision((value) => value + 1);
+    window.addEventListener('ccm-runtime-capability-changed', refresh);
+    return () => window.removeEventListener('ccm-runtime-capability-changed', refresh);
+  }, []);
 
   useEffect(() => {
     if (!open) return;

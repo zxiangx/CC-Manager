@@ -116,7 +116,7 @@ export interface RuntimeSettings {
   codex_app_server_enabled: boolean;
   /** Absent when proxying an older Worker that predates this capability. */
   codex_main_mcp_enabled?: boolean;
-  /** Absent on pre-PR7B2 runtimes; unknown must fail closed for Monitor. */
+  /** Persisted global opt-in; absent on older runtimes must fail closed. */
   codex_monitor_enabled?: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
@@ -1183,7 +1183,7 @@ export const api = {
 
   // Global Settings
   getRuntimeSettings: () => request<RuntimeSettings>('/api/settings/runtime'),
-  updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
+  updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'codex_monitor_enabled' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
     request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(data) }),
   getGitSettings: () => request<GlobalSettings>('/api/settings/git'),
   updateGitSettings: (data: Partial<GlobalSettings>) =>

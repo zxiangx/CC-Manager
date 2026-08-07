@@ -1717,6 +1717,10 @@ async def test_local_codex_chat_accepts_monitor_command(
     from backend.models.log_entry import LogEntry
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
     task_id = await _create_task_with_session(
         client,
         session_factory,

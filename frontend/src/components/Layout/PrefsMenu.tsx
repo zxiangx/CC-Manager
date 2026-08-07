@@ -68,6 +68,26 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
     }
   }, [runtime, switching]);
 
+  const toggleMonitor = useCallback(async () => {
+    if (!runtime || switching) return;
+    const enabled = runtime.codex_monitor_enabled === true;
+    if (enabled) {
+      const ok = window.confirm(
+        '关闭后 Codex 将看不到 CCM Monitor，正在运行的 Monitor 也会停止。确定关闭？',
+      );
+      if (!ok) return;
+    }
+    setSwitching(true);
+    try {
+      const updated = await api.updateRuntimeSettings({
+        codex_monitor_enabled: !enabled,
+      });
+      setRuntime(updated);
+    } catch { /* keep previous state */ } finally {
+      setSwitching(false);
+    }
+  }, [runtime, switching]);
+
   const changeCompactThreshold = useCallback(async (value: number) => {
     if (!runtime || switching) return;
     setSwitching(true);
@@ -159,6 +179,28 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
                 className={toggleCls(runtime.use_pty_mode)}
               >
                 <span className={knobCls(runtime.use_pty_mode)} />
+              </button>
+            </div>
+          )}
+          {isAdmin && runtime && (
+            <div
+              className="flex items-center justify-between gap-3"
+              title={
+                runtime.codex_monitor_enabled
+                  ? 'CCM Monitor 已向受支持的任务开放'
+                  : '关闭时 Codex 不会收到 Monitor skill 或工具'
+              }
+            >
+              <span className={`text-xs ${runtime.codex_monitor_enabled ? 'text-green-400' : 'text-gray-400'}`}>
+                CCM Monitor
+              </span>
+              <button
+                aria-label="切换 CCM Monitor"
+                onClick={toggleMonitor}
+                disabled={switching || !runtime.codex_main_mcp_enabled}
+                className={toggleCls(runtime.codex_monitor_enabled === true)}
+              >
+                <span className={knobCls(runtime.codex_monitor_enabled === true)} />
               </button>
             </div>
           )}

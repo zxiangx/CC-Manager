@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { PrefsMenu } from './PrefsMenu';
+import { api } from '../../api/client';
 
 vi.mock('../../api/client', () => ({
   api: {
@@ -10,6 +11,7 @@ vi.mock('../../api/client', () => ({
       pty_available: true,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: false,
       auto_sort_on_access: true,
       context_compact_threshold: 0.8,
     }),
@@ -160,6 +162,33 @@ describe('PrefsMenu', () => {
       const status = await screen.findByTestId('codex-main-mcp-status');
       expect(status).toHaveTextContent('Codex 主任务 MCP');
       expect(status).toHaveTextContent('已启用');
+    });
+
+    it('enables CCM Monitor through the persisted runtime switch', async () => {
+      vi.mocked(api.updateRuntimeSettings).mockResolvedValue({
+        use_pty_mode: false,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        codex_monitor_enabled: true,
+        auto_sort_on_access: true,
+        context_compact_threshold: 0.8,
+      });
+      const user = userEvent.setup();
+      render(<PrefsMenu isAdmin={true} />);
+
+      await user.click(screen.getByTitle('偏好设置（时区 / 主题）'));
+      const toggle = await screen.findByRole('button', { name: '切换 CCM Monitor' });
+      expect(toggle).toHaveClass('bg-gray-600');
+
+      await user.click(toggle);
+
+      await waitFor(() => {
+        expect(api.updateRuntimeSettings).toHaveBeenCalledWith({
+          codex_monitor_enabled: true,
+        });
+        expect(toggle).toHaveClass('bg-green-500');
+      });
     });
 
     it('shows logout button', async () => {

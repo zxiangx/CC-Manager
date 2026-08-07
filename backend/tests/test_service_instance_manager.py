@@ -1954,7 +1954,7 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
             task.id,
             {},
             provider="codex",
-            codex_monitor_enabled=True,
+            codex_monitor_enabled=False,
         )
     )
     flag_index = argv.index("-c")
@@ -2650,7 +2650,7 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
             task.id,
             {},
             provider="codex",
-            codex_monitor_enabled=True,
+            codex_monitor_enabled=False,
         )
     )
     flag_index = argv.index("-c")

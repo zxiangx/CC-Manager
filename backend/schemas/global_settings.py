@@ -36,5 +36,6 @@ class RuntimeSettingsResponse(BaseModel):
 
 class RuntimeSettingsUpdate(BaseModel):
     use_pty_mode: bool | None = None
+    codex_monitor_enabled: bool | None = None
     auto_sort_on_access: bool | None = None
     context_compact_threshold: float | None = Field(default=None, ge=0.3, le=0.95)

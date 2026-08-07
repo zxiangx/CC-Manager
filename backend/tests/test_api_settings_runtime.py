@@ -1,5 +1,10 @@
 """Tests for /api/settings/runtime — frontend PTY mode toggle."""
 import pytest
+from sqlalchemy import select
+from unittest.mock import AsyncMock, patch
+
+from backend.models.monitor_session import MonitorSession
+from backend.models.task import Task
 
 
 @pytest.mark.asyncio
@@ -12,11 +17,12 @@ async def test_get_runtime_settings(client):
     assert "codex_app_server_enabled" in data
     assert "codex_main_mcp_enabled" in data
     assert "codex_monitor_enabled" in data
+    assert data["codex_monitor_enabled"] is False
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [True, False])
-async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
+async def test_runtime_settings_keeps_monitor_switch_independent_from_main_mcp(
     client, monkeypatch, enabled,
 ):
     from backend.config import settings
@@ -26,15 +32,18 @@ async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
     get_resp = await client.get("/api/settings/runtime")
     assert get_resp.status_code == 200
     assert get_resp.json()["codex_main_mcp_enabled"] is enabled
-    assert get_resp.json()["codex_monitor_enabled"] is enabled
+    assert get_resp.json()["codex_monitor_enabled"] is False
 
     put_resp = await client.put(
         "/api/settings/runtime",
-        json={"auto_sort_on_access": True},
+        json={"codex_monitor_enabled": True},
     )
     assert put_resp.status_code == 200
     assert put_resp.json()["codex_main_mcp_enabled"] is enabled
-    assert put_resp.json()["codex_monitor_enabled"] is enabled
+    assert put_resp.json()["codex_monitor_enabled"] is True
+
+    get_resp = await client.get("/api/settings/runtime")
+    assert get_resp.json()["codex_monitor_enabled"] is True
 
 
 @pytest.mark.asyncio
@@ -125,3 +134,63 @@ async def test_context_compact_threshold_rejects_out_of_range(client):
             "/api/settings/runtime", json={"context_compact_threshold": bad}
         )
         assert resp.status_code == 422, f"{bad} should be rejected"
+
+
+@pytest.mark.asyncio
+async def test_disabling_monitor_cancels_running_codex_monitors(
+    client,
+    session_factory,
+):
+    enabled = await client.put(
+        "/api/settings/runtime",
+        json={"codex_monitor_enabled": True},
+    )
+    assert enabled.status_code == 200
+
+    created = await client.post("/api/tasks", json={
+        "title": "monitor owner",
+        "description": "test",
+        "provider": "codex",
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            Task.__table__.update()
+            .where(Task.id == task_id)
+            .values(status="in_progress")
+        )
+        monitor = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            provider="codex",
+            description="running monitor",
+            status="running",
+        )
+        db.add(monitor)
+        await db.commit()
+        monitor_id = monitor.id
+
+    from backend.main import dispatcher
+
+    with patch.object(
+        dispatcher,
+        "stop_monitor_session_process",
+        new=AsyncMock(),
+    ) as stop:
+        disabled = await client.put(
+            "/api/settings/runtime",
+            json={"codex_monitor_enabled": False},
+        )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["codex_monitor_enabled"] is False
+    stop.assert_awaited_once_with(monitor_id, terminal=True)
+    async with session_factory() as db:
+        row = await db.scalar(
+            select(MonitorSession).where(MonitorSession.id == monitor_id)
+        )
+    assert row is not None
+    assert row.status == "cancelled"
+    assert row.completed_at is not None

@@ -1,5 +1,7 @@
 """Security and command-template tests for Monitor remote reads."""
 
+import asyncio
+
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -133,3 +135,19 @@ async def test_missing_profile_is_a_permanent_capability_failure():
 
     assert exc_info.value.code == "profile_not_found"
     assert exc_info.value.permanent is True
+
+
+async def test_remote_read_does_not_swallow_cancellation():
+    fake_executor = AsyncMock()
+    fake_executor.run.side_effect = asyncio.CancelledError()
+
+    with patch(
+        "backend.services.monitor_remote_read.SSHExecutor",
+        return_value=fake_executor,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await execute_monitor_remote_read(
+                raw_profiles=_profiles_json(),
+                profile_name="yc_h100",
+                operation="connection",
+            )

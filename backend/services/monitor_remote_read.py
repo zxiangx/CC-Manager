@@ -379,9 +379,7 @@ async def execute_monitor_remote_read(
             sensitive=True,
             max_output_bytes=_MAX_OUTPUT_BYTES,
         )
-    except BaseException as exc:
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            raise
+    except Exception as exc:
         raise _translate_transport_error(exc) from exc
     return MonitorRemoteReadResult(
         profile=profile_name,

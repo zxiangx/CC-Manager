@@ -5860,6 +5860,44 @@ async def test_codex_sub_agent_controller_unsubscribes_after_terminal_turn(
 
 
 @pytest.mark.asyncio
+async def test_codex_sub_agent_controller_unsubscribes_full_thread_lineage(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="codex-controller-lineage-unsubscribe")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+
+    process = _make_mock_process(pid=54_330, returncode=0)
+    process.thread_id = "thread-parent"
+    process.cleanup_thread_ids = (
+        "thread-child-a",
+        "thread-child-b",
+        "thread-parent",
+    )
+    process.unsubscribe_on_terminal = True
+    registry = MagicMock()
+    registry.unsubscribe_thread = AsyncMock(return_value="unsubscribed")
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._codex_app_server = registry
+
+    await im._consume_output_impl(
+        instance_id,
+        None,
+        process,
+        provider="codex",
+    )
+
+    assert registry.unsubscribe_thread.await_args_list == [
+        call("thread-child-a"),
+        call("thread-child-b"),
+        call("thread-parent"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_codex_turn_without_thread_mcp_does_not_unsubscribe(
     db_factory,
 ):
@@ -7437,6 +7475,68 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
     assert task.status == "failed"
     assert task.error_message == error_text
     assert [entry.content for entry in error_entries] == [error_text]
+
+
+@pytest.mark.asyncio
+async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
+    db_factory,
+):
+    async with db_factory() as db:
+        inst = Instance(name="codex-request-blocked-inst", status="running")
+        task = Task(
+            title="codex request blocked task",
+            description="d",
+            status="executing",
+            provider="codex",
+            session_id="poisoned-thread",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        inst.current_task_id = task.id
+        await db.commit()
+        inst_id, task_id = inst.id, task.id
+
+    process = _make_mock_process(returncode=0)
+    output = iter([
+        json.dumps({
+            "type": "turn.failed",
+            "error": {
+                "message": "Request blocked.",
+                "codex_error_info": "other",
+            },
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[inst_id] = process
+
+    await manager._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        inst = await db.get(Instance, inst_id)
+
+    assert task.status == "failed"
+    assert task.metadata_["codex_quarantine_reason"] == "request_blocked"
+    assert task.metadata_["codex_quarantined_session_id"] == "poisoned-thread"
+    assert task.metadata_["codex_quarantined_sessions"] == ["poisoned-thread"]
+    assert "下一条消息" in task.error_message
+    assert inst.status == "idle"
+    assert inst.current_task_id is None
 
 
 @pytest.mark.asyncio

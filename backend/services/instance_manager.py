@@ -6168,7 +6168,23 @@ class InstanceManager:
             process,
             exit_code,
         )
-        new_status = "idle" if successful_terminal else "error"
+        from backend.services.codex_recovery import (
+            is_request_blocked,
+            quarantine_metadata,
+        )
+        recoverable_codex_block = bool(
+            task_id
+            and chat_initiated
+            and is_request_blocked(provider, failure_text)
+        )
+        # A provider-level rejection does not mean the reusable CCM worker is
+        # unhealthy. Keep the slot available while the Task records a failed,
+        # quarantined turn for safe next-message recovery.
+        new_status = (
+            "idle"
+            if successful_terminal or recoverable_codex_block
+            else "error"
+        )
         final_status = None
         task_publication_generation: dict | None = None
         failure_notice_data = None
@@ -6207,6 +6223,8 @@ class InstanceManager:
                             Task.status,
                             Task.retry_count,
                             Task.instance_id,
+                            Task.session_id,
+                            Task.metadata_,
                             Task.started_at,
                             Task.completed_at,
                         ).where(Task.id == task_id)
@@ -6236,6 +6254,17 @@ class InstanceManager:
                             if failure_text
                             else f"Process exited with code {exit_code}"
                         )
+                        if recoverable_codex_block:
+                            task_values.update(
+                                error_message=(
+                                    "Request blocked. CCM 已隔离该 Codex thread；"
+                                    "下一条消息会从安全摘要自动创建新 thread。"
+                                ),
+                                metadata_=quarantine_metadata(
+                                    current_task_generation.metadata_,
+                                    current_task_generation.session_id,
+                                ),
+                            )
                     task_update = await db.execute(
                         update(Task)
                         .where(
@@ -6513,9 +6542,19 @@ class InstanceManager:
             and self._codex_app_server is not None
         ):
             thread_id = getattr(process, "thread_id", None)
-            if thread_id:
+            lineage = getattr(process, "cleanup_thread_ids", ())
+            if not isinstance(lineage, (tuple, list, set)):
+                lineage = ()
+            cleanup_thread_ids = list(
+                dict.fromkeys(
+                    tuple(lineage) + ((thread_id,) if thread_id else ())
+                )
+            )
+            for cleanup_thread_id in cleanup_thread_ids:
                 try:
-                    await self._codex_app_server.unsubscribe_thread(thread_id)
+                    await self._codex_app_server.unsubscribe_thread(
+                        cleanup_thread_id
+                    )
                 except Exception:
                     # A queued follow-up may already be resuming this thread.
                     # In that case its later terminal consumer will retry the
@@ -6524,7 +6563,7 @@ class InstanceManager:
                         "Codex controller thread unsubscribe deferred: "
                         "task=%s thread=%s",
                         task_id,
-                        thread_id,
+                        cleanup_thread_id,
                         exc_info=True,
                     )
 

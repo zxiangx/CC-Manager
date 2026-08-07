@@ -511,6 +511,10 @@ class CodexTurnProcess:
         # admission response is persisted separately for safe fork mapping.
         self.admitted_turn_id: str | None = None
         self.unsubscribe_on_terminal = False
+        # Filled at terminal publication before the native context detaches.
+        # InstanceManager uses the immutable snapshot to unload every
+        # thread-scoped MCP helper, including collaboration descendants.
+        self.cleanup_thread_ids: tuple[str, ...] = ()
         self.returncode: int | None = None
         self.termination_kind: str | None = None
         self.stdout = asyncio.StreamReader(limit=10 * 1024 * 1024)
@@ -1845,6 +1849,9 @@ class CodexAppServer:
             (time.perf_counter() - context.launch_started) * 1000,
             status,
         )
+        context.process.cleanup_thread_ids = tuple(
+            sorted(context.descendant_thread_ids)
+        ) + (context.thread_id,)
         context.process.finish(
             exit_code,
             stderr,

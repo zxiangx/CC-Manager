@@ -3276,6 +3276,10 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
     })
 
     assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    assert process.cleanup_thread_ids == (
+        "thread-goal-child",
+        "thread-goal-descendant",
+    )
     rows = []
     while line := await process.stdout.readline():
         rows.append(json.loads(line))

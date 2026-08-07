@@ -4899,6 +4899,26 @@ class GlobalDispatcher:
             if task is None:
                 return False
             observed_generation = self._task_status_generation(task)
+            from backend.services.codex_recovery import (
+                is_request_blocked,
+                quarantine_metadata,
+            )
+            task_values = {
+                "status": "failed",
+                "error_message": reason,
+                "completed_at": datetime.utcnow(),
+            }
+            if is_request_blocked(task.provider, reason):
+                task_values.update(
+                    error_message=(
+                        "Request blocked. CCM 已隔离该 Codex thread；"
+                        "下一条消息会从安全摘要自动创建新 thread。"
+                    ),
+                    metadata_=quarantine_metadata(
+                        task.metadata_,
+                        task.session_id,
+                    ),
+                )
             changed = await db.execute(
                 update(Task)
                 .where(
@@ -4907,11 +4927,7 @@ class GlobalDispatcher:
                     ),
                     task_retry_not_superseded_predicate(),
                 )
-                .values(
-                    status="failed",
-                    error_message=reason,
-                    completed_at=datetime.utcnow(),
-                )
+                .values(**task_values)
             )
             if not changed.rowcount:
                 await db.rollback()
@@ -11176,6 +11192,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 task.session_id, provider=provider
             ) is None
             if task.session_id and (task.status == "failed" or session_gone):
+                from backend.services.codex_recovery import (
+                    clear_active_quarantine,
+                    has_request_blocked_quarantine,
+                )
                 # Snapshot the complete resume generation before any clone /
                 # compaction awaits.  A concurrent cancel, retry, or owner/session
                 # change must win and keep this exact QueuedMessage unconsumed.
@@ -11197,8 +11217,23 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # turn.  Unlike Claude's flat JSONL, it cannot be made into a
                 # new thread by merely copying/renaming the file because the
                 # thread id is embedded in its metadata.
-                keep_codex_session = provider == "codex" and not session_gone
-                cloned = None if keep_codex_session else await _clone_session(task_id, db)
+                quarantined_codex_session = bool(
+                    provider == "codex"
+                    and has_request_blocked_quarantine(
+                        task.metadata_,
+                        error_message=task.error_message,
+                    )
+                )
+                keep_codex_session = bool(
+                    provider == "codex"
+                    and not session_gone
+                    and not quarantined_codex_session
+                )
+                cloned = (
+                    None
+                    if keep_codex_session or quarantined_codex_session
+                    else await _clone_session(task_id, db)
+                )
                 recovered_session_id = recovery_session_id
                 recovered_context_usage = task.context_window_usage
                 recovered_prompt = msg.prompt
@@ -11221,6 +11256,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     recovered_session_id = None
                     recovered_context_usage = None
                     if summary:
+                        if quarantined_codex_session:
+                            summary = (
+                                "## CCM 安全恢复说明\n"
+                                "上一条原生 Codex thread 因上游 Request blocked "
+                                "已被隔离。原始日志仍完整保留在 CCM 数据库中。"
+                                "如需分析大量历史日志，必须分页、小批量读取并逐批"
+                                "提炼；不要一次输出或回灌 raw_json、tool_output "
+                                "等原始大字段。\n\n"
+                                + summary
+                            )
                         recovered_prompt = build_compacted_resume_prompt(
                             summary,
                             msg.current_message,
@@ -11319,6 +11364,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 current.context_window_usage = recovered_context_usage
                 current.completed_at = None
                 current.error_message = None
+                if quarantined_codex_session:
+                    current.metadata_ = clear_active_quarantine(
+                        current.metadata_
+                    )
                 await db.commit()
                 msg.prompt = recovered_prompt
                 if recovered_session_id is None:

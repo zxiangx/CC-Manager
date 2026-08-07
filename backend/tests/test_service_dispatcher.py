@@ -5131,6 +5131,41 @@ async def test_owned_mode_publication_cannot_cross_new_generation(
 
 
 @pytest.mark.asyncio
+async def test_initial_codex_request_blocked_marks_session_for_safe_recovery(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="initial-codex-request-blocked")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="initial blocked",
+            status="executing",
+            provider="codex",
+            instance_id=instance.id,
+            session_id="initial-poisoned-thread",
+            retry_count=0,
+        )
+        db.add(task)
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id = task.id
+
+    assert await d._fail_owned_task(generation, "Request blocked.")
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "failed"
+    assert task.metadata_["codex_quarantine_reason"] == "request_blocked"
+    assert (
+        task.metadata_["codex_quarantined_session_id"]
+        == "initial-poisoned-thread"
+    )
+    assert "下一条消息" in task.error_message
+
+
+@pytest.mark.asyncio
 async def test_queued_codex_busy_launch_rolls_back_status_and_temp_skills(
     db_factory, monkeypatch,
 ):
@@ -6683,6 +6718,47 @@ async def test_failed_codex_task_reuses_present_native_thread(db_factory, monkey
 
     clone.assert_not_awaited()
     assert d.instance_manager.launch.await_args.kwargs["resume_session_id"] == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
+    db_factory, monkeypatch,
+):
+    """A poisoned Codex rollout must never be resumed on the next message."""
+    import backend.api.tasks as tasks_mod
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    clone = AsyncMock()
+    monkeypatch.setattr(tasks_mod, "_clone_session", clone)
+    d._compact_session = AsyncMock(return_value="bounded conversation summary")
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.provider = "codex"
+        task.status = "failed"
+        task.error_message = "Request blocked."
+        task.metadata_ = {
+            "codex_quarantine_reason": "request_blocked",
+            "codex_quarantined_session_id": "sess-1",
+            "codex_quarantined_sessions": ["sess-1"],
+        }
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    clone.assert_not_awaited()
+    d._compact_session.assert_awaited_once()
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert "CCM 安全恢复说明" in launch["prompt"]
+    assert "bounded conversation summary" in launch["prompt"]
+    assert launch["current_message"] == "hi"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.metadata_["codex_quarantined_sessions"] == ["sess-1"]
+        assert "codex_quarantine_reason" not in task.metadata_
+        assert "codex_quarantined_session_id" not in task.metadata_
 
 
 @pytest.mark.asyncio

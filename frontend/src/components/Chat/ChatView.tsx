@@ -1883,9 +1883,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   <button
                     key={`${anchor.type}-${anchor.id ?? 'initial'}`}
                     type="button"
-                    onClick={() => setSelectedForkAnchor(anchor)}
+                    onClick={() => {
+                      if (anchor.available !== false) setSelectedForkAnchor(anchor);
+                    }}
+                    disabled={anchor.available === false}
                     className={`w-full rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                      selectedForkAnchor?.type === anchor.type
+                      anchor.available === false
+                        ? 'cursor-not-allowed border-gray-800 bg-gray-900/20 opacity-55'
+                        : selectedForkAnchor?.type === anchor.type
                         && selectedForkAnchor?.id === anchor.id
                         ? 'border-indigo-400 bg-indigo-500/10'
                         : 'border-gray-700 bg-gray-900/40 hover:border-gray-600 hover:bg-gray-700/40'
@@ -1897,6 +1902,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     {anchor.type === 'latest' && (
                       <div className="mt-1 text-[11px] text-indigo-300">
                         包含全部用户消息和回答，新 Task 输入框为空
+                      </div>
+                    )}
+                    {anchor.available === false && anchor.unavailable_reason && (
+                      <div className="mt-1 text-[11px] text-amber-400/90">
+                        无法精确分叉：{anchor.unavailable_reason}
                       </div>
                     )}
                     <div className="mt-1.5 flex items-center gap-2 text-[11px] text-gray-500">

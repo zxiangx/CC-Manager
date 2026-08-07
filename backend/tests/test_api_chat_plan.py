@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -112,7 +113,22 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert first_message["item_id"] == "item-1"
     assert first_message["turn_id"] == "turn-1"
 
-    anchors = await client.get(f"/api/tasks/{task_id}/fork-anchors")
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
+        {"id": "turn-3", "status": "completed", "items": [{"id": "item-3"}]},
+    ]
+    with (
+        patch(
+            "backend.api.chat._codex_fork_home",
+            return_value=("/tmp/codex-home", "codex-a"),
+        ),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-source", "turns": turns}),
+        ),
+    ):
+        anchors = await client.get(f"/api/tasks/{task_id}/fork-anchors")
     assert anchors.status_code == 200, anchors.text
     assert [
         (item["type"], item["id"], item["content"])
@@ -124,11 +140,6 @@ async def test_codex_fork_starts_before_selected_user_message(
         ("user_message", later_user_id, "do not copy"),
     ]
 
-    turns = [
-        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
-        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
-        {"id": "turn-3", "status": "completed", "items": [{"id": "item-3"}]},
-    ]
     with (
         patch(
             "backend.api.chat._codex_fork_home",
@@ -195,6 +206,261 @@ async def test_codex_fork_starts_before_selected_user_message(
         "first answer",
         f"Forked from Task #{task_id}",
     ]
+    copied_raw = json.loads(copied[0].raw_json)
+    assert copied_raw["fork_source_task_id"] == task_id
+    assert copied_raw["fork_source_log_id"] == first_message["id"]
+
+
+def test_codex_fork_resolver_prefers_unique_terminal_turn_over_stale_alias():
+    from backend.api.chat import ForkAnchor, _resolve_fork_turn
+
+    rows = [
+        LogEntry(
+            id=1,
+            event_type="message",
+            role="assistant",
+            content="before",
+            raw_json='{"turn_id":"turn-1"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=2,
+            event_type="user_message",
+            role="user",
+            content="fork here",
+            raw_json='{"raw_content":"fork here"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=3,
+            event_type="message",
+            role="assistant",
+            content="early stale alias",
+            raw_json='{"type":"item.completed","turn_id":"turn-1"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=4,
+            event_type="system_event",
+            role=None,
+            content="turn.completed",
+            raw_json='{"type":"turn.completed","turn_id":"turn-2"}',
+            is_error=False,
+        ),
+    ]
+
+    target_turn_id, cutoff = _resolve_fork_turn(
+        anchor=ForkAnchor(type="user_message", id=2),
+        rows=rows,
+        turns=[
+            {"id": "turn-1", "status": "completed"},
+            {"id": "turn-2", "status": "completed"},
+        ],
+    )
+
+    assert target_turn_id == "turn-1"
+    assert cutoff == 1
+
+
+def test_codex_fork_resolver_does_not_guess_by_message_ordinal():
+    from backend.api.chat import ForkAnchor, _resolve_fork_turn
+
+    rows = [
+        LogEntry(
+            id=1,
+            event_type="message",
+            role="assistant",
+            content="legacy answer without native ids",
+            is_error=False,
+        ),
+        LogEntry(
+            id=2,
+            event_type="user_message",
+            role="user",
+            content="fork here",
+            raw_json='{"raw_content":"fork here"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=3,
+            event_type="message",
+            role="assistant",
+            content="another answer without native ids",
+            is_error=False,
+        ),
+    ]
+
+    with pytest.raises(HTTPException) as exc_info:
+        _resolve_fork_turn(
+            anchor=ForkAnchor(type="user_message", id=2),
+            rows=rows,
+            turns=[
+                {"id": "turn-1", "status": "completed"},
+                {"id": "turn-2", "status": "completed"},
+            ],
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == (
+        "This user message cannot be mapped safely to a Codex turn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_legacy_copied_anchor_uses_native_parent_lineage(
+    client,
+    session_factory,
+):
+    parent_response = await client.post("/api/tasks", json={
+        "title": "Parent",
+        "description": "initial",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+    })
+    child_response = await client.post("/api/tasks", json={
+        "title": "Child",
+        "description": "initial",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+    })
+    parent_id = parent_response.json()["id"]
+    child_id = child_response.json()["id"]
+
+    async with session_factory() as db:
+        parent = await db.get(Task, parent_id)
+        child = await db.get(Task, child_id)
+        parent.status = child.status = "completed"
+        parent.session_id = "thread-parent"
+        child.session_id = "thread-child"
+        parent.metadata_ = {"codex_account_id": "parent-account"}
+
+        before = LogEntry(
+            task_id=parent_id,
+            event_type="message",
+            role="assistant",
+            content="before",
+            raw_json='{"turn_id":"turn-1"}',
+            is_error=False,
+        )
+        selected = LogEntry(
+            task_id=parent_id,
+            event_type="user_message",
+            role="user",
+            content="fork this inherited message",
+            raw_json='{"raw_content":"fork this inherited message"}',
+            is_error=False,
+        )
+        after = LogEntry(
+            task_id=parent_id,
+            event_type="message",
+            role="assistant",
+            content="after",
+            raw_json='{"turn_id":"turn-2"}',
+            is_error=False,
+        )
+        later = LogEntry(
+            task_id=parent_id,
+            event_type="user_message",
+            role="user",
+            content="original child seed",
+            is_error=False,
+        )
+        db.add_all([before, selected, after, later])
+        await db.flush()
+        child.metadata_ = {
+            "codex_account_id": "child-account",
+            "forked_from_task_id": parent_id,
+            "forked_from_log_id": later.id,
+            "fork_mode": "branch",
+        }
+        copied = []
+        for row in (before, selected, after):
+            copied.append(LogEntry(
+                task_id=child_id,
+                event_type=row.event_type,
+                role=row.role,
+                content=row.content,
+                raw_json=row.raw_json,
+                is_error=row.is_error,
+                timestamp=row.timestamp,
+            ))
+        db.add_all(copied)
+        await db.flush()
+        copied_selected_id = copied[1].id
+        db.add(LogEntry(
+            task_id=child_id,
+            event_type="system_event",
+            role="system",
+            content=f"Forked from Task #{parent_id}",
+            raw_json=json.dumps({"forked_from_task_id": parent_id}),
+            is_error=False,
+        ))
+        await db.commit()
+
+    turns = [
+        {"id": "turn-1", "status": "completed"},
+        {"id": "turn-2", "status": "completed"},
+    ]
+
+    def fork_home(task, session_id=None):
+        if task.id == child_id:
+            assert session_id == "thread-child"
+            return "/tmp/child-home", "child-account"
+        assert task.id == parent_id
+        assert session_id == "thread-parent"
+        return "/tmp/parent-home", "parent-account"
+
+    with (
+        patch("backend.api.chat._codex_fork_home", side_effect=fork_home),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-parent", "turns": turns}),
+        ) as read_thread,
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-grandchild"}),
+        ) as fork_thread,
+    ):
+        anchors_response = await client.get(
+            f"/api/tasks/{child_id}/fork-anchors"
+        )
+        assert anchors_response.status_code == 200, anchors_response.text
+        inherited_anchor = next(
+            item
+            for item in anchors_response.json()
+            if item["id"] == copied_selected_id
+        )
+        assert inherited_anchor["available"] is True
+        assert inherited_anchor["unavailable_reason"] is None
+        response = await client.post(
+            f"/api/tasks/{child_id}/fork",
+            json={
+                "anchor": {
+                    "type": "user_message",
+                    "id": copied_selected_id,
+                }
+            },
+        )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["metadata_"]["forked_from_task_id"] == child_id
+    assert payload["metadata_"]["forked_from_native_task_id"] == parent_id
+    assert payload["metadata_"]["codex_account_id"] == "parent-account"
+    assert read_thread.await_count == 3
+    assert read_thread.await_args_list[0].args == (
+        "/tmp/child-home",
+        "thread-child",
+    )
+    assert all(
+        call.args == ("/tmp/parent-home", "thread-parent")
+        for call in read_thread.await_args_list[1:]
+    )
+    fork_thread.assert_awaited_once_with(
+        "/tmp/parent-home",
+        "thread-parent",
+        last_turn_id="turn-1",
+    )
 
 
 @pytest.mark.asyncio

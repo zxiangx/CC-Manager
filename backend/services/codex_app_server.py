@@ -506,6 +506,10 @@ class CodexTurnProcess:
     ) -> None:
         self.pid = pid
         self.thread_id = thread_id
+        # Exact id returned by turn/start for this submitted user message.
+        # Notifications can temporarily use another active-turn alias, so the
+        # admission response is persisted separately for safe fork mapping.
+        self.admitted_turn_id: str | None = None
         self.unsubscribe_on_terminal = False
         self.returncode: int | None = None
         self.termination_kind: str | None = None
@@ -2898,6 +2902,7 @@ class CodexAppServer:
                 (time.perf_counter() - launch_started) * 1000,
                 adopted_turn_id,
             )
+            turn_process.admitted_turn_id = str(adopted_turn_id)
             return turn_process, thread_id
 
         turn_request = asyncio.create_task(self._request("turn/start", turn_params))
@@ -2968,6 +2973,7 @@ class CodexAppServer:
                 )
             raise CodexAppServerError(message)
         context.admitted_turn_id = str(turn_id)
+        turn_process.admitted_turn_id = str(turn_id)
         # An already-running steerable turn can emit notifications before this
         # response arrives. In that case its notification turn id is the real
         # active generation and must not be overwritten by this submission id.

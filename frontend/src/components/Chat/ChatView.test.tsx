@@ -1440,6 +1440,30 @@ describe('ChatView', () => {
       });
     });
 
+    it('shows an unavailable fork anchor without allowing it to be selected', async () => {
+      const task = makeTask({ id: 15, provider: 'codex', status: 'completed' });
+      const unavailable = {
+        type: 'user_message' as const,
+        id: 501,
+        content: 'inherited message without native rollout',
+        timestamp: '2024-01-01T00:03:00Z',
+        attachments: [],
+        available: false,
+        unavailable_reason: 'Native Codex history is unavailable',
+      };
+      (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([unavailable]);
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByLabelText('Fork Codex session'));
+      const anchor = await screen.findByRole('button', {
+        name: /inherited message without native rollout/,
+      });
+      expect(anchor).toBeDisabled();
+      expect(screen.getByText(/Native Codex history is unavailable/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Create fork' })).toBeDisabled();
+    });
+
     it('does not offer native fork actions for Claude sessions', () => {
       const task = makeTask({ provider: 'claude', status: 'completed' });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);

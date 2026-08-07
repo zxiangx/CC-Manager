@@ -2990,11 +2990,25 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
             instance_id=inst.id,
         )
         db.add(task)
+        await db.flush()
+        source_log = LogEntry(
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="work",
+            raw_json='{"raw_content":"work"}',
+            is_error=False,
+        )
+        db.add(source_log)
         await db.commit()
         await db.refresh(inst)
         await db.refresh(task)
+        await db.refresh(source_log)
+        source_log_id = source_log.id
 
     process = _make_mock_process(pid=7654)
+    process.admitted_turn_id = "turn-admitted-7654"
+    process.thread_id = "thread-home"
     registry = MagicMock()
     registry.start_turn = AsyncMock(return_value=(process, "thread-home"))
     codex_home = tmp_path / "account-home"
@@ -3019,7 +3033,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
             config_dir=str(codex_home.resolve()),
             enable_workflows=False,
             enabled_skills=None,
-            source_log_id=4321,
+            source_log_id=source_log_id,
             current_message="raw work",
             queue_timestamp=12.5,
             codex_service_tier="priority",
@@ -3037,7 +3051,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     )
     assert im.get_config_dir(inst.id) == str(codex_home.resolve())
     assert im._launch_params[inst.id]["config_dir"] == str(codex_home.resolve())
-    assert im._launch_params[inst.id]["source_log_id"] == 4321
+    assert im._launch_params[inst.id]["source_log_id"] == source_log_id
     assert im._launch_params[inst.id]["current_message"] == "raw work"
     assert im._launch_params[inst.id]["queue_timestamp"] == 12.5
     assert im._launch_params[inst.id]["codex_service_tier"] == "priority"
@@ -3045,7 +3059,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     im.task_message_enqueuer.assert_awaited_once()
     assert (
         im.task_message_enqueuer.await_args.kwargs["source_log_id"]
-        == 4321
+        == source_log_id
     )
     assert (
         im.task_message_enqueuer.await_args.kwargs["current_message"]
@@ -3059,6 +3073,14 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
         im.task_message_enqueuer.await_args.kwargs["queue_timestamp"]
         == 12.5
     )
+    async with db_factory() as db:
+        persisted_source = await db.get(LogEntry, source_log_id)
+        assert json.loads(persisted_source.raw_json)["turn_id"] == (
+            "turn-admitted-7654"
+        )
+        assert json.loads(persisted_source.raw_json)["thread_id"] == (
+            "thread-home"
+        )
 
 
 @pytest.mark.asyncio

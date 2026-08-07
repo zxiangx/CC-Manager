@@ -324,6 +324,8 @@ export interface CodexForkAnchor {
   content: string;
   timestamp: string | null;
   attachments: FileAttachment[];
+  available?: boolean;
+  unavailable_reason?: string | null;
 }
 
 export interface AskUserOption {

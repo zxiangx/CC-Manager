@@ -1570,6 +1570,7 @@ class InstanceManager:
             chat_initiated=chat_initiated,
             provider=provider,
             task_retry_count=task_retry_count,
+            source_log_id=source_log_id,
         )
 
     def _ensure_codex_app_server_registry(self):
@@ -2050,6 +2051,7 @@ class InstanceManager:
                 chat_initiated=chat_initiated,
                 provider="codex",
                 task_retry_count=task_retry_count,
+                source_log_id=source_log_id,
             )
         except (InstanceNotFoundError, LaunchSupersededError):
             raise
@@ -2072,6 +2074,7 @@ class InstanceManager:
         chat_initiated: bool,
         provider: str,
         task_retry_count: int | None = None,
+        source_log_id: int | None = None,
     ) -> int:
         """Commit launch metadata and install the consumer as one guarded step."""
 
@@ -2099,6 +2102,40 @@ class InstanceManager:
                     if task_update.rowcount == 0:
                         raise LaunchSupersededError(
                             f"Task {task_id} no longer owns instance {instance_id}"
+                        )
+                    admitted_turn_id = getattr(
+                        process,
+                        "admitted_turn_id",
+                        None,
+                    )
+                    if (
+                        provider == "codex"
+                        and source_log_id is not None
+                        and admitted_turn_id
+                    ):
+                        source_log = await db.get(LogEntry, source_log_id)
+                        if source_log is None or source_log.task_id != task_id:
+                            raise LaunchSupersededError(
+                                "Codex source message no longer belongs to "
+                                f"Task {task_id}"
+                            )
+                        try:
+                            source_metadata = json.loads(
+                                source_log.raw_json or "{}"
+                            )
+                        except (TypeError, ValueError):
+                            source_metadata = {}
+                        if not isinstance(source_metadata, dict):
+                            source_metadata = {}
+                        source_metadata["turn_id"] = str(admitted_turn_id)
+                        admitted_thread_id = getattr(process, "thread_id", None)
+                        if admitted_thread_id:
+                            source_metadata["thread_id"] = str(
+                                admitted_thread_id
+                            )
+                        source_log.raw_json = json.dumps(
+                            source_metadata,
+                            ensure_ascii=False,
                         )
                 instance_update = await db.execute(
                     update(Instance)

@@ -1,5 +1,6 @@
 import asyncio
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import logging
 import os
@@ -362,23 +363,29 @@ def _resolve_fork_turn(
     selected_turn_id = row_turns.get(selected.id)
     if selected_turn_id is None:
         # A CCM user row is committed before turn/start returns. Associate it
-        # with the first native event before the next real user message.
+        # with the native events before the next real user message.  A resumed
+        # app-server can briefly label early events with the preceding turn's
+        # notification alias, while its one terminal event carries the real
+        # turn id.  Trust a unique terminal id; otherwise require the entire
+        # segment to agree instead of silently choosing its first event.
+        segment_turn_ids: list[str] = []
+        terminal_turn_ids: list[str] = []
         for candidate in rows[selected_index + 1:]:
             if _is_forkable_user_message(candidate):
                 break
-            selected_turn_id = row_turns.get(candidate.id)
-            if selected_turn_id:
-                break
-    if selected_turn_id is None:
-        # Legacy logs predate persisted turn ids. The initial Task description
-        # owns turn zero, so the Nth ordinary follow-up user row owns turn N.
-        ordinal = sum(
-            1
-            for row in rows[:selected_index + 1]
-            if _is_forkable_user_message(row)
-        )
-        if ordinal < len(turn_ids):
-            selected_turn_id = turn_ids[ordinal]
+            candidate_turn_id = row_turns.get(candidate.id)
+            if not candidate_turn_id:
+                continue
+            segment_turn_ids.append(candidate_turn_id)
+            raw = _raw_log_metadata(candidate)
+            if raw.get("type") in {"turn.completed", "turn.failed"}:
+                terminal_turn_ids.append(candidate_turn_id)
+        unique_terminal_ids = list(dict.fromkeys(terminal_turn_ids))
+        unique_segment_ids = list(dict.fromkeys(segment_turn_ids))
+        if len(unique_terminal_ids) == 1:
+            selected_turn_id = unique_terminal_ids[0]
+        elif not unique_terminal_ids and len(unique_segment_ids) == 1:
+            selected_turn_id = unique_segment_ids[0]
     if selected_turn_id is None:
         raise HTTPException(
             409,
@@ -398,6 +405,174 @@ def _resolve_fork_turn(
         raise HTTPException(409, "The preceding Codex turn is still running")
 
     return target_turn_id, selected.id - 1
+
+
+@dataclass(frozen=True)
+class _ForkLineageAnchor:
+    """The native Task/log row that owns one displayed fork anchor."""
+
+    task: Task
+    rows: list[LogEntry]
+    anchor_id: int
+    thread_id: str
+
+
+async def _task_log_rows(db: AsyncSession, task_id: int) -> list[LogEntry]:
+    return list((await db.execute(
+        select(LogEntry)
+        .where(LogEntry.task_id == task_id)
+        .order_by(LogEntry.id.asc())
+    )).scalars().all())
+
+
+def _fork_copy_signature(row: LogEntry) -> tuple:
+    """Stable fields that a fork copy preserves exactly across new row ids."""
+
+    return (
+        row.event_type,
+        row.role,
+        row.content,
+        row.tool_name,
+        row.tool_input,
+        row.tool_output,
+        bool(row.is_error),
+        row.loop_iteration,
+        row.timestamp,
+    )
+
+
+def _fork_marker_index(rows: list[LogEntry], parent_task_id: int) -> int | None:
+    for index, row in enumerate(rows):
+        raw = _raw_log_metadata(row)
+        if (
+            row.event_type == "system_event"
+            and raw.get("forked_from_task_id") == parent_task_id
+        ):
+            return index
+    return None
+
+
+async def _resolve_fork_lineage_anchor(
+    db: AsyncSession,
+    task: Task,
+    rows: list[LogEntry],
+    anchor_id: int,
+    *,
+    rows_cache: dict[int, list[LogEntry]] | None = None,
+    link_cache: dict[tuple[int, int], tuple[Task, int]] | None = None,
+) -> _ForkLineageAnchor:
+    """Walk copied log provenance back to the Task that owns the native turn.
+
+    New copies carry an explicit immediate-source link.  The positional path
+    is a strict compatibility bridge for already-created forks: the complete
+    copied prefix must still match its parent one-for-one before it is trusted.
+    """
+
+    rows_cache = rows_cache if rows_cache is not None else {task.id: rows}
+    rows_cache.setdefault(task.id, rows)
+    link_cache = link_cache if link_cache is not None else {}
+    current_task = task
+    current_rows = rows
+    current_anchor_id = anchor_id
+    visited: set[int] = set()
+
+    while True:
+        if current_task.id in visited:
+            raise HTTPException(409, "Fork lineage contains a cycle")
+        visited.add(current_task.id)
+        cached_link = link_cache.get((current_task.id, current_anchor_id))
+        if cached_link is not None:
+            current_task, current_anchor_id = cached_link
+            current_rows = rows_cache[current_task.id]
+            continue
+        selected_index = next(
+            (i for i, row in enumerate(current_rows) if row.id == current_anchor_id),
+            None,
+        )
+        if selected_index is None:
+            raise HTTPException(404, "Fork anchor message not found")
+        selected = current_rows[selected_index]
+        raw = _raw_log_metadata(selected)
+
+        parent_task_id = raw.get("fork_source_task_id")
+        parent_log_id = raw.get("fork_source_log_id")
+        if not isinstance(parent_task_id, int) or not isinstance(parent_log_id, int):
+            metadata = current_task.metadata_ or {}
+            legacy_parent_id = metadata.get("forked_from_task_id")
+            if not isinstance(legacy_parent_id, int):
+                return _ForkLineageAnchor(
+                    current_task,
+                    current_rows,
+                    current_anchor_id,
+                    str(raw.get("thread_id") or current_task.session_id or ""),
+                )
+            marker_index = _fork_marker_index(current_rows, legacy_parent_id)
+            if marker_index is None or selected_index >= marker_index:
+                return _ForkLineageAnchor(
+                    current_task,
+                    current_rows,
+                    current_anchor_id,
+                    str(raw.get("thread_id") or current_task.session_id or ""),
+                )
+            parent_task_id = legacy_parent_id
+            parent_log_id = None
+
+        parent = await db.get(Task, parent_task_id)
+        if parent is None:
+            raise HTTPException(409, "The native parent Task no longer exists")
+        parent_rows = rows_cache.get(parent.id)
+        if parent_rows is None:
+            parent_rows = await _task_log_rows(db, parent.id)
+            rows_cache[parent.id] = parent_rows
+
+        if parent_log_id is None:
+            marker_index = _fork_marker_index(current_rows, parent.id)
+            if marker_index is None:
+                raise HTTPException(409, "Fork lineage marker is missing")
+            copied_rows = current_rows[:marker_index]
+            source_anchor_id = (current_task.metadata_ or {}).get(
+                "forked_from_log_id"
+            )
+            if isinstance(source_anchor_id, int):
+                parent_prefix = [row for row in parent_rows if row.id < source_anchor_id]
+            else:
+                parent_prefix = parent_rows[:len(copied_rows)]
+            if len(parent_prefix) != len(copied_rows) or any(
+                _fork_copy_signature(child) != _fork_copy_signature(source)
+                for child, source in zip(copied_rows, parent_prefix)
+            ):
+                raise HTTPException(
+                    409,
+                    "Legacy fork history no longer matches its native parent safely",
+                )
+            for child_row, parent_row in zip(copied_rows, parent_prefix):
+                link_cache[(current_task.id, child_row.id)] = (
+                    parent,
+                    parent_row.id,
+                )
+            parent_log_id = parent_prefix[selected_index].id
+        elif not any(row.id == parent_log_id for row in parent_rows):
+            raise HTTPException(409, "Fork lineage source message no longer exists")
+        else:
+            link_cache[(current_task.id, current_anchor_id)] = (
+                parent,
+                parent_log_id,
+            )
+
+        current_task = parent
+        current_rows = parent_rows
+        current_anchor_id = parent_log_id
+
+
+def _fork_copy_raw_json(row: LogEntry, source_task_id: int) -> str:
+    """Stamp immediate and original provenance on a copied display row."""
+
+    raw = _raw_log_metadata(row).copy()
+    raw["fork_source_task_id"] = source_task_id
+    raw["fork_source_log_id"] = row.id
+    raw.setdefault("fork_origin_task_id", source_task_id)
+    raw.setdefault("fork_origin_log_id", row.id)
+    return json.dumps(raw, ensure_ascii=False)
 
 
 def _resolve_latest_fork_turn(
@@ -420,14 +595,30 @@ def _resolve_latest_fork_turn(
     return turn_id, (rows[-1].id if rows else -1)
 
 
-def _codex_fork_home(task: Task) -> tuple[str, str | None]:
+def _codex_fork_home(
+    task: Task,
+    session_id: str | None = None,
+) -> tuple[str, str | None]:
     """Resolve the one proven account home containing the source rollout."""
 
     from backend.main import codex_pool
     from backend.services.codex_app_server import normalize_codex_home
 
+    target_session_id = session_id or task.session_id
+    if not target_session_id:
+        raise HTTPException(409, "Codex session id is unavailable")
     account_id = (task.metadata_ or {}).get("codex_account_id")
     if codex_pool:
+        matches = codex_pool.locate_session_homes(target_session_id)
+        if target_session_id != task.session_id:
+            if len(matches) > 1:
+                raise HTTPException(
+                    409,
+                    "Historical Codex session has multiple rollout copies",
+                )
+            if len(matches) == 1:
+                home = matches[0]
+                return home, codex_pool.account_id_for_home(home)
         if account_id:
             home = codex_pool.home_for_account(str(account_id))
             if not home:
@@ -435,7 +626,6 @@ def _codex_fork_home(task: Task) -> tuple[str, str | None]:
                     409,
                     "The Codex account bound to this task no longer exists",
                 )
-            matches = codex_pool.locate_session_homes(task.session_id)
             canonical = codex_pool.canonical_home(home)
             if matches and canonical not in matches:
                 raise HTTPException(
@@ -443,7 +633,6 @@ def _codex_fork_home(task: Task) -> tuple[str, str | None]:
                     "The bound Codex account does not contain this session",
                 )
             return canonical, str(account_id)
-        matches = codex_pool.locate_session_homes(task.session_id)
         if len(matches) > 1:
             raise HTTPException(
                 409,
@@ -455,7 +644,7 @@ def _codex_fork_home(task: Task) -> tuple[str, str | None]:
 
     from backend.api.tasks import _find_session_jsonl
 
-    rollout = _find_session_jsonl(task.session_id, provider="codex")
+    rollout = _find_session_jsonl(target_session_id, provider="codex")
     if rollout is None:
         raise HTTPException(409, "Codex rollout file was not found")
     sessions_dir = next(
@@ -678,11 +867,7 @@ async def list_codex_fork_anchors(
     if not source.session_id:
         raise HTTPException(400, "This task has no Codex session to fork")
 
-    rows = list((await db.execute(
-        select(LogEntry)
-        .where(LogEntry.task_id == task_id)
-        .order_by(LogEntry.id.asc())
-    )).scalars().all())
+    rows = await _task_log_rows(db, task_id)
     anchors = [{
         "type": "latest",
         "id": None,
@@ -692,8 +877,15 @@ async def list_codex_fork_anchors(
             if source.completed_at else None
         ),
         "attachments": [],
+        "available": source.status not in {"in_progress", "executing", "migrating"},
+        "unavailable_reason": (
+            "Wait for the current Codex turn to finish"
+            if source.status in {"in_progress", "executing", "migrating"}
+            else None
+        ),
     }]
     if source.description:
+        source_active = source.status in {"in_progress", "executing", "migrating"}
         anchors.append({
             "type": "initial",
             "id": None,
@@ -703,11 +895,116 @@ async def list_codex_fork_anchors(
                 if source.created_at else None
             ),
             "attachments": (source.metadata_ or {}).get("attachments") or [],
+            "available": not source_active,
+            "unavailable_reason": (
+                "Wait for the current Codex turn to finish"
+                if source_active else None
+            ),
         })
+    native_cache: dict[
+        tuple[int, str],
+        tuple[list[LogEntry], list[dict]] | HTTPException,
+    ] = {}
+    if anchors[0]["available"]:
+        try:
+            codex_home, _account_id = _codex_fork_home(
+                source,
+                str(source.session_id),
+            )
+            from backend.main import instance_manager
+            from backend.services.codex_app_server import CodexAppServerError
+
+            try:
+                native_thread = await instance_manager.read_codex_thread(
+                    codex_home,
+                    str(source.session_id),
+                )
+            except CodexAppServerError as exc:
+                raise HTTPException(
+                    409,
+                    f"Native Codex history is unavailable: {exc}",
+                ) from exc
+            source_turns = [
+                turn
+                for turn in (native_thread.get("turns") or [])
+                if isinstance(turn, dict)
+            ]
+            _resolve_latest_fork_turn(source_turns, rows)
+            native_cache[(source.id, str(source.session_id))] = (
+                rows,
+                source_turns,
+            )
+        except HTTPException as exc:
+            anchors[0]["available"] = False
+            anchors[0]["unavailable_reason"] = str(exc.detail)
+    lineage_rows_cache = {source.id: rows}
+    lineage_link_cache: dict[tuple[int, int], tuple[Task, int]] = {}
+    authorized_lineage_tasks = {source.id}
     for row in rows:
         if not _is_forkable_user_message(row):
             continue
         metadata = _raw_log_metadata(row)
+        available = source.status not in {"in_progress", "executing", "migrating"}
+        unavailable_reason = (
+            "Wait for the current Codex turn to finish" if not available else None
+        )
+        if available:
+            try:
+                lineage = await _resolve_fork_lineage_anchor(
+                    db,
+                    source,
+                    rows,
+                    row.id,
+                    rows_cache=lineage_rows_cache,
+                    link_cache=lineage_link_cache,
+                )
+                if lineage.task.id not in authorized_lineage_tasks:
+                    await require_task_control(request, lineage.task, db)
+                    authorized_lineage_tasks.add(lineage.task.id)
+                cache_key = (lineage.task.id, lineage.thread_id)
+                cached = native_cache.get(cache_key)
+                if cached is None:
+                    codex_home, _account_id = _codex_fork_home(
+                        lineage.task,
+                        lineage.thread_id,
+                    )
+                    from backend.main import instance_manager
+                    from backend.services.codex_app_server import CodexAppServerError
+
+                    try:
+                        native_thread = await instance_manager.read_codex_thread(
+                            codex_home,
+                            lineage.thread_id,
+                        )
+                    except CodexAppServerError as exc:
+                        cached = HTTPException(
+                            409,
+                            f"Native Codex history is unavailable: {exc}",
+                        )
+                    else:
+                        cached = (
+                            lineage.rows,
+                            [
+                                turn
+                                for turn in (native_thread.get("turns") or [])
+                                if isinstance(turn, dict)
+                            ],
+                        )
+                    native_cache[cache_key] = cached
+                if isinstance(cached, HTTPException):
+                    raise cached
+                native_rows, turns = cached
+                _resolve_fork_turn(
+                    anchor=ForkAnchor(
+                        type="user_message",
+                        id=lineage.anchor_id,
+                    ),
+                    rows=native_rows,
+                    turns=turns,
+                )
+            except HTTPException as exc:
+                available = False
+                unavailable_reason = str(exc.detail)
         anchors.append({
             "type": "user_message",
             "id": row.id,
@@ -716,6 +1013,8 @@ async def list_codex_fork_anchors(
                 row.timestamp.isoformat() + "Z" if row.timestamp else None
             ),
             "attachments": metadata.get("attachments") or [],
+            "available": available,
+            "unavailable_reason": unavailable_reason,
         })
     return anchors
 
@@ -744,11 +1043,7 @@ async def fork_codex_task(
     if source.status in {"in_progress", "executing", "migrating"}:
         raise HTTPException(409, "Wait for the current Codex turn to finish")
 
-    rows = list((await db.execute(
-        select(LogEntry)
-        .where(LogEntry.task_id == task_id)
-        .order_by(LogEntry.id.asc())
-    )).scalars().all())
+    rows = await _task_log_rows(db, task_id)
     selected: LogEntry | None = None
     seed_message: str | None = None
     selected_metadata: dict = {}
@@ -774,7 +1069,34 @@ async def fork_codex_task(
             selected_metadata.get("raw_content") or selected.content or ""
         )
 
-    codex_home, account_id = _codex_fork_home(source)
+    native_source = source
+    native_rows = rows
+    native_anchor = body.anchor
+    if body.anchor.type == "user_message":
+        lineage = await _resolve_fork_lineage_anchor(
+            db,
+            source,
+            rows,
+            body.anchor.id,
+        )
+        native_source = lineage.task
+        native_rows = lineage.rows
+        native_anchor = ForkAnchor(
+            type="user_message",
+            id=lineage.anchor_id,
+        )
+        if native_source.id != source.id:
+            await require_task_control(request, native_source, db)
+
+    native_thread_id = (
+        lineage.thread_id
+        if body.anchor.type == "user_message"
+        else str(native_source.session_id or "")
+    )
+    codex_home, account_id = _codex_fork_home(
+        native_source,
+        native_thread_id,
+    )
     from backend.main import instance_manager
     from backend.services.codex_app_server import (
         CodexAppServerBusyError,
@@ -793,7 +1115,7 @@ async def fork_codex_task(
         else:
             native_thread = await instance_manager.read_codex_thread(
                 codex_home,
-                source.session_id,
+                native_thread_id,
             )
             turns = [
                 turn for turn in (native_thread.get("turns") or [])
@@ -803,13 +1125,17 @@ async def fork_codex_task(
                 last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
             else:
                 last_turn_id, cutoff = _resolve_fork_turn(
-                    anchor=body.anchor,
-                    rows=rows,
+                    anchor=native_anchor,
+                    rows=native_rows,
                     turns=turns,
                 )
+                # The native cutoff belongs to the owning ancestor.  Display
+                # history is always copied from the Task the user actually
+                # opened and stops immediately before its selected message.
+                cutoff = selected.id - 1
             forked_thread = await instance_manager.fork_codex_thread(
                 codex_home,
-                source.session_id,
+                native_thread_id,
                 last_turn_id=last_turn_id,
             )
     except CodexAppServerBusyError as exc:
@@ -828,6 +1154,7 @@ async def fork_codex_task(
             body.anchor.id if body.anchor.type == "user_message" else None
         )
         metadata["forked_from_turn_id"] = last_turn_id
+        metadata["forked_from_native_task_id"] = native_source.id
         metadata["fork_mode"] = (
             "full_copy" if body.anchor.type == "latest" else "branch"
         )
@@ -903,7 +1230,7 @@ async def fork_codex_task(
                 tool_name=row.tool_name,
                 tool_input=row.tool_input,
                 tool_output=row.tool_output,
-                raw_json=row.raw_json,
+                raw_json=_fork_copy_raw_json(row, source.id),
                 is_error=row.is_error,
                 loop_iteration=row.loop_iteration,
                 timestamp=row.timestamp,

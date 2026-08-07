@@ -34,6 +34,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 
 ### 交互与对话
 - **多轮对话** — 任务完成后可通过 Chat 界面继续追问，自动 `--resume` 同一 session
+- **运行中直接补充** — 使用同一个消息输入框即可给正在运行的本地 Claude PTY / Codex app-server turn 发送补充指令，无需切换“注入模式”；空闲时自动作为普通 follow-up，不支持实时注入的 Worker/Shared Task 仍进入队列
 - **Session 关注标签** — 每个 Task 可维护一个自定义短标签，在任务列表和 Chat 顶栏醒目展示并随时编辑，便于记录“何时再看/下一步做什么”；该字段与系统内部 `tags` 独立，复制、Fork 和 Worker 迁移时会保留
 - **Codex 精确 Fork** — 可从普通用户消息之前或最新完整上下文创建独立 Task；多次 Fork、session 压缩和换号后仍按持久化的原生 thread/turn lineage 定位。缺失 rollout 或无法安全映射的旧消息会在选择器中明确禁用并显示原因，不会切错 context
 - **Task 产物下载** — Claude/Codex 会把明确交付给用户的文件保存到当前 Project 的 `.claude-manager/artifacts/task-<id>/`，聊天中的显式产物链接可直接下载；普通源码和文档引用不会误显示为下载文件

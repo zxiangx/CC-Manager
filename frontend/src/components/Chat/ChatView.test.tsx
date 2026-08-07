@@ -1021,6 +1021,42 @@ describe('ChatView', () => {
   });
 
   describe('Live turn injection', () => {
+    it('injects from the ordinary composer into an executing Claude PTY turn', async () => {
+      vi.mocked(api.getRuntimeSettings).mockResolvedValue({
+        use_pty_mode: true,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        codex_monitor_enabled: true,
+      });
+      const task = makeTask({
+        provider: 'claude',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await screen.findByText(/Claude PTY.*直接补充当前 turn/);
+      expect(screen.queryByTitle(/开启注入模式/)).not.toBeInTheDocument();
+      await userEvent.type(screen.getByRole('textbox'), 'please check the logs too');
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'please check the logs too',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
     it('steers an executing Codex turn even when Claude PTY is off', async () => {
       const task = makeTask({
         provider: 'codex',
@@ -1030,10 +1066,9 @@ describe('ChatView', () => {
       });
       render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
 
-      const toggle = await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/);
-      await userEvent.click(toggle);
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       await userEvent.type(screen.getByRole('textbox'), 'change direction');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
 
       await waitFor(() => {
         expect(api.injectTaskMessage).toHaveBeenCalledWith(
@@ -1073,7 +1108,7 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
       );
 
-      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       const picker = container.querySelector<HTMLInputElement>('input[type="file"]')!;
       await userEvent.upload(picker, [
         new File(['png'], 'diagram.png', { type: 'image/png' }),
@@ -1081,7 +1116,7 @@ describe('ChatView', () => {
       ]);
       await waitFor(() => expect(api.uploadImages).toHaveBeenCalledTimes(2));
       await screen.findByText('notes.txt');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
 
       await waitFor(() => {
         expect(api.getInjectCapabilities).toHaveBeenCalledWith(task.id);
@@ -1141,13 +1176,13 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
       );
 
-      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       await userEvent.upload(
         container.querySelector<HTMLInputElement>('input[type="file"]')!,
         new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
       );
       await screen.findByText('evidence.txt');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
 
       expect(await screen.findByText(/HTTP 404/)).toHaveTextContent(
         '消息和附件已保留',
@@ -1178,13 +1213,13 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
       );
 
-      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       await userEvent.upload(
         container.querySelector<HTMLInputElement>('input[type="file"]')!,
         new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
       );
       await screen.findByText('evidence.txt');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
 
       expect(await screen.findByText(/没有确认全部附件均已注入/)).toHaveTextContent(
         '消息和附件已保留',
@@ -1212,15 +1247,15 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
       );
 
-      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       const textbox = screen.getByRole('textbox');
       await userEvent.type(textbox, 'snapshot');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
       await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalled());
 
       expect(textbox).toBeDisabled();
       expect(screen.getByTitle('Attach files')).toBeDisabled();
-      expect(screen.getByTitle(/注入模式已开启/)).toBeDisabled();
+      expect(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)')).toBeDisabled();
 
       await act(async () => {
         resolveInjection({ ok: true, injected: true });
@@ -1251,14 +1286,14 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
       );
 
-      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       await userEvent.upload(
         container.querySelector<HTMLInputElement>('input[type="file"]')!,
         new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
       );
       await screen.findByText('evidence.txt');
       await userEvent.type(screen.getByRole('textbox'), '请结合附件继续');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('发送到运行中的 turn (Ctrl+Enter)'));
 
       expect(await screen.findByText(/服务器没有确认消息已注入/)).toHaveTextContent(
         '消息和附件已保留',
@@ -1280,7 +1315,7 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
       );
 
-      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await screen.findByText(/Codex turn\/steer.*直接补充当前 turn/);
       await userEvent.upload(
         container.querySelector<HTMLInputElement>('input[type="file"]')!,
         new File(['bad'], 'broken.txt', { type: 'text/plain' }),
@@ -1294,7 +1329,7 @@ describe('ChatView', () => {
       expect(screen.getByText('broken.txt')).toBeInTheDocument();
     });
 
-    it('does not offer local injection for worker tasks', async () => {
+    it('keeps queue routing for worker tasks without live injection', async () => {
       const task = makeTask({
         provider: 'codex',
         status: 'executing',
@@ -1304,7 +1339,8 @@ describe('ChatView', () => {
       render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
 
       await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
-      expect(screen.queryByTitle(/Codex turn\/steer/)).not.toBeInTheDocument();
+      expect(screen.getByTitle('Add to queue (Ctrl+Enter)')).toBeInTheDocument();
+      expect(screen.queryByText(/直接补充当前 turn/)).not.toBeInTheDocument();
     });
   });
 

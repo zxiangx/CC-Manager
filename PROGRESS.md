@@ -2,6 +2,12 @@
 
 > **重要：Claude 必须自主维护本文件。** 每次完成重要改动或遇到问题后，在对应章节记录。每条记录必须附上 git commit ID。
 
+## 2026-08-08：暂停的 Codex 原生 Goal 可由下一条消息安全续跑
+
+- **问题（commit `323804e`）**：用户 Stop 会把原生 Goal 正确持久化为 `paused`，但 CCM 下一次续聊只在 thread 已经 active 时接管 Goal；idle + paused 会直接新建普通 `turn/start`，导致 #17 之类的 Task 一直显示 Goal paused，用户消息也没有恢复原目标。
+- **修复（commit `323804e`）**：Standard follow-up 只对精确 `paused` 状态执行恢复；先建立 CCM generation owner，再用 `thread/goal/set active` 触发 continuation，等待并绑定精确 `turn/started`，最后把当前用户输入 steer 到同一个 turn。`blocked`、`usageLimited`、`budgetLimited`、complete 和无 Goal 保持原有普通 turn 语义；恢复失败或取消执行 pause + interrupt 的 fail-closed 清理，避免重复执行。
+- **验证（commit `323804e`）**：`backend/tests/test_codex_app_server.py` 共 `178 passed`，包含 paused 恢复顺序、精确 turn 身份及非 paused 门禁；前端 `npx tsc --noEmit` 与 Python compile 通过。扩大到 app-server/InstanceManager/Dispatcher 的 702 项测试中，本次相关测试全绿；24 failed + 1 error 均为 macOS `/tmp` 规范化和测试安全目录拒绝 symlink ancestor 的既有环境问题。
+
 ## 已完成功能
 
 ### 阶段 1：基础设施

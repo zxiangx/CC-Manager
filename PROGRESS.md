@@ -2,6 +2,12 @@
 
 > **重要：Claude 必须自主维护本文件。** 每次完成重要改动或遇到问题后，在对应章节记录。每条记录必须附上 git commit ID。
 
+## 2026-08-08：Codex 动态 Plan 清单
+
+- **问题（commit `3f7b011`）**：CCM 旧 parser 只认识 `codex exec --json` 的 `todo_list` item，并把它压成普通 system 文本；常驻 app-server 没接计划快照，前端也没有清单组件，因此 Codex 调用 `update_plan` 时用户看不到桌面端的三态进度表。
+- **修复（commit `3f7b011`）**：以当前 Codex 自动生成的 v2 bindings 为协议证据，接入正式 `turn/plan/updated`，按 exact turn 生成稳定 `todo_id`，规范化 `pending/inProgress/completed`，同一 turn 只保留最新 durable snapshot。替换时先插入新 log id 再删除旧 snapshot，保证活跃计划不会因大量 tool logs 掉出最新历史页。WebSocket/HTTP 返回结构化 items，ChatView 按 `todo_id` 原位更新 Plan 卡片；旧 exec 格式继续兼容。
+- **验证（commit `3f7b011`）**：app-server/API/精确持久化 `184 passed`；ChatView + message merge `115 passed`；TypeScript、production build、Python compile 与 `git diff --check` 通过。扩大 InstanceManager 文件测试中的 24 项失败仍为修改前已复现的 macOS `/tmp -> /private/tmp` 断言和安全测试目录拒绝 symlink ancestor 环境问题，本功能专项通过。
+
 ## 2026-08-08：暂停的 Codex 原生 Goal 可由下一条消息安全续跑
 
 - **问题（commit `323804e`）**：用户 Stop 会把原生 Goal 正确持久化为 `paused`，但 CCM 下一次续聊只在 thread 已经 active 时接管 Goal；idle + paused 会直接新建普通 `turn/start`，导致 #17 之类的 Task 一直显示 Goal paused，用户消息也没有恢复原目标。

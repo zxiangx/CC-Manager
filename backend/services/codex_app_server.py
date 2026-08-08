@@ -4550,6 +4550,25 @@ class CodexAppServer:
             context.process.feed({"type": "turn.started"})
             return
 
+        if method == "turn/plan/updated":
+            # Codex app-server v2 publishes update_plan snapshots as a
+            # turn-level notification, not an item lifecycle event. Preserve
+            # one stable synthetic item id so downstream persistence and the
+            # UI can replace the checklist in place.
+            plan = params.get("plan")
+            if isinstance(plan, list):
+                context.process.feed({
+                    "type": "item.updated",
+                    "item": {
+                        "type": "todo_list",
+                        "id": f"todo:{context.turn_id}",
+                        "explanation": params.get("explanation"),
+                        "items": plan,
+                    },
+                    "turn_id": context.turn_id,
+                })
+            return
+
         if method == "item/started":
             item = params.get("item") or {}
             self._track_collaboration_item(
@@ -4575,6 +4594,17 @@ class CodexAppServer:
             }:
                 context.process.feed({
                     "type": "item.started",
+                    "item": normalized,
+                    "turn_id": context.turn_id,
+                })
+            return
+
+        if method == "item/updated":
+            item = params.get("item") or {}
+            normalized = self._normalize_item(item)
+            if normalized and normalized.get("type") == "todo_list":
+                context.process.feed({
+                    "type": "item.updated",
                     "item": normalized,
                     "turn_id": context.turn_id,
                 })

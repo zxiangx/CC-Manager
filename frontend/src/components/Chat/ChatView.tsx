@@ -1263,7 +1263,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       return;
     }
 
-    const showTypes = ['message', 'result', 'tool_use', 'tool_result', 'system_init', 'system_event', 'thinking'];
+    const showTypes = ['message', 'result', 'tool_use', 'tool_result', 'system_init', 'system_event', 'thinking', 'todo_list'];
     if (!showTypes.includes(eventType)) return;
     if (isLegacyCodexCollabCompleted({
       event_type: eventType,
@@ -1303,6 +1303,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       stream_item_id: itemId,
       native_item_type: (msg.data.native_item_type as string) || null,
       native_item_status: (msg.data.native_item_status as string) || null,
+      todo_id: (msg.data.todo_id as string) || null,
+      todo_explanation: (msg.data.todo_explanation as string) || null,
+      todo_items: (msg.data.todo_items as ChatMessage['todo_items']) || null,
       pty_cold_start: Boolean(msg.data.pty_cold_start),
       persisted: isPersisted,
     };
@@ -1310,6 +1313,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const current = isPersisted
         ? prev.filter((candidate) => !candidate.pty_cold_start)
         : prev;
+      if (entry.event_type === 'todo_list' && entry.todo_id) {
+        const index = current.findIndex(
+          (candidate) => candidate.todo_id === entry.todo_id,
+        );
+        if (index >= 0) {
+          const next = [...current];
+          next[index] = entry;
+          return next;
+        }
+      }
       if (isPersisted) {
         const next = mergeChatHistory([entry], current);
         syncLiveStreamCache(task.id, next);
@@ -3462,6 +3475,56 @@ const MessageBubble = memo(function MessageBubble({
           <div className="mt-0.5 px-1">
             <MessageTimestamp timestamp={message.timestamp} />
           </div>
+        )}
+      </div>
+    );
+  }
+
+  if (message.event_type === 'todo_list') {
+    const items = message.todo_items || [];
+    const completed = items.filter((item) => item.status === 'completed').length;
+    return (
+      <div className="mx-4 my-2 rounded-lg border border-blue-500/20 bg-blue-500/[0.04] overflow-hidden">
+        <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-blue-500/15">
+          <span className="text-xs font-semibold tracking-wide text-blue-300">Plan</span>
+          <span className="text-[11px] text-gray-500">{completed} of {items.length} completed</span>
+        </div>
+        <div className="px-3 py-2 space-y-1.5">
+          {message.todo_explanation && (
+            <div className="pb-1 text-xs text-gray-400">{message.todo_explanation}</div>
+          )}
+          {items.map((item, index) => {
+            const isCompleted = item.status === 'completed';
+            const isActive = item.status === 'in_progress';
+            return (
+              <div key={`${index}:${item.text}`} className="flex items-start gap-2 text-sm">
+                <span
+                  aria-hidden="true"
+                  className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border text-[10px] ${
+                    isCompleted
+                      ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-400'
+                      : isActive
+                        ? 'border-blue-400/70 bg-blue-400/10 text-blue-300'
+                        : 'border-gray-600 text-transparent'
+                  }`}
+                >
+                  {isCompleted ? '✓' : isActive ? '●' : '·'}
+                </span>
+                <span
+                  data-status={item.status}
+                  className={isCompleted ? 'text-gray-500 line-through' : isActive ? 'text-gray-200' : 'text-gray-400'}
+                >
+                  {item.text}
+                </span>
+              </div>
+            );
+          })}
+          {items.length === 0 && (
+            <div className="text-xs text-gray-500">Todo list updated</div>
+          )}
+        </div>
+        {message.timestamp && (
+          <div className="px-3 pb-2"><MessageTimestamp timestamp={message.timestamp} /></div>
         )}
       </div>
     );

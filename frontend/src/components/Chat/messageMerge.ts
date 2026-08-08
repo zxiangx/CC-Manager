@@ -50,11 +50,15 @@ function messageFingerprint(message: ChatMessage): string {
     message.tool_output,
     message.loop_iteration,
     message.source || null,
+    message.todo_id || null,
+    message.todo_explanation || null,
+    message.todo_items || null,
     attachmentKey(message),
   ]);
 }
 
 function stableLiveKey(message: ChatMessage): string | null {
+  if (message.todo_id) return `todo:${message.todo_id}`;
   const nativeId = message.item_id || message.stream_item_id;
   if (nativeId) return `item:${nativeId}`;
   if (message.request_id) return `request:${message.request_id}`;

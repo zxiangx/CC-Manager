@@ -7815,15 +7815,67 @@ class InstanceManager:
                 })
         elif item_type == "todo_list":
             items = item.get("items") or []
+            todo_items = []
+            for todo_item in items:
+                if not isinstance(todo_item, dict):
+                    continue
+                raw_status = str(todo_item.get("status") or "").strip()
+                status_key = re.sub(
+                    r"(?<!^)(?=[A-Z])",
+                    "_",
+                    raw_status,
+                ).lower()
+                if status_key in {"completed", "complete", "done"}:
+                    status = "completed"
+                elif status_key in {
+                    "in_progress",
+                    "inprogress",
+                    "active",
+                    "running",
+                }:
+                    status = "in_progress"
+                elif todo_item.get("completed") is True:
+                    status = "completed"
+                else:
+                    status = "pending"
+                text = str(
+                    todo_item.get("text")
+                    or todo_item.get("step")
+                    or todo_item.get("content")
+                    or ""
+                ).strip()
+                if text:
+                    todo_items.append({"text": text, "status": status})
             lines = [
-                f"{'✓' if it.get('completed') else '○'} {it.get('text', '')}"
-                for it in items if isinstance(it, dict)
+                f"{ {'completed': '✓', 'in_progress': '◉'}.get(it['status'], '○') } "
+                f"{it['text']}"
+                for it in todo_items
             ]
+            turn_id = data.get("turn_id") or data.get("turnId")
+            native_item_id = item.get("id")
+            todo_id = (
+                f"todo:{turn_id}"
+                if turn_id
+                else f"todo:item:{native_item_id}"
+                if native_item_id
+                else None
+            )
             event.update({
-                "event_type": "system_event",
+                "event_type": "todo_list",
                 "role": "assistant",
                 "content": "Todo:\n" + "\n".join(lines) if lines else "Todo list updated",
+                "todo_id": todo_id,
+                "todo_explanation": (
+                    str(item.get("explanation")).strip()
+                    if item.get("explanation")
+                    else None
+                ),
+                "todo_items": todo_items,
             })
+            data["todo_id"] = todo_id
+            data["todo_explanation"] = event["todo_explanation"]
+            data["todo_items"] = todo_items
+            event["raw_json"] = json.dumps(data, ensure_ascii=False)
         elif item_type == "error":
             event.update({
                 "event_type": "system_event",
@@ -8389,6 +8441,30 @@ class InstanceManager:
                             task_id,
                         )
                         return
+            entry = None
+            todo_id = event.get("todo_id")
+            if task_id is not None and event["event_type"] == "todo_list" and todo_id:
+                candidates = (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.task_id == task_id,
+                            LogEntry.event_type == "todo_list",
+                            LogEntry.task_retry_count == persisted_task_retry_count,
+                        )
+                        .order_by(LogEntry.id.desc())
+                        .limit(20)
+                    )
+                ).scalars().all()
+                for candidate in candidates:
+                    try:
+                        payload = json.loads(candidate.raw_json or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if payload.get("todo_id") == todo_id:
+                        entry = candidate
+                        break
+            previous_todo_entry = entry
             entry = LogEntry(
                 instance_id=instance_id,
                 task_id=task_id,
@@ -8404,6 +8480,12 @@ class InstanceManager:
                 loop_iteration=loop_iteration,
             )
             db.add(entry)
+            if previous_todo_entry is not None:
+                # Flush the replacement before deleting the prior maximum id;
+                # SQLite may otherwise reuse that id. The new monotonic id
+                # keeps an actively changing plan in the latest history page.
+                await db.flush()
+                await db.delete(previous_todo_entry)
             if task_id:
                 task_values = {}
                 if session_id and not detached_autonomous:

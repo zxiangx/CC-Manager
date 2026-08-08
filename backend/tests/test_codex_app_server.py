@@ -3889,6 +3889,56 @@ async def test_notifications_stream_delta_and_finish_process():
 
 
 @pytest.mark.asyncio
+async def test_todo_list_updates_are_forwarded_with_exact_turn_identity():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-plan", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-plan"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="work", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=1,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("turn/plan/updated", {
+        "threadId": "thread-plan",
+        "turnId": "turn-plan",
+        "explanation": "Track implementation",
+        "plan": [
+            {"step": "Write tests", "status": "completed"},
+            {"step": "Implement UI", "status": "inProgress"},
+            {"step": "Deploy", "status": "pending"},
+        ],
+    })
+
+    line = json.loads(
+        await asyncio.wait_for(process.stdout.readline(), timeout=0.1)
+    )
+    assert line == {
+        "type": "item.updated",
+        "item": {
+            "type": "todo_list",
+            "id": "todo:turn-plan",
+            "explanation": "Track implementation",
+            "items": [
+                {"step": "Write tests", "status": "completed"},
+                {"step": "Implement UI", "status": "inProgress"},
+                {"step": "Deploy", "status": "pending"},
+            ],
+        },
+        "turn_id": "turn-plan",
+    }
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-plan",
+        "turn": {"id": "turn-plan", "status": "completed", "error": None},
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
 async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)

@@ -281,6 +281,11 @@ export interface FileAttachment {
   is_image: boolean;
 }
 
+export interface CodexTodoItem {
+  text: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
 export interface ChatMessage {
   id: number;
   role: string;
@@ -308,6 +313,10 @@ export interface ChatMessage {
   /** Native item metadata used for narrowly-scoped compatibility filtering. */
   native_item_type?: string | null;
   native_item_status?: string | null;
+  /** Stable per-turn identity and latest snapshot for a Codex plan checklist. */
+  todo_id?: string | null;
+  todo_explanation?: string | null;
+  todo_items?: CodexTodoItem[] | null;
   /** True when this row came from persisted chat history, not live optimism. */
   persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）

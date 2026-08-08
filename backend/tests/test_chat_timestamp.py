@@ -88,3 +88,48 @@ async def test_chat_history_null_timestamp():
 
     assert len(messages) == 1
     assert messages[0]["timestamp"] is None
+
+
+@pytest.mark.asyncio
+async def test_chat_history_exposes_structured_codex_todo_snapshot():
+    mock_task = MagicMock()
+    mock_task.__bool__ = lambda self: True
+    mock_task.sort_order = None
+    mock_task.starred = False
+    row = _make_log_row(
+        event_type="todo_list",
+        content="Todo:\n✓ Write tests\n◉ Deploy",
+        raw_json=json.dumps({
+            "type": "item.updated",
+            "turn_id": "turn-plan",
+            "todo_id": "todo:turn-plan",
+            "todo_explanation": "Track implementation",
+            "todo_items": [
+                {"text": "Write tests", "status": "completed"},
+                {"text": "Deploy", "status": "in_progress"},
+            ],
+            "item": {"id": "todo:turn-plan", "type": "todo_list"},
+        }),
+    )
+    row.task_retry_count = 0
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_task
+    mock_result = MagicMock()
+    mock_result.all.return_value = [row]
+    mock_result.scalar.return_value = None
+    mock_db.execute.return_value = mock_result
+
+    messages = await get_chat_history(
+        task_id=1,
+        request=_fake_request(),
+        limit=0,
+        compact=True,
+        db=mock_db,
+    )
+
+    assert messages[0]["todo_id"] == "todo:turn-plan"
+    assert messages[0]["todo_explanation"] == "Track implementation"
+    assert messages[0]["todo_items"] == [
+        {"text": "Write tests", "status": "completed"},
+        {"text": "Deploy", "status": "in_progress"},
+    ]

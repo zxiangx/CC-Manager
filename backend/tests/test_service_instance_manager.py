@@ -6677,6 +6677,69 @@ async def test_process_event_reordered_writes_preserve_event_bookkeeping(
 
 
 @pytest.mark.asyncio
+async def test_codex_todo_updates_replace_one_durable_snapshot(db_factory):
+    async with db_factory() as db:
+        instance = Instance(name="todo-snapshot")
+        task = Task(title="todo snapshot", provider="codex")
+        db.add_all([instance, task])
+        await db.commit()
+        await db.refresh(instance)
+        await db.refresh(task)
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    first = manager._parse_codex_line(json.dumps({
+        "type": "item.updated",
+        "turn_id": "turn-plan",
+        "item": {
+            "id": "todo-1",
+            "type": "todo_list",
+            "items": [
+                {"text": "Write tests", "status": "inProgress"},
+                {"text": "Deploy", "status": "pending"},
+            ],
+        },
+    }))
+    second = manager._parse_codex_line(json.dumps({
+        "type": "item.updated",
+        "turn_id": "turn-plan",
+        "item": {
+            "id": "todo-2",
+            "type": "todo_list",
+            "items": [
+                {"text": "Write tests", "status": "completed"},
+                {"text": "Deploy", "status": "inProgress"},
+            ],
+        },
+    }))
+
+    await manager._process_event(instance.id, task.id, first)
+    await manager._process_event(instance.id, task.id, second)
+
+    async with db_factory() as db:
+        rows = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task.id,
+                    LogEntry.event_type == "todo_list",
+                )
+            )
+        ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].id == broadcaster.broadcast.await_args_list[-1].args[1]["id"]
+    assert (
+        broadcaster.broadcast.await_args_list[0].args[1]["id"]
+        != broadcaster.broadcast.await_args_list[-1].args[1]["id"]
+    )
+    payload = json.loads(rows[0].raw_json)
+    assert payload["todo_id"] == "todo:turn-plan"
+    assert payload["todo_items"] == [
+        {"text": "Write tests", "status": "completed"},
+        {"text": "Deploy", "status": "in_progress"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_process_event_lock_order_does_not_deadlock_lifecycle_update():
     """An event transaction cannot invert a lifecycle Task -> Instance lock."""
     task_lock = asyncio.Lock()
@@ -10325,12 +10388,21 @@ def test_parse_codex_todo_list():
     im = InstanceManager(MagicMock(), MagicMock())
     event = im._parse_codex_line(json.dumps({
         "type": "item.updated",
+        "turn_id": "turn-plan",
         "item": {"id": "i", "type": "todo_list",
                  "items": [{"text": "write tests", "completed": True},
+                           {"text": "build UI", "status": "inProgress"},
                            {"text": "run tests", "completed": False}]},
     }))
-    assert event["event_type"] == "system_event"
+    assert event["event_type"] == "todo_list"
+    assert event["todo_id"] == "todo:turn-plan"
+    assert event["todo_items"] == [
+        {"text": "write tests", "status": "completed"},
+        {"text": "build UI", "status": "in_progress"},
+        {"text": "run tests", "status": "pending"},
+    ]
     assert "✓ write tests" in event["content"]
+    assert "◉ build UI" in event["content"]
     assert "○ run tests" in event["content"]
 
 

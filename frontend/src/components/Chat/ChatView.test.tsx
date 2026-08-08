@@ -349,6 +349,90 @@ describe('ChatView', () => {
     });
   });
 
+  describe('Codex todo list', () => {
+    it('renders the latest structured checklist with all three states', async () => {
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: 950,
+        role: 'assistant',
+        event_type: 'todo_list',
+        content: 'Todo list updated',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-08T09:00:00Z',
+        image_urls: null,
+        attachments: null,
+        item_id: 'todo-native-1',
+        todo_id: 'todo:turn-plan',
+        todo_items: [
+          { text: 'Write tests', status: 'completed' },
+          { text: 'Implement UI', status: 'in_progress' },
+          { text: 'Deploy', status: 'pending' },
+        ],
+      } satisfies ChatMessage]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 17, provider: 'codex' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(await screen.findByText('Plan')).toBeInTheDocument();
+      expect(screen.getByText('Write tests')).toHaveClass('line-through');
+      expect(screen.getByText('Implement UI')).toHaveAttribute('data-status', 'in_progress');
+      expect(screen.getByText('Deploy')).toHaveAttribute('data-status', 'pending');
+      expect(screen.getByText('1 of 3 completed')).toBeInTheDocument();
+    });
+
+    it('replaces one checklist in place when Codex publishes a new snapshot', async () => {
+      const task = makeTask({ id: 18, provider: 'codex' });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:18',
+          data: {
+            id: 960,
+            event_type: 'todo_list',
+            role: 'assistant',
+            todo_id: 'todo:turn-live',
+            todo_items: [
+              { text: 'Write tests', status: 'in_progress' },
+              { text: 'Deploy', status: 'pending' },
+            ],
+          },
+        });
+      });
+      expect(screen.getByText('0 of 2 completed')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:18',
+          data: {
+            id: 960,
+            event_type: 'todo_list',
+            role: 'assistant',
+            todo_id: 'todo:turn-live',
+            todo_items: [
+              { text: 'Write tests', status: 'completed' },
+              { text: 'Deploy', status: 'in_progress' },
+            ],
+          },
+        });
+      });
+
+      expect(screen.getAllByText('Plan')).toHaveLength(1);
+      expect(screen.getAllByText('Write tests')).toHaveLength(1);
+      expect(screen.getByText('Write tests')).toHaveClass('line-through');
+      expect(screen.getByText('1 of 2 completed')).toBeInTheDocument();
+    });
+  });
+
   describe('Codex main MCP capability', () => {
     it('shows the enabled runtime capability on Codex tasks', async () => {
       render(

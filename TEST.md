@@ -590,6 +590,10 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
 | `test_codex_app_server.py::test_standard_resume_reactivates_paused_goal_before_steering` | Standard follow-up 先注册 CCM owner，再恢复 `paused` 原生 Goal，等待精确 `turn/started` 并把用户消息 steer 到该 turn |
 | `test_codex_app_server.py::test_standard_resume_does_not_bypass_non_paused_goal_status` | 只有 `paused` 可由下一条消息自动续跑；`blocked`、usage/budget limited、complete 与无 Goal 均保持普通 `turn/start` 语义 |
+| `test_codex_app_server.py::test_todo_list_updates_are_forwarded_with_exact_turn_identity` | 当前 app-server `turn/plan/updated` 权威快照转换成结构化 `todo_list`，保留 exact turn identity |
+| `test_service_instance_manager.py::test_codex_todo_updates_replace_one_durable_snapshot` | 同一 turn 的计划更新删除旧 snapshot、以新 log id 持久化最新版本，数据库只留一条且不会掉出最新历史页 |
+| `test_chat_timestamp.py::test_chat_history_exposes_structured_codex_todo_snapshot` | HTTP 历史返回稳定 `todo_id`、explanation 和规范化的三态 items |
+| 前端 `ChatView.test.tsx::Codex todo list` | Plan 卡片渲染 pending/in_progress/completed，连续 WS 快照按 `todo_id` 原位更新且不重复 |
 | `test_service_instance_manager.py::test_internal_codex_abort_is_not_a_successful_chat_terminal` | transport/admission 内部 abort 不得伪装成用户 Interrupt 的 completed |
 | `test_codex_app_server.py::test_claimed_stop_preserves_shared_transport_when_interrupt_unconfirmed` / `test_claimed_stop_rejects_an_in_flight_steer_before_interrupt` / `test_unconfirmed_descendant_abandon_escalates_transport_shutdown` | 已持久 claim 的 stop 在 peer/steer 存在时保留共享 transport 与所有 turn；drain 后拒绝新 steer；真正 unclaimed cleanup 仍 fail closed 关闭账号 transport |
 | `test_service_instance_manager.py::test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy` / `test_api_tasks.py::test_stop_session_reports_unresolved_exact_owner` | 无法隔离的停止保留 Task→Instance、process 和 consumer，不影响 peer；API 返回 409 且不写伪终态/广播 |

@@ -1734,6 +1734,9 @@ async def get_chat_history(
         turn_id = None
         native_item_type = None
         native_item_status = None
+        todo_id = None
+        todo_explanation = None
+        todo_items = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
@@ -1763,6 +1766,25 @@ async def get_chat_history(
                             if item_status not in (None, "")
                             else None
                         )
+                    if row.event_type == "todo_list":
+                        raw_todo_id = raw.get("todo_id")
+                        todo_id = (
+                            str(raw_todo_id)
+                            if raw_todo_id not in (None, "")
+                            else None
+                        )
+                        if isinstance(raw.get("todo_explanation"), str):
+                            todo_explanation = raw["todo_explanation"]
+                        raw_todo_items = raw.get("todo_items")
+                        if isinstance(raw_todo_items, list):
+                            todo_items = [
+                                {
+                                    "text": str(todo.get("text") or ""),
+                                    "status": str(todo.get("status") or "pending"),
+                                }
+                                for todo in raw_todo_items
+                                if isinstance(todo, dict) and todo.get("text")
+                            ]
                     if raw.get("attachments"):
                         attachments = raw["attachments"]
                         image_urls = [a["url"] for a in attachments if a.get("is_image")]
@@ -1808,6 +1830,9 @@ async def get_chat_history(
             "turn_id": turn_id,
             "native_item_type": native_item_type,
             "native_item_status": native_item_status,
+            "todo_id": todo_id,
+            "todo_explanation": todo_explanation,
+            "todo_items": todo_items,
         })
 
     # Trim back to requested limit (we over-fetched to compensate for

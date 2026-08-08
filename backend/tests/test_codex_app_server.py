@@ -264,6 +264,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
             },
             "serviceTier": "default",
         },
+        {"goal": None},
         {"turn": {"id": "turn-456"}},
     ])
 
@@ -280,7 +281,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     )
 
     assert thread_id == "thread-123"
-    resume_call, turn_call = server._request.await_args_list
+    resume_call, goal_call, turn_call = server._request.await_args_list
     assert resume_call.args[0] == "thread/resume"
     assert resume_call.args[1]["threadId"] == "thread-123"
     assert resume_call.args[1]["approvalPolicy"] == "never"
@@ -306,6 +307,10 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     assert resume_call.args[1]["config"]["projects"] == {
         str(Path("/tmp").resolve()): {"trust_level": "untrusted"}
     }
+    assert goal_call.args == (
+        "thread/goal/get",
+        {"threadId": "thread-123"},
+    )
     assert turn_call.args[0] == "turn/start"
     assert turn_call.args[1]["effort"] == "max"
     assert turn_call.args[1]["model"] == "gpt-5.6-luna"
@@ -1660,7 +1665,12 @@ async def test_loaded_thread_switches_service_tier_before_turn_start(
             "turn/start",
         ]
         if requested_tier == "priority"
-        else ["thread/resume", "thread/settings/update", "turn/start"]
+        else [
+            "thread/resume",
+            "thread/goal/get",
+            "thread/settings/update",
+            "turn/start",
+        ]
     )
     update_params = next(
         params for method, params in calls
@@ -2230,6 +2240,8 @@ async def test_turn_start_prefixes_task_skills_in_schema_backed_text_input(
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            return {"goal": None}
         if method == "turn/start":
             turn_params.update(params)
             return {"turn": {"id": "turn-skills"}}
@@ -2644,6 +2656,8 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            return {"goal": None}
         if method == "turn/start":
             # Task 208's active goal emitted output before the turn/start RPC
             # returned its distinct submission id.
@@ -2726,6 +2740,8 @@ async def test_terminal_first_notification_settles_provisional_context():
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            return {"goal": None}
         if method == "turn/start":
             server._handle_notification("turn/completed", {
                 "threadId": "thread-hook",
@@ -2772,6 +2788,8 @@ async def test_signal_interrupt_reconciles_and_pauses_existing_goal_turn():
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            return {"goal": None}
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/interrupt":
@@ -2836,6 +2854,10 @@ async def test_interrupt_continues_when_goals_feature_is_disabled():
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            raise CodexAppServerError(
+                "thread/goal/get failed: goals feature is disabled"
+            )
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/interrupt":
@@ -2897,6 +2919,8 @@ async def test_steer_retries_authoritative_active_turn_id():
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            return {"goal": None}
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/steer":
@@ -3385,6 +3409,150 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
 
 
 @pytest.mark.asyncio
+async def test_standard_resume_reactivates_paused_goal_before_steering():
+    """A new user message is an explicit resume signal for a paused Goal."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    prepared = False
+    requests: list[tuple[str, dict]] = []
+    goal_checks = 0
+
+    async def on_turn_prepared(_process, thread_id):
+        nonlocal prepared
+        assert thread_id == "thread-paused-goal"
+        prepared = True
+
+    async def request(method, params):
+        nonlocal goal_checks
+        requests.append((method, params))
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": "thread-paused-goal",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/goal/get":
+            goal_checks += 1
+            return {
+                "goal": {
+                    "status": "paused" if goal_checks == 1 else "complete",
+                },
+            }
+        if method == "thread/goal/set":
+            assert prepared is True
+            assert params == {
+                "threadId": "thread-paused-goal",
+                "status": "active",
+            }
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/started",
+                {
+                    "threadId": "thread-paused-goal",
+                    "turn": {
+                        "id": "turn-resumed-goal",
+                        "status": "inProgress",
+                    },
+                },
+            )
+            return {"goal": {"status": "active"}}
+        if method == "turn/steer":
+            assert params == {
+                "threadId": "thread-paused-goal",
+                "expectedTurnId": "turn-resumed-goal",
+                "input": [{"type": "text", "text": "keep watching"}],
+            }
+            return {"turnId": "turn-resumed-goal"}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="keep watching",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-paused-goal",
+        git_env=None,
+        task_id=306,
+        on_turn_prepared=on_turn_prepared,
+    )
+
+    assert thread_id == "thread-paused-goal"
+    assert [method for method, _ in requests] == [
+        "thread/resume",
+        "thread/goal/get",
+        "thread/goal/set",
+        "turn/steer",
+    ]
+    assert process.admitted_turn_id == "turn-resumed-goal"
+    context = server._contexts_by_thread[thread_id]
+    assert context.following_native_goal is True
+    assert context.turn_id == "turn-resumed-goal"
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-resumed-goal",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "goal_status",
+    [None, "blocked", "usageLimited", "budgetLimited", "complete"],
+)
+async def test_standard_resume_does_not_bypass_non_paused_goal_status(
+    goal_status,
+):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls: list[str] = []
+
+    async def request(method, _params):
+        calls.append(method)
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": "thread-non-paused-goal",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/goal/get":
+            return {
+                "goal": (
+                    {"status": goal_status}
+                    if goal_status is not None
+                    else None
+                ),
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-regular"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="new instruction",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-non-paused-goal",
+        git_env=None,
+        task_id=307,
+    )
+
+    assert calls == ["thread/resume", "thread/goal/get", "turn/start"]
+    assert process.admitted_turn_id == "turn-regular"
+
+
+@pytest.mark.asyncio
 async def test_active_non_goal_thread_is_not_adopted():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -3532,8 +3700,10 @@ async def test_second_turn_on_same_active_thread_is_typed_busy_error():
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
         {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"goal": None},
         {"turn": {"id": "turn-1"}},
         {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"goal": None},
     ])
     await server.start_turn(
         prompt="first", cwd="/tmp", model="gpt-5.5", effort="low",
@@ -5821,6 +5991,8 @@ async def test_cancelled_turn_with_unconfirmed_interrupt_escalates_transport(
                     "status": {"type": "idle"},
                 },
             }
+        if method == "thread/goal/get":
+            return {"goal": None}
         if method == "turn/start":
             turn_start_entered.set()
             await release_turn_start.wait()
@@ -5889,6 +6061,7 @@ async def test_turn_start_timeout_shuts_transport_to_avoid_untracked_work(
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
         {"thread": {"id": thread_id, "status": {"type": "idle"}}},
+        {"goal": None},
         asyncio.TimeoutError(),
     ])
     server.shutdown = AsyncMock()

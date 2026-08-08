@@ -604,6 +604,7 @@ class _TurnContext:
     pending_goal_terminal_notification: dict[str, Any] | None = None
     goal_terminal_generation: int = 0
     goal_guard_tasks: set[asyncio.Task] = field(default_factory=set)
+    goal_started_future: asyncio.Future | None = None
     non_retry_error: dict[str, Any] | None = None
     tools_disabled: bool = False
     tool_policy_violation: str | None = None
@@ -736,6 +737,9 @@ class CodexAppServer:
         admission_future = context.admission_observed_future
         if admission_future is not None and not admission_future.done():
             admission_future.cancel()
+        goal_started_future = context.goal_started_future
+        if goal_started_future is not None and not goal_started_future.done():
+            goal_started_future.cancel()
         guard_task = getattr(context, "descendant_guard_task", None)
         context.descendant_guard_task = None
         try:
@@ -1961,6 +1965,100 @@ class CodexAppServer:
             return response_turn_id
         raise CodexAppServerError("Could not adopt active native Goal turn")
 
+    async def _resume_paused_native_goal(
+        self,
+        context: _TurnContext,
+        steer_input: list[dict[str, Any]],
+    ) -> str:
+        """Reactivate one paused Goal and steer the pending user message.
+
+        Setting a persisted Goal back to ``active`` starts its continuation
+        turn asynchronously.  Register the CCM owner before that request,
+        wait for the exact ``turn/started`` identity, and only then steer the
+        user input.  This mirrors Codex's own logical Goal operation instead
+        of starting an unrelated regular turn beside the paused Goal.
+        """
+
+        started = context.goal_started_future
+        if started is None:
+            raise CodexAppServerError(
+                "Paused Codex Goal has no prepared start observer"
+            )
+        response = await self._request(
+            "thread/goal/set",
+            {"threadId": context.thread_id, "status": "active"},
+        )
+        goal = response.get("goal") if isinstance(response, dict) else None
+        if not isinstance(goal, dict) or goal.get("status") != "active":
+            raise CodexAppServerError(
+                "thread/goal/set did not reactivate the paused Codex Goal"
+            )
+
+        turn_id = context.turn_id
+        if not turn_id:
+            try:
+                turn_id = str(
+                    await asyncio.wait_for(
+                        asyncio.shield(started),
+                        timeout=self.request_timeout,
+                    )
+                )
+            except asyncio.TimeoutError as exc:
+                raise CodexAppServerError(
+                    "Timed out waiting for the resumed Codex Goal turn"
+                ) from exc
+        response = await self._request(
+            "turn/steer",
+            {
+                "threadId": context.thread_id,
+                "expectedTurnId": turn_id,
+                "input": steer_input,
+            },
+        )
+        response_turn_id = (
+            response.get("turnId") if isinstance(response, dict) else None
+        )
+        if str(response_turn_id or "") != turn_id:
+            raise CodexAppServerError(
+                "turn/steer did not preserve the resumed Codex Goal turn id"
+            )
+        if not self._bind_turn_context(context, turn_id, observed=True):
+            raise CodexAppServerError(
+                f"Could not bind resumed Codex Goal turn {turn_id}"
+            )
+        return turn_id
+
+    async def _cancel_resumed_native_goal(
+        self,
+        context: _TurnContext,
+        reason: str,
+    ) -> bool:
+        """Pause and interrupt a Goal whose resume could not be handed off."""
+
+        try:
+            await self._pause_active_goal(context.thread_id)
+            if context.turn_id:
+                return await self.abandon_turn(context.process, reason)
+            _, status_type, active_turn_ids = await self._read_descendant_status(
+                context.thread_id,
+            )
+            if status_type != "idle" or active_turn_ids:
+                return False
+        except BaseException:
+            logger.exception(
+                "Failed to cancel resumed Codex Goal task=%s thread=%s",
+                context.task_id,
+                context.thread_id,
+            )
+            return False
+        self._detach_turn_context(context)
+        context.process.finish(
+            130,
+            reason,
+            termination_kind="internal_abort",
+        )
+        return True
+
     async def _interrupt_turn_context(self, context: _TurnContext) -> None:
         """Interrupt the actual active turn, reconciling steer-style admission ids."""
 
@@ -2645,6 +2743,7 @@ class CodexAppServer:
         # non-Goal active work remain fail-closed.
         thread_status_type = self._thread_status_type(thread.get("status"))
         adopt_active_goal = False
+        resume_paused_goal = False
         if thread_status_type != "idle":
             if (
                 resume_session_id
@@ -2671,6 +2770,21 @@ class CodexAppServer:
                     thread_id=str(thread_id),
                     operation=f"{thread_method} turn admission",
                 )
+        elif (
+            resume_session_id
+            and service_tier == CODEX_SERVICE_TIER_DEFAULT
+            and not disable_autonomous_features
+            and not tools_disabled
+        ):
+            # Stop intentionally pauses a native Goal. A later user message is
+            # an explicit continuation signal, so restore that same Goal
+            # rather than starting an unrelated regular turn and leaving the
+            # persisted objective stranded forever.
+            paused_goal = await self._read_thread_goal(str(thread_id))
+            resume_paused_goal = bool(
+                isinstance(paused_goal, dict)
+                and paused_goal.get("status") == "paused"
+            )
         if (
             resume_session_id
             and service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2753,6 +2867,11 @@ class CodexAppServer:
                     service_tier == CODEX_SERVICE_TIER_PRIORITY
                     or actual_tier_proxy is not None
                 )
+                else None
+            ),
+            goal_started_future=(
+                asyncio.get_running_loop().create_future()
+                if resume_paused_goal
                 else None
             ),
         )
@@ -2910,6 +3029,68 @@ class CodexAppServer:
                 adopted_turn_id,
             )
             turn_process.admitted_turn_id = str(adopted_turn_id)
+            return turn_process, thread_id
+
+        if resume_paused_goal:
+            self._mark_following_native_goal(context)
+            resume = asyncio.create_task(
+                self._resume_paused_native_goal(
+                    context,
+                    list(turn_params["input"]),
+                ),
+            )
+            resume_cancelled = False
+            while not resume.done():
+                try:
+                    await asyncio.shield(resume)
+                except asyncio.CancelledError:
+                    resume_cancelled = True
+                except BaseException:
+                    break
+            try:
+                resumed_turn_id = resume.result()
+            except BaseException:
+                confirmed = await _settle_registry_cleanup(
+                    self._cancel_resumed_native_goal(
+                        context,
+                        "Codex paused Goal resume failed",
+                    )
+                )
+                if not confirmed:
+                    raise _UnconfirmedTurnCancellation(
+                        turn_process,
+                        "Codex paused Goal resume failed and its active "
+                        "generation could not be stopped",
+                    )
+                raise
+
+            if actual_tier_proxy is not None:
+                context.admission_confirmed = True
+                self._replay_pending_admission_notifications(context)
+            turn_process.admitted_turn_id = resumed_turn_id
+            context.admitted_turn_id = resumed_turn_id
+            if resume_cancelled:
+                confirmed = await _settle_registry_cleanup(
+                    self._cancel_resumed_native_goal(
+                        context,
+                        "Codex paused Goal resume was cancelled",
+                    )
+                )
+                if not confirmed:
+                    raise _UnconfirmedTurnCancellation(
+                        turn_process,
+                        "Codex paused Goal resume was cancelled and its "
+                        "active generation could not be stopped",
+                    )
+                raise asyncio.CancelledError
+            logger.info(
+                "Codex latency task=%s thread=%s stage=goal_resumed "
+                "elapsed_ms=%.1f turn=%s",
+                task_id,
+                thread_id,
+                (time.perf_counter() - launch_started) * 1000,
+                resumed_turn_id,
+            )
             return turn_process, thread_id
 
         turn_request = asyncio.create_task(self._request("turn/start", turn_params))
@@ -4293,6 +4474,13 @@ class CodexAppServer:
             observed_future = context.admission_observed_future
             if observed_future is not None and not observed_future.done():
                 observed_future.set_result(context.observed_turn_id)
+            goal_started = context.goal_started_future
+            if (
+                method == "turn/started"
+                and goal_started is not None
+                and not goal_started.done()
+            ):
+                goal_started.set_result(context.observed_turn_id)
         if method == "turn/started" and (
             context.following_native_goal
             or context.pending_goal_terminal_notification is not None

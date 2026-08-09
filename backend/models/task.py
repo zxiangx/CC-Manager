@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import (
     CheckConstraint,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -102,6 +103,19 @@ class Task(Base):
     has_unread: Mapped[bool] = mapped_column(default=False, server_default="0")
     # Non-NULL = shadow task from a shared remote task
     shared_from_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Edited-message branches remain implementation-only Tasks.  Every hidden
+    # Task points at the one canonical sidebar Task, whose active pointer stores
+    # the branch last viewed by the user across browsers and devices.
+    message_branch_root_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    active_message_branch_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

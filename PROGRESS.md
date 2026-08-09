@@ -1023,3 +1023,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **需求与实现**：用户消息和初始 Prompt 可点铅笔编辑；后端复用 exact native Fork，在 `message_branches/message_branch_versions` 中保存有序真实 Task/thread 版本。新 Task 先保留可编辑 seed，首次发送后才绑定真实 user log；原日志和 rollout 永不改写。消息下方左右箭头加载对应 Task，ordinal > 0 的实现 Task 从普通 list/count 隐藏，侧栏仍只显示一个 Session。
 - **预防**：消息“版本”必须切换真实模型 context，不能只在前端替换文本；普通 Fork 必须清除继承的 branch metadata。分支 Task 不自动跨 CCM 分享，避免远端列表泄漏内部实现行。
 - **验证**：Fork/分支/Alembic 定向 `98 passed`，TaskQueue `45 passed`，ChatView `112 passed`，前端全量 `42 files / 563 tests`（TZ=UTC）和 production build 通过；Alembic SQLite upgrade→downgrade→upgrade 通过，Python compile 与 `git diff --check` 通过。后端全量在本机继续受既有可选依赖/环境基线影响：缺 `auto_backup`、缺 `claude_pty`，以及 multipart 版本将一个既有上传负向用例返回 422 而非 400；本次相关测试均通过。
+
+### 2026-08-09 — 同一 Session 内原地编辑与上下文分支
+
+- **交互修正**：编辑按钮不再立即导航到隐藏 Fork。原用户气泡直接变成预填输入框，Enter 提交、Shift+Enter 换行、Escape/Cancel 取消；提交后在同一个 URL、侧栏 Session、标题和标签下展示新回答。左右箭头切换的是完整真实上下文，普通 Fork 的独立 Task 行为保持不变。
+- **运行模型**：Codex 原生 thread 仍以精确 turn fork 保证上下文正确，但隐藏 Task 仅作为 runtime。可见 canonical Task 持久记录分支根和上次选中的 runtime Task；重新打开时从服务端恢复，跨设备一致。历史、WebSocket、发送、停止、Goal、Monitor 和配置操作跟随当前 runtime，标题、星标和关注标签仍属于 canonical Session。
+- **状态与兼容**：侧栏 list/count/status filter 映射当前分支状态，WebSocket 将选中隐藏分支的状态和后台活动镜像到 canonical Session，避免“实际执行但圆点不蓝”。旧版已经创建的隐藏分支可沿受约束的 branch membership/fork lineage 解析并在首次切换时补齐根关联。发送临时失败会复用已创建的内部 Fork，不会重复生成分支。
+- **验证**：Chat/Fork/状态广播/Alembic 相关后端 `113 passed`；ChatView `114 passed`；TypeScript/Vite production build、`git diff --check` 通过。SQLite 从空库 upgrade 到 `8c1f4a7d2e90`、downgrade 到 `6d9e2f4a1b70`、再次 upgrade 均通过。ChatView 和 API 客户端仍有本次修改前已存在的 ESLint 基线问题，本次新增 wrapper lint 问题已清零。

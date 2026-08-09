@@ -670,7 +670,7 @@ async def list_tasks(
 ):
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
-    return await queue.list_tasks(
+    tasks = await queue.list_tasks(
         status=status, include_archived=include_archived,
         archived_only=archived_only,
         project_id=project_id, starred=starred,
@@ -678,6 +678,26 @@ async def list_tasks(
         limit=limit, offset=offset,
         user_id=user_id if user_role not in ("admin", "super_admin") else None,
     )
+    rendered: list[TaskResponse] = []
+    for task in tasks:
+        response = TaskResponse.model_validate(task)
+        selected_id = task.active_message_branch_task_id
+        if selected_id is not None:
+            selected = await queue.db.get(Task, selected_id)
+            if (
+                selected is not None
+                and selected.message_branch_root_task_id == task.id
+            ):
+                # The sidebar represents the logical session. Reflect its last
+                # viewed runtime branch without overwriting the original Task's
+                # own terminal state, which is needed when switching back.
+                response.status = selected.status
+                response.background_active = selected.background_active
+                response.active_sub_agents = selected.active_sub_agents
+                response.context_window_usage = selected.context_window_usage
+                response.error_message = selected.error_message
+        rendered.append(response)
+    return rendered
 
 
 @router.post("", response_model=TaskResponse, status_code=201)

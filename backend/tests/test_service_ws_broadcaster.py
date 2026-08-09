@@ -119,6 +119,34 @@ async def test_worker_events_are_mirrored_to_scoped_channel():
 
 
 @pytest.mark.asyncio
+async def test_selected_hidden_branch_status_is_mirrored_to_canonical_session():
+    b = WebSocketBroadcaster()
+    b.db_factory = lambda: None
+    b._selected_message_branch_root = AsyncMock(return_value=41)
+    global_ws = _make_ws()
+    canonical_ws = _make_ws()
+    await b.subscribe(global_ws, ["tasks"])
+    await b.subscribe(canonical_ws, ["task:41"])
+
+    payload = {
+        "event": "status_change",
+        "task_id": 42,
+        "new_status": "executing",
+    }
+    await b.broadcast("tasks", payload)
+
+    root_payload = {**payload, "task_id": 41}
+    global_ws.send_text.assert_any_await(json.dumps({
+        "channel": "tasks",
+        "data": root_payload,
+    }))
+    canonical_ws.send_text.assert_awaited_once_with(json.dumps({
+        "channel": "task:41",
+        "data": root_payload,
+    }))
+
+
+@pytest.mark.asyncio
 async def test_broadcast_removes_dead_connections():
     b = WebSocketBroadcaster()
     ws_good = _make_ws()

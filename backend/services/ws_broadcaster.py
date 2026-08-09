@@ -80,6 +80,29 @@ class WebSocketBroadcaster:
                 task_msg,
             )
 
+        # Hidden edited-message Tasks execute independently, while the sidebar
+        # keeps one canonical session row. Mirror live status/background events
+        # to that row only when this hidden Task is the last selected branch.
+        if (
+            channel == "tasks"
+            and data.get("event") in {"status_change", "background_activity"}
+            and isinstance(data.get("task_id"), int)
+            and callable(self.db_factory)
+        ):
+            root_id = await self._selected_message_branch_root(data["task_id"])
+            if root_id is not None:
+                root_data = {**data, "task_id": root_id}
+                root_message = json.dumps({"channel": "tasks", "data": root_data})
+                await self._broadcast_snapshot(
+                    list(self.subscriptions.get("tasks", set())),
+                    root_message,
+                )
+                root_channel = f"task:{root_id}"
+                await self._broadcast_snapshot(
+                    list(self.subscriptions.get(root_channel, set())),
+                    json.dumps({"channel": root_channel, "data": root_data}),
+                )
+
         # The global workers channel contains private IPs and bootstrap logs, so
         # members cannot subscribe to it. Mirror each event to an ACL-checked
         # worker-specific channel to preserve real-time logs for that owner.
@@ -109,6 +132,28 @@ class WebSocketBroadcaster:
             and self.db_factory
         ):
             asyncio.create_task(self._notify_shared_status(data))
+
+    async def _selected_message_branch_root(self, task_id: int) -> int | None:
+        try:
+            from backend.models.task import Task
+
+            async with self.db_factory() as db:
+                task = await db.get(Task, task_id)
+                if task is None or task.message_branch_root_task_id is None:
+                    return None
+                root = await db.get(Task, task.message_branch_root_task_id)
+                if (
+                    root is None
+                    or root.active_message_branch_task_id != task.id
+                ):
+                    return None
+                return root.id
+        except Exception:
+            logger.exception(
+                "message branch status mirror failed for task %s",
+                task_id,
+            )
+            return None
 
     async def _notify_shared_status(self, data: dict):
         try:

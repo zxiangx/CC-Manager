@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models.task import Task
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.message_branch import MessageBranch, MessageBranchVersion
 from backend.models.task_share import TaskShare
 
 
@@ -334,6 +335,174 @@ async def test_edited_message_fork_keeps_both_contexts_and_binds_new_message(
     assert (await client.get(
         "/api/tasks/count?include_archived=true"
     )).json() == {"total": 1}
+
+
+@pytest.mark.asyncio
+async def test_message_branch_session_restores_last_selected_internal_task(
+    client, session_factory,
+):
+    created = await client.post("/api/tasks", json={
+        "title": "Canonical session",
+        "description": "initial",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    canonical_id = created.json()["id"]
+
+    async with session_factory() as db:
+        canonical = await db.get(Task, canonical_id)
+        canonical.status = "completed"
+        canonical.session_id = "thread-root"
+        internal = Task(
+            title="Hidden branch",
+            description="initial",
+            status="completed",
+            target_repo="/tmp/project",
+            target_branch="main",
+            provider="codex",
+            model="gpt-5.6-sol",
+            session_id="thread-branch",
+            message_branch_root_task_id=canonical_id,
+        )
+        db.add(internal)
+        branch = MessageBranch()
+        db.add(branch)
+        await db.flush()
+        db.add_all([
+            MessageBranchVersion(
+                branch_id=branch.id,
+                task_id=canonical_id,
+                message_log_id=None,
+                is_initial=True,
+                ordinal=0,
+            ),
+            MessageBranchVersion(
+                branch_id=branch.id,
+                task_id=internal.id,
+                message_log_id=None,
+                is_initial=False,
+                ordinal=1,
+            ),
+        ])
+        await db.commit()
+        await db.refresh(internal)
+        internal_id = internal.id
+
+    selected = await client.put(
+        f"/api/tasks/{canonical_id}/message-branch-session",
+        json={"selected_task_id": internal_id},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["canonical_task_id"] == canonical_id
+    assert selected.json()["active_task"]["id"] == internal_id
+
+    restored = await client.get(
+        f"/api/tasks/{canonical_id}/message-branch-session"
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["active_task"]["id"] == internal_id
+
+    async with session_factory() as db:
+        internal = await db.get(Task, internal_id)
+        internal.status = "executing"
+        await db.commit()
+    visible = (await client.get("/api/tasks?include_archived=true")).json()
+    assert [task["id"] for task in visible] == [canonical_id]
+    assert visible[0]["status"] == "executing"
+    executing = (await client.get(
+        "/api/tasks?include_archived=true&status=executing"
+    )).json()
+    assert [task["id"] for task in executing] == [canonical_id]
+    assert (await client.get(
+        "/api/tasks/count?include_archived=true&status=executing"
+    )).json() == {"total": 1}
+
+    switched_back = await client.put(
+        f"/api/tasks/{canonical_id}/message-branch-session",
+        json={"selected_task_id": canonical_id},
+    )
+    assert switched_back.status_code == 200, switched_back.text
+    assert switched_back.json()["active_task"]["id"] == canonical_id
+
+
+@pytest.mark.asyncio
+async def test_message_branch_session_rejects_unrelated_task(
+    client,
+):
+    first = (await client.post("/api/tasks", json={
+        "title": "First",
+        "description": "one",
+        "target_repo": "/tmp/one",
+        "provider": "codex",
+    })).json()
+    second = (await client.post("/api/tasks", json={
+        "title": "Second",
+        "description": "two",
+        "target_repo": "/tmp/two",
+        "provider": "codex",
+    })).json()
+
+    response = await client.put(
+        f"/api/tasks/{first['id']}/message-branch-session",
+        json={"selected_task_id": second["id"]},
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_message_branch_session_adopts_legacy_hidden_branch(
+    client, session_factory,
+):
+    canonical_id = (await client.post("/api/tasks", json={
+        "title": "Legacy root",
+        "description": "root",
+        "target_repo": "/tmp/root",
+        "provider": "codex",
+    })).json()["id"]
+    async with session_factory() as db:
+        child = Task(
+            title="Legacy hidden branch",
+            description="root",
+            status="completed",
+            target_repo="/tmp/root",
+            target_branch="main",
+            provider="codex",
+            session_id="legacy-thread",
+            metadata_={"forked_from_task_id": canonical_id},
+        )
+        branch = MessageBranch()
+        db.add_all([child, branch])
+        await db.flush()
+        db.add_all([
+            MessageBranchVersion(
+                branch_id=branch.id, task_id=canonical_id,
+                is_initial=True, ordinal=0,
+            ),
+            MessageBranchVersion(
+                branch_id=branch.id, task_id=child.id,
+                is_initial=False, ordinal=1,
+            ),
+        ])
+        await db.commit()
+        child_id = child.id
+
+    resolved = await client.get(
+        f"/api/tasks/{child_id}/message-branch-session"
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["canonical_task_id"] == canonical_id
+    assert resolved.json()["active_task"]["id"] == canonical_id
+
+    selected = await client.put(
+        f"/api/tasks/{canonical_id}/message-branch-session",
+        json={"selected_task_id": child_id},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["active_task"]["id"] == child_id
+    async with session_factory() as db:
+        child = await db.get(Task, child_id)
+        assert child.message_branch_root_task_id == canonical_id
 
 
 def test_codex_fork_resolver_prefers_unique_terminal_turn_over_stale_alias():

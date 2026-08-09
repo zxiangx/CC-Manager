@@ -142,6 +142,15 @@ class MessageBranchStateResponse(BaseModel):
     versions: list[MessageBranchVersionResponse]
 
 
+class MessageBranchSelectionRequest(BaseModel):
+    selected_task_id: int
+
+
+class MessageBranchSessionResponse(BaseModel):
+    canonical_task_id: int
+    active_task: TaskResponse
+
+
 def _validate_chat_service_tier(task: Task, model_override: str | None) -> None:
     """Reject an unsupported one-turn model before persisting the message."""
 
@@ -484,6 +493,125 @@ async def _bind_pending_message_branch(
     await db.flush()
     version.message_log_id = user_log.id
     log_metadata["message_branch_version_id"] = version.id
+
+
+async def _canonical_message_branch_task(
+    db: AsyncSession,
+    task: Task,
+) -> Task:
+    root_id = task.message_branch_root_task_id
+    if root_id is None:
+        membership = (await db.execute(
+            select(MessageBranchVersion).where(
+                MessageBranchVersion.task_id == task.id,
+                MessageBranchVersion.ordinal > 0,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if membership is None:
+            return task
+        # Compatibility for branches created by the first implementation,
+        # before the canonical root column existed. Only Tasks recorded as
+        # hidden branch versions may follow fork lineage this way.
+        current = task
+        seen = {task.id}
+        while True:
+            parent_id = (current.metadata_ or {}).get("forked_from_task_id")
+            if not isinstance(parent_id, int) or parent_id in seen:
+                raise HTTPException(409, "Could not resolve message branch root")
+            parent = await db.get(Task, parent_id)
+            if parent is None:
+                raise HTTPException(409, "Message branch root no longer exists")
+            if parent.message_branch_root_task_id is not None:
+                root_id = parent.message_branch_root_task_id
+                break
+            parent_membership = (await db.execute(
+                select(MessageBranchVersion.id).where(
+                    MessageBranchVersion.task_id == parent.id,
+                    MessageBranchVersion.ordinal > 0,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if parent_membership is None:
+                return parent
+            seen.add(parent.id)
+            current = parent
+    root = await db.get(Task, root_id)
+    if root is None:
+        raise HTTPException(409, "Message branch root no longer exists")
+    return root
+
+
+async def _active_message_branch_task(
+    db: AsyncSession,
+    canonical: Task,
+) -> Task:
+    selected_id = canonical.active_message_branch_task_id
+    if selected_id is None or selected_id == canonical.id:
+        return canonical
+    selected = await db.get(Task, selected_id)
+    if selected is None:
+        # A deleted or stale pointer must fail safely to the visible session.
+        return canonical
+    selected_root = await _canonical_message_branch_task(db, selected)
+    if selected_root.id != canonical.id:
+        return canonical
+    return selected
+
+
+@router.get(
+    "/{task_id}/message-branch-session",
+    response_model=MessageBranchSessionResponse,
+)
+async def get_message_branch_session(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    canonical = await _canonical_message_branch_task(db, task)
+    await require_task_access(request, canonical, db)
+    active = await _active_message_branch_task(db, canonical)
+    await require_task_access(request, active, db)
+    return {
+        "canonical_task_id": canonical.id,
+        "active_task": active,
+    }
+
+
+@router.put(
+    "/{task_id}/message-branch-session",
+    response_model=MessageBranchSessionResponse,
+)
+async def select_message_branch_session(
+    task_id: int,
+    body: MessageBranchSelectionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    canonical = await _canonical_message_branch_task(db, task)
+    await require_task_control(request, canonical, db)
+    selected = await db.get(Task, body.selected_task_id)
+    if selected is None:
+        raise HTTPException(404, "Selected message branch not found")
+    await require_task_access(request, selected, db)
+    selected_root = await _canonical_message_branch_task(db, selected)
+    if selected_root.id != canonical.id:
+        raise HTTPException(409, "Selected task is not part of this session")
+    if selected.id != canonical.id and selected.message_branch_root_task_id is None:
+        selected.message_branch_root_task_id = canonical.id
+    canonical.active_message_branch_task_id = (
+        None if selected.id == canonical.id else selected.id
+    )
+    await db.commit()
+    await db.refresh(selected)
+    return {
+        "canonical_task_id": canonical.id,
+        "active_task": selected,
+    }
 
 
 @router.get(
@@ -1347,6 +1475,11 @@ async def fork_codex_task(
             tags=deepcopy(source.tags),
             attention_tag=source.attention_tag,
             metadata_=metadata,
+            message_branch_root_task_id=(
+                source.message_branch_root_task_id or source.id
+                if body.message_branch
+                else None
+            ),
             started_at=now,
             completed_at=now,
         )

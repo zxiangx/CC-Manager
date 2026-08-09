@@ -18,6 +18,8 @@ vi.mock('../../api/client', () => ({
     stopTaskSession: vi.fn().mockResolvedValue({}),
     listForkAnchors: vi.fn().mockResolvedValue([]),
     listMessageBranches: vi.fn().mockResolvedValue([]),
+    getMessageBranchSession: vi.fn().mockRejectedValue(new Error('unsupported')),
+    selectMessageBranchSession: vi.fn().mockResolvedValue({}),
     forkTask: vi.fn().mockResolvedValue({}),
     getTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
@@ -154,6 +156,10 @@ describe('ChatView', () => {
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.listMessageBranches as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getMessageBranchSession as ReturnType<typeof vi.fn>)
+      .mockRejectedValue(new Error('unsupported'));
+    (api.selectMessageBranchSession as ReturnType<typeof vi.fn>)
+      .mockRejectedValue(new Error('unsupported'));
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -1635,7 +1641,7 @@ describe('ChatView', () => {
       expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
     });
 
-    it('edits a persisted user message by creating an immutable message branch', async () => {
+    it('edits a persisted user message inline and stays in the canonical session', async () => {
       const task = makeTask({
         id: 21,
         description: null,
@@ -1655,6 +1661,10 @@ describe('ChatView', () => {
       const onTaskForked = vi.fn();
       (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([message]);
       (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
+      (api.selectMessageBranchSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        canonical_task_id: task.id,
+        active_task: forked,
+      });
 
       render(
         <ChatView
@@ -1670,6 +1680,14 @@ describe('ChatView', () => {
         name: 'Edit this message in a new branch',
       }));
 
+      const editor = screen.getByRole('textbox', { name: 'Edit message' });
+      expect(editor).toHaveValue('old instruction');
+      await userEvent.clear(editor);
+      await userEvent.type(editor, 'new instruction');
+      await userEvent.click(screen.getByRole('button', {
+        name: 'Send edited message',
+      }));
+
       await waitFor(() => {
         expect(api.forkTask).toHaveBeenCalledWith(
           task.id,
@@ -1677,7 +1695,65 @@ describe('ChatView', () => {
           undefined,
           true,
         );
-        expect(onTaskForked).toHaveBeenCalledWith(forked);
+        expect(api.sendTaskChat).toHaveBeenCalledWith(
+          forked.id,
+          'new instruction',
+          undefined,
+          undefined,
+          null,
+          {
+            provider: forked.provider,
+            model: forked.model,
+            codex_service_tier: forked.codex_service_tier,
+          },
+        );
+        expect(api.selectMessageBranchSession).toHaveBeenCalledWith(
+          task.id,
+          forked.id,
+        );
+        expect(onTaskForked).not.toHaveBeenCalled();
+      });
+    });
+
+    it('retries a failed edited-message send without creating another fork', async () => {
+      const task = makeTask({
+        id: 23,
+        description: null,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const message: ChatMessage = {
+        id: 457,
+        event_type: 'user_message',
+        role: 'user',
+        content: 'old instruction',
+        raw_content: 'old instruction',
+        is_error: false,
+        timestamp: null,
+      };
+      const forked = makeTask({ id: 24, provider: 'codex', status: 'completed' });
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([message]);
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
+      (api.sendTaskChat as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(new Error('temporary send failure'))
+        .mockResolvedValueOnce({});
+      (api.selectMessageBranchSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        canonical_task_id: task.id,
+        active_task: forked,
+      });
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await userEvent.click(await screen.findByRole('button', {
+        name: 'Edit this message in a new branch',
+      }));
+      await userEvent.click(screen.getByRole('button', { name: 'Send edited message' }));
+      expect(await screen.findByText(/temporary send failure/)).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Send edited message' }));
+
+      await waitFor(() => {
+        expect(api.forkTask).toHaveBeenCalledTimes(1);
+        expect(api.sendTaskChat).toHaveBeenCalledTimes(2);
+        expect(api.selectMessageBranchSession).toHaveBeenCalledTimes(1);
       });
     });
 
@@ -1711,6 +1787,10 @@ describe('ChatView', () => {
         ],
       }]);
       (api.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(target);
+      (api.selectMessageBranchSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        canonical_task_id: task.id,
+        active_task: target,
+      });
 
       render(
         <ChatView
@@ -1726,8 +1806,54 @@ describe('ChatView', () => {
 
       await waitFor(() => {
         expect(api.getTask).toHaveBeenCalledWith(target.id);
-        expect(onTaskForked).toHaveBeenCalledWith(target);
+        expect(api.selectMessageBranchSession).toHaveBeenCalledWith(task.id, target.id);
+        expect(onTaskForked).not.toHaveBeenCalled();
       });
+    });
+
+    it('restores the last viewed internal branch inside the canonical session shell', async () => {
+      const canonical = makeTask({
+        id: 41,
+        title: 'One visible session',
+        description: null,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const active = makeTask({
+        id: 42,
+        title: 'Hidden implementation task',
+        description: null,
+        provider: 'codex',
+        status: 'executing',
+      });
+      (api.getMessageBranchSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        canonical_task_id: canonical.id,
+        active_task: active,
+      });
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockImplementation(
+        async (taskId: number) => taskId === active.id ? [{
+          id: 901,
+          event_type: 'message',
+          role: 'assistant',
+          content: 'response from restored branch',
+          is_error: false,
+          timestamp: null,
+        }] : [],
+      );
+
+      render(<ChatView task={canonical} projects={projects} onBack={onBack} />);
+
+      expect(await screen.findByText('response from restored branch')).toBeInTheDocument();
+      expect(screen.getByText(`Task #${canonical.id}`)).toBeInTheDocument();
+      expect(screen.queryByText(`Task #${active.id}`)).not.toBeInTheDocument();
+      expect(document.title).toContain(`#${canonical.id}`);
+      expect(api.getTaskChatHistory).toHaveBeenCalledWith(
+        active.id,
+        true,
+        expect.any(Number),
+        0,
+        true,
+      );
     });
 
     it('does not add fork actions to assistant messages', async () => {

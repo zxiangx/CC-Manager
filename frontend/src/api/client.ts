@@ -362,6 +362,11 @@ export interface MessageBranchState {
   versions: MessageBranchVersion[];
 }
 
+export interface MessageBranchSession {
+  canonical_task_id: number;
+  active_task: Task;
+}
+
 export interface AskUserOption {
   label: string;
   description?: string;
@@ -1312,6 +1317,13 @@ export const api = {
     request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
   listMessageBranches: (id: number) =>
     request<MessageBranchState[]>(`/api/tasks/${id}/message-branches`),
+  getMessageBranchSession: (id: number) =>
+    request<MessageBranchSession>(`/api/tasks/${id}/message-branch-session`),
+  selectMessageBranchSession: (id: number, selectedTaskId: number) =>
+    request<MessageBranchSession>(`/api/tasks/${id}/message-branch-session`, {
+      method: 'PUT',
+      body: JSON.stringify({ selected_task_id: selectedTaskId }),
+    }),
   forkTask: (
     id: number,
     anchor: { type: 'initial' | 'latest'; id?: never } | { type: 'user_message'; id: number },

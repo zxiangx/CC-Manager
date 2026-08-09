@@ -29,6 +29,22 @@ def _visible_task_predicate():
     return Task.id.not_in(hidden_branch_task_ids)
 
 
+def _effective_task_status_expr():
+    """Use the selected hidden branch status for logical-session filters."""
+
+    active = Task.__table__.alias("active_message_branch_task")
+    active_status = (
+        select(active.c.status)
+        .where(
+            active.c.id == Task.active_message_branch_task_id,
+            active.c.message_branch_root_task_id == Task.id,
+        )
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    return func.coalesce(active_status, Task.status)
+
+
 class _UnixTimestamp(FunctionElement):
     """Cross-dialect epoch conversion used by the mixed manual/time sort key."""
 
@@ -246,7 +262,12 @@ class TaskQueue:
             stmt = stmt.where(Task.archived == False)
         if status:
             parts = [s.strip() for s in status.split(",") if s.strip()]
-            stmt = stmt.where(Task.status.in_(parts)) if len(parts) > 1 else stmt.where(Task.status == parts[0])
+            effective_status = _effective_task_status_expr()
+            stmt = (
+                stmt.where(effective_status.in_(parts))
+                if len(parts) > 1
+                else stmt.where(effective_status == parts[0])
+            )
         if project_id is not None:
             stmt = stmt.where(Task.project_id == project_id)
         if starred is not None:
@@ -295,7 +316,12 @@ class TaskQueue:
             stmt = stmt.where(Task.archived == False)
         if status:
             parts = [s.strip() for s in status.split(",") if s.strip()]
-            stmt = stmt.where(Task.status.in_(parts)) if len(parts) > 1 else stmt.where(Task.status == parts[0])
+            effective_status = _effective_task_status_expr()
+            stmt = (
+                stmt.where(effective_status.in_(parts))
+                if len(parts) > 1
+                else stmt.where(effective_status == parts[0])
+            )
         if project_id is not None:
             stmt = stmt.where(Task.project_id == project_id)
         if starred is not None:

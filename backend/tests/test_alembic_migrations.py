@@ -38,7 +38,8 @@ PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
 CODEX_MONITOR_SWITCH_REVISION = "4b7d2e9a6c10"
-CURRENT_HEAD_REVISION = "6d9e2f4a1b70"
+MESSAGE_BRANCH_REVISION = "6d9e2f4a1b70"
+CURRENT_HEAD_REVISION = "8c1f4a7d2e90"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -916,7 +917,7 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
-            == CODEX_MONITOR_SWITCH_REVISION
+            == MESSAGE_BRANCH_REVISION
         )
         assert (
             script.get_revision(PR_REVIEW_PANEL_REVISION).down_revision

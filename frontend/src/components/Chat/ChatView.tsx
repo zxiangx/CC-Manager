@@ -40,6 +40,11 @@ interface ChatViewProps {
   inline?: boolean;
 }
 
+interface ChatRuntimeViewProps extends ChatViewProps {
+  canonicalTask: Task;
+  onInternalBranchSelected: (task: Task) => Promise<void>;
+}
+
 interface QueuedMessage {
   text: string;
   uploadResults?: UploadResult[];
@@ -255,12 +260,76 @@ function injectAttachments(uploadResults: UploadResult[]): InjectTaskAttachments
   };
 }
 
-export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, inline }: ChatViewProps) {
+export function ChatView(props: ChatViewProps) {
+  const { task: canonicalTask } = props;
+  const [runtimeSelection, setRuntimeSelection] = useState({
+    canonicalTaskId: canonicalTask.id,
+    task: canonicalTask,
+  });
+  const selectedTask = runtimeSelection.canonicalTaskId === canonicalTask.id
+    ? runtimeSelection.task
+    : canonicalTask;
+  const runtimeTask = selectedTask.id === canonicalTask.id
+    ? canonicalTask
+    : selectedTask;
+  const canRestoreMessageBranch = (
+    canonicalTask.provider === 'codex'
+    && !!canonicalTask.session_id
+    && canonicalTask.worker_id == null
+    && canonicalTask.shared_from_id == null
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!canRestoreMessageBranch) return () => { cancelled = true; };
+    api.getMessageBranchSession(canonicalTask.id).then((session) => {
+      if (!cancelled) setRuntimeSelection({
+        canonicalTaskId: session.canonical_task_id,
+        task: session.active_task,
+      });
+    }).catch(() => {
+      // Mixed-version deployments safely remain on the canonical Task.
+    });
+    return () => { cancelled = true; };
+  }, [canonicalTask.id, canRestoreMessageBranch]);
+
+  const selectInternalBranch = useCallback(async (selected: Task) => {
+    const session = await api.selectMessageBranchSession(
+      canonicalTask.id,
+      selected.id,
+    );
+    setRuntimeSelection({
+      canonicalTaskId: session.canonical_task_id,
+      task: session.active_task,
+    });
+  }, [canonicalTask.id]);
+
+  return (
+    <ChatRuntimeView
+      key={runtimeTask.id}
+      {...props}
+      task={runtimeTask}
+      canonicalTask={canonicalTask}
+      onInternalBranchSelected={selectInternalBranch}
+    />
+  );
+}
+
+function ChatRuntimeView({
+  task,
+  canonicalTask,
+  projects,
+  onBack,
+  onTaskUpdated,
+  onTaskForked,
+  onInternalBranchSelected,
+  inline,
+}: ChatRuntimeViewProps) {
   const projectName = useMemo(() => {
-    if (!task.project_id) return null;
-    const p = projects.find((p) => p.id === task.project_id);
+    if (!canonicalTask.project_id) return null;
+    const p = projects.find((p) => p.id === canonicalTask.project_id);
     return p?.name ?? null;
-  }, [task.project_id, projects]);
+  }, [canonicalTask.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
   const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
@@ -300,6 +369,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [forkError, setForkError] = useState<string | null>(null);
   const [messageBranches, setMessageBranches] = useState<MessageBranchState[]>([]);
   const [editingMessageKey, setEditingMessageKey] = useState<string | null>(null);
+  const [editingMessageAnchor, setEditingMessageAnchor] = useState<
+    { type: 'initial' } | { type: 'user_message'; id: number } | null
+  >(null);
+  const [editingMessageDraft, setEditingMessageDraft] = useState('');
+  const [submittingMessageEdit, setSubmittingMessageEdit] = useState(false);
+  const pendingMessageEditRef = useRef<{
+    key: string;
+    task: Task;
+    sent: boolean;
+  } | null>(null);
   const [switchingBranchId, setSwitchingBranchId] = useState<number | null>(null);
   const refreshHistoryRef = useRef<() => void>(() => {});
   // A pending HTTP snapshot can arrive after the corresponding WS resolution.
@@ -354,7 +433,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(task.context_window_usage ?? null);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingAttentionTag, setEditingAttentionTag] = useState(false);
-  const [titleDraft, setTitleDraft] = useState(task.title || '');
+  const [titleDraft, setTitleDraft] = useState(canonicalTask.title || '');
   const titleInputRef = useRef<HTMLInputElement>(null);
   const [titleExpanded, setTitleExpanded] = useState(false);
   const chatRootRef = useRef<HTMLDivElement>(null);
@@ -369,7 +448,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [requestRailTooltip, setRequestRailTooltip] = useState<RequestRailTooltip | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [starred, setStarred] = useState(task.starred);
+  const [starred, setStarred] = useState(canonicalTask.starred);
 
   useVisualViewportBounds(chatRootRef, !inline);
 
@@ -875,11 +954,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   useEffect(() => {
     const prev = document.title;
-    const label = task.title || task.description || '';
+    const label = canonicalTask.title || canonicalTask.description || '';
     const preview = label.length > 30 ? label.slice(0, 30) + '…' : label;
-    document.title = preview ? `#${task.id} ${preview}` : `#${task.id} - CCM`;
+    document.title = preview ? `#${canonicalTask.id} ${preview}` : `#${canonicalTask.id} - CCM`;
     return () => { document.title = prev; };
-  }, [task.id, task.title, task.description]);
+  }, [canonicalTask.id, canonicalTask.title, canonicalTask.description]);
 
   // Handle real-time WebSocket messages via callback (not state) to avoid
   // losing messages when React batches rapid state updates.
@@ -1686,12 +1765,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   const handleTitleSave = async () => {
     const trimmed = titleDraft.trim();
-    if (trimmed === (task.title || '')) {
+    if (trimmed === (canonicalTask.title || '')) {
       setEditingTitle(false);
       return;
     }
     try {
-      await api.updateTask(task.id, { title: trimmed });
+      await api.updateTask(canonicalTask.id, { title: trimmed });
       onTaskUpdated?.();
     } catch { /* ignore */ }
     setEditingTitle(false);
@@ -1699,7 +1778,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   const handleStar = async () => {
     try {
-      const updated = await api.starTask(task.id);
+      const updated = await api.starTask(canonicalTask.id);
       setStarred(updated.starred);
       onTaskUpdated?.();
     } catch { /* ignore */ }
@@ -1737,18 +1816,73 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     [messageBranches],
   );
 
-  const editMessageBranch = async (anchor: { type: 'initial' } | { type: 'user_message'; id: number }, key: string) => {
+  const editMessageBranch = (
+    anchor: { type: 'initial' } | { type: 'user_message'; id: number },
+    key: string,
+    content: string,
+  ) => {
     if (editingMessageKey || isProcessing) return;
     setEditingMessageKey(key);
+    setEditingMessageAnchor(anchor);
+    setEditingMessageDraft(content);
+    setError(null);
+  };
+
+  const cancelMessageBranchEdit = () => {
+    if (submittingMessageEdit) return;
+    setEditingMessageKey(null);
+    setEditingMessageAnchor(null);
+    setEditingMessageDraft('');
+  };
+
+  const submitMessageBranchEdit = async () => {
+    const edited = editingMessageDraft.trim();
+    if (!editingMessageAnchor || !edited || submittingMessageEdit) return;
+    setSubmittingMessageEdit(true);
     setError(null);
     try {
-      const forked = await api.forkTask(task.id, anchor, undefined, true);
-      onTaskForked?.(forked);
+      let pending = pendingMessageEditRef.current;
+      if (!pending || pending.key !== editingMessageKey) {
+        const forked = await api.forkTask(
+          task.id,
+          editingMessageAnchor,
+          undefined,
+          true,
+        );
+        pending = { key: editingMessageKey || '', task: forked, sent: false };
+        pendingMessageEditRef.current = pending;
+      }
+      const forked = pending.task;
+      const seedUploads = Array.isArray(forked.metadata_?.fork_seed_uploads)
+        ? (forked.metadata_!.fork_seed_uploads as UploadResult[])
+        : [];
+      if (!pending.sent) {
+        await api.sendTaskChat(
+          forked.id,
+          edited,
+          seedUploads.length ? seedUploads.map((upload) => upload.path) : undefined,
+          undefined,
+          null,
+          {
+            provider: forked.provider,
+            model: forked.model,
+            codex_service_tier: forked.codex_service_tier,
+          },
+        );
+        pending.sent = true;
+      }
+      try {
+        localStorage.setItem(`ccm-fork-seed-consumed-${forked.id}`, '1');
+        localStorage.setItem(`ccm-fork-seed-uploads-consumed-${forked.id}`, '1');
+        localStorage.removeItem(`ccm-chat-draft-${forked.id}`);
+      } catch { /* storage may be unavailable */ }
+      await onInternalBranchSelected(forked);
+      pendingMessageEditRef.current = null;
       onTaskUpdated?.();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not create an editable message branch');
+      setError(e instanceof Error ? e.message : 'Could not send the edited message');
     } finally {
-      setEditingMessageKey(null);
+      setSubmittingMessageEdit(false);
     }
   };
 
@@ -1760,7 +1894,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setError(null);
     try {
       const targetTask = await api.getTask(target.task_id);
-      onTaskForked?.(targetTask);
+      await onInternalBranchSelected(targetTask);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not switch message branch');
     } finally {
@@ -1965,7 +2099,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <ArrowLeft size={20} />
           </button>
           <div className="flex items-center gap-1.5 min-w-0 flex-1">
-            <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
+            <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{canonicalTask.id}</p>
             <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
               {providerLabel}
             </span>
@@ -2068,19 +2202,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 value={titleDraft}
                 onChange={(e) => setTitleDraft(e.target.value)}
                 onBlur={handleTitleSave}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleTitleSave(); if (e.key === 'Escape') { setTitleDraft(task.title || ''); setEditingTitle(false); } }}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleTitleSave(); if (e.key === 'Escape') { setTitleDraft(canonicalTask.title || ''); setEditingTitle(false); } }}
                 className="w-full bg-gray-800 text-foreground text-xs rounded px-2 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                 placeholder="Enter title..."
               />
             ) : (
               <div className="flex items-center gap-1 min-w-0 group/title">
-                <span className={`text-xs text-gray-500 ${titleExpanded ? 'whitespace-normal break-all' : 'truncate'}`}>{task.title || task.description || 'Untitled'}</span>
+                <span className={`text-xs text-gray-500 ${titleExpanded ? 'whitespace-normal break-all' : 'truncate'}`}>{canonicalTask.title || canonicalTask.description || 'Untitled'}</span>
                 <button
                   onClick={() => setTitleExpanded(!titleExpanded)}
                   className="text-[10px] text-gray-600 hover:text-gray-300 shrink-0 whitespace-nowrap"
                 >{titleExpanded ? 'less' : 'more'}</button>
                 <button
-                  onClick={() => { setTitleDraft(task.title || ''); setEditingTitle(true); }}
+                  onClick={() => { setTitleDraft(canonicalTask.title || ''); setEditingTitle(true); }}
                   className="text-gray-600 hover:text-gray-400 opacity-0 group-hover/title:opacity-100 transition-opacity shrink-0"
                   title="Edit title"
                 >
@@ -2090,8 +2224,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             )}
           </div>}
           <AttentionTag
-            taskId={task.id}
-            value={task.attention_tag}
+            taskId={canonicalTask.id}
+            value={canonicalTask.attention_tag}
             editing={editingAttentionTag}
             onEdit={() => {
               setEditingTitle(false);
@@ -2110,7 +2244,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       </div>
 
-      {task.metadata_?.forked_from_task_id && (
+      {task.metadata_?.forked_from_task_id && task.id === canonicalTask.id && (
         <div className="px-4 py-1.5 border-b border-indigo-500/20 bg-indigo-500/5 text-xs text-indigo-300 flex items-center gap-1.5">
           <GitBranch size={12} />
           <span>Forked from Task #{task.metadata_.forked_from_task_id}</span>
@@ -2461,12 +2595,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ))}
                     </div>
                   )}
-                  <ExpandableText
-                    text={task.description!}
-                    collapsedLines={6}
-                    className="whitespace-pre-wrap text-white"
-                    expandedClassName="whitespace-pre-wrap text-white"
-                  />
+                  {editingMessageKey === 'initial' ? (
+                    <InlineMessageEditor
+                      value={editingMessageDraft}
+                      submitting={submittingMessageEdit}
+                      onChange={setEditingMessageDraft}
+                      onSubmit={() => void submitMessageBranchEdit()}
+                      onCancel={cancelMessageBranchEdit}
+                    />
+                  ) : (
+                    <ExpandableText
+                      text={task.description!}
+                      collapsedLines={6}
+                      className="whitespace-pre-wrap text-white"
+                      expandedClassName="whitespace-pre-wrap text-white"
+                    />
+                  )}
                 </div>
                 <div className="flex items-center justify-end gap-1 mt-0.5 pr-1">
                   {task.created_at && <MessageTimestamp timestamp={task.created_at} />}
@@ -2477,7 +2621,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       canEdit={!isProcessing}
                       editing={editingMessageKey === 'initial'}
                       switching={switchingBranchId === initialMessageBranch?.branch_id}
-                      onEdit={() => editMessageBranch({ type: 'initial' }, 'initial')}
+                      onEdit={() => editMessageBranch(
+                        { type: 'initial' },
+                        'initial',
+                        task.description || '',
+                      )}
                       onSwitch={(index) => initialMessageBranch && switchMessageBranch(initialMessageBranch, index)}
                     />
                   )}
@@ -2512,11 +2660,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 && !group.message.source
               }
               editingBranch={editingMessageKey === `message-${group.message.id}`}
+              editDraft={editingMessageDraft}
+              editSubmitting={submittingMessageEdit}
               switchingBranch={switchingBranchId === messageBranchByLogId.get(group.message.id)?.branch_id}
               onEditBranch={() => editMessageBranch(
                 { type: 'user_message', id: group.message.id },
                 `message-${group.message.id}`,
+                group.message.raw_content || stripSenderPrefix(group.message.content || ''),
               )}
+              onEditDraftChange={setEditingMessageDraft}
+              onSubmitEdit={() => void submitMessageBranchEdit()}
+              onCancelEdit={cancelMessageBranchEdit}
               onSwitchBranch={(index) => {
                 const branch = messageBranchByLogId.get(group.message.id);
                 if (branch) void switchMessageBranch(branch, index);
@@ -3511,6 +3665,66 @@ function AskUserCard({
   );
 }
 
+function InlineMessageEditor({
+  value,
+  submitting,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  value: string;
+  submitting: boolean;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="min-w-[min(70vw,32rem)] space-y-2">
+      <textarea
+        autoFocus
+        aria-label="Edit message"
+        value={value}
+        disabled={submitting}
+        rows={Math.min(10, Math.max(3, value.split('\n').length))}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          const nativeEvent = event.nativeEvent as KeyboardEvent;
+          if (
+            event.key === 'Enter'
+            && !event.shiftKey
+            && !nativeEvent.isComposing
+            && nativeEvent.keyCode !== 229
+          ) {
+            event.preventDefault();
+            onSubmit();
+          }
+          if (event.key === 'Escape') onCancel();
+        }}
+        className="w-full resize-y rounded-lg border border-indigo-300/40 bg-gray-950/35 px-3 py-2 text-sm text-white outline-none focus:border-indigo-200 disabled:opacity-60"
+      />
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={submitting}
+          className="rounded px-2.5 py-1 text-xs text-indigo-100 hover:bg-white/10 disabled:opacity-40"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={submitting || !value.trim()}
+          className="inline-flex items-center gap-1 rounded bg-white/15 px-2.5 py-1 text-xs font-medium text-white hover:bg-white/25 disabled:opacity-40"
+        >
+          {submitting && <Loader2 size={12} className="animate-spin" />}
+          Send edited message
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MessageBranchControls({
   branch,
   canEdit,
@@ -3576,8 +3790,13 @@ const MessageBubble = memo(function MessageBubble({
   branch,
   canEditBranch,
   editingBranch,
+  editDraft,
+  editSubmitting,
   switchingBranch,
   onEditBranch,
+  onEditDraftChange,
+  onSubmitEdit,
+  onCancelEdit,
   onSwitchBranch,
 }: {
   message: ChatMessage;
@@ -3586,8 +3805,13 @@ const MessageBubble = memo(function MessageBubble({
   branch: MessageBranchState | null;
   canEditBranch: boolean;
   editingBranch: boolean;
+  editDraft: string;
+  editSubmitting: boolean;
   switchingBranch: boolean;
   onEditBranch: () => void;
+  onEditDraftChange: (value: string) => void;
+  onSubmitEdit: () => void;
+  onCancelEdit: () => void;
   onSwitchBranch: (index: number) => void;
 }) {
   const isUser = message.role === 'user';
@@ -3796,7 +4020,15 @@ const MessageBubble = memo(function MessageBubble({
                   : 'bg-gray-800 text-gray-200 rounded-bl-md border border-gray-700/50 shadow-sm'
           }`}
         >
-          {isUser ? (
+          {isUser && editingBranch ? (
+            <InlineMessageEditor
+              value={editDraft}
+              submitting={editSubmitting}
+              onChange={onEditDraftChange}
+              onSubmit={onSubmitEdit}
+              onCancel={onCancelEdit}
+            />
+          ) : isUser ? (
             <>
               {message.attachments && message.attachments.length > 0 && (
                 <div className="mb-2 flex flex-wrap gap-2">

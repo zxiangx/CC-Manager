@@ -1017,3 +1017,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **事故**：停止一个 Codex Task 时，未确认 `turn/interrupt` 的兜底路径会关闭该账号共享的 app-server，使同一 `CODEX_HOME` 上的其他 Task 一并失败；clean exit 0 又被误报为 unexpected，并把账号级历史 stderr 拼到每个 Task 的错误中。
 - **修复**：已领取 turn 改走 exact-generation `stop_claimed_turn`。只有目标仍是权威 live turn、没有 peer turn、没有已准入 RPC 时才允许关闭 transport；存在 peer、并发 steer/RPC 或目标已变化时保留原 process/consumer/DB owner 并向停止接口返回 409。未领取 turn 的清理仍保持 fail-closed。transport EOF 时冻结精确 shutdown intent，计划关闭与真实异常分开归因；共享 stderr 只留服务日志，不再泄漏到 Task 错误。
 - **验证**：Codex app-server 与 InstanceManager 完整文件 `456 passed`，关键停止/EOF/steer 并发矩阵 `10 passed`；后端全量 `3247 passed, 2 failed`，两项均与修改前基线相同（queued-message 旧 prompt 断言、login-runtime stale socket 环境断言），无新增回归。前端全量 `40 files / 525 tests`、`tsc --noEmit`、production build、Python compile 与 `git diff --check` 均通过。
+
+### 2026-08-09 — Codex 已发送消息的不可变编辑分支（commit 26b4077）
+
+- **需求与实现**：用户消息和初始 Prompt 可点铅笔编辑；后端复用 exact native Fork，在 `message_branches/message_branch_versions` 中保存有序真实 Task/thread 版本。新 Task 先保留可编辑 seed，首次发送后才绑定真实 user log；原日志和 rollout 永不改写。消息下方左右箭头加载对应 Task，ordinal > 0 的实现 Task 从普通 list/count 隐藏，侧栏仍只显示一个 Session。
+- **预防**：消息“版本”必须切换真实模型 context，不能只在前端替换文本；普通 Fork 必须清除继承的 branch metadata。分支 Task 不自动跨 CCM 分享，避免远端列表泄漏内部实现行。
+- **验证**：Fork/分支/Alembic 定向 `98 passed`，TaskQueue `45 passed`，ChatView `112 passed`，前端全量 `42 files / 563 tests`（TZ=UTC）和 production build 通过；Alembic SQLite upgrade→downgrade→upgrade 通过，Python compile 与 `git diff --check` 通过。后端全量在本机继续受既有可选依赖/环境基线影响：缺 `auto_backup`、缺 `claude_pty`，以及 multipart 版本将一个既有上传负向用例返回 422 而非 400；本次相关测试均通过。

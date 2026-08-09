@@ -20,6 +20,7 @@ from backend.models.project import Project     # noqa: F401
 from backend.models.project_todo import ProjectTodo  # noqa: F401
 from backend.models.task import Task           # noqa: F401
 from backend.models.log_entry import LogEntry  # noqa: F401
+from backend.models.message_branch import MessageBranch, MessageBranchVersion  # noqa: F401
 from backend.models.worktree import Worktree   # noqa: F401
 from backend.models.secret import Secret               # noqa: F401
 from backend.models.tag import Tag                     # noqa: F401

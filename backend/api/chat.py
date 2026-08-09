@@ -17,10 +17,12 @@ from backend.api.deps import (
 from pydantic import BaseModel, model_validator
 from sqlalchemy import and_, not_, select, func, update as sa_update  # still used by chat history
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from backend.database import get_db
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
+from backend.models.message_branch import MessageBranch, MessageBranchVersion
 from backend.models.user_skill import UserSkill
 from backend.api.uploads import (
     UploadAttachmentValidationError,
@@ -114,6 +116,30 @@ class ForkAnchor(BaseModel):
 class CodexForkRequest(BaseModel):
     anchor: ForkAnchor
     title: str | None = None
+    message_branch: bool = False
+
+    @model_validator(mode="after")
+    def validate_message_branch(self):
+        if self.message_branch and self.anchor.type == "latest":
+            raise ValueError("full-copy forks cannot be message branches")
+        return self
+
+
+class MessageBranchVersionResponse(BaseModel):
+    task_id: int
+    message_id: int | None
+    is_initial: bool
+    ordinal: int
+    title: str
+    preview: str
+
+
+class MessageBranchStateResponse(BaseModel):
+    branch_id: int
+    message_id: int | None
+    is_initial: bool
+    current_index: int
+    versions: list[MessageBranchVersionResponse]
 
 
 def _validate_chat_service_tier(task: Task, model_override: str | None) -> None:
@@ -423,6 +449,109 @@ async def _task_log_rows(db: AsyncSession, task_id: int) -> list[LogEntry]:
         .where(LogEntry.task_id == task_id)
         .order_by(LogEntry.id.asc())
     )).scalars().all())
+
+
+def _message_branch_preview(task: Task, row: LogEntry | None, *, is_initial: bool) -> str:
+    if is_initial:
+        return task.description or ""
+    if row is not None:
+        metadata = _raw_log_metadata(row)
+        return str(metadata.get("raw_content") or row.content or "")
+    metadata = task.metadata_ or {}
+    return str(metadata.get("fork_seed_message") or "")
+
+
+async def _bind_pending_message_branch(
+    db: AsyncSession,
+    task: Task,
+    user_log: LogEntry,
+    log_metadata: dict,
+) -> None:
+    """Bind an edited fork draft to the first durable user row it sends."""
+
+    metadata = task.metadata_ or {}
+    version_id = metadata.get("message_branch_version_id")
+    if not isinstance(version_id, int):
+        return
+    version = await db.get(MessageBranchVersion, version_id)
+    if (
+        version is None
+        or version.task_id != task.id
+        or version.is_initial
+        or version.message_log_id is not None
+    ):
+        return
+    await db.flush()
+    version.message_log_id = user_log.id
+    log_metadata["message_branch_version_id"] = version.id
+
+
+@router.get(
+    "/{task_id}/message-branches",
+    response_model=list[MessageBranchStateResponse],
+)
+async def list_message_branches(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return every branch switcher anchored in the currently opened Task."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+
+    memberships = list((await db.execute(
+        select(MessageBranchVersion)
+        .where(MessageBranchVersion.task_id == task_id)
+        .order_by(MessageBranchVersion.ordinal.asc())
+    )).scalars().all())
+    states: list[dict] = []
+    for membership in memberships:
+        versions = list((await db.execute(
+            select(MessageBranchVersion)
+            .where(MessageBranchVersion.branch_id == membership.branch_id)
+            .order_by(MessageBranchVersion.ordinal.asc())
+        )).scalars().all())
+        rendered_versions: list[dict] = []
+        current_index = -1
+        for version in versions:
+            sibling = await db.get(Task, version.task_id)
+            if sibling is None:
+                continue
+            await require_task_access(request, sibling, db)
+            row = (
+                await db.get(LogEntry, version.message_log_id)
+                if version.message_log_id is not None
+                else None
+            )
+            if row is not None and row.task_id != sibling.id:
+                raise HTTPException(409, "Message branch points to an invalid log row")
+            if version.id == membership.id:
+                current_index = len(rendered_versions)
+            rendered_versions.append({
+                "task_id": sibling.id,
+                "message_id": version.message_log_id,
+                "is_initial": version.is_initial,
+                "ordinal": version.ordinal,
+                "title": sibling.title or f"Task #{sibling.id}",
+                "preview": _message_branch_preview(
+                    sibling,
+                    row,
+                    is_initial=version.is_initial,
+                ),
+            })
+        if current_index < 0 or not rendered_versions:
+            continue
+        states.append({
+            "branch_id": membership.branch_id,
+            "message_id": membership.message_log_id,
+            "is_initial": membership.is_initial,
+            "current_index": current_index,
+            "versions": rendered_versions,
+        })
+    return states
 
 
 def _fork_copy_signature(row: LogEntry) -> tuple:
@@ -806,10 +935,12 @@ async def send_chat_message(
         event_type="user_message",
         role="user",
         content=display_content,
-        raw_json=json.dumps(log_metadata) if log_metadata else None,
+        raw_json=None,
         is_error=False,
     )
     db.add(user_log)
+    await _bind_pending_message_branch(db, task, user_log, log_metadata)
+    user_log.raw_json = json.dumps(log_metadata) if log_metadata else None
     await db.commit()
 
     # Broadcast user message to task channel
@@ -1147,6 +1278,10 @@ async def fork_codex_task(
     committed = False
     try:
         metadata = deepcopy(source.metadata_ or {})
+        # Branch membership belongs to one exact Task/log position and must
+        # never be inherited by an unrelated ordinary fork.
+        metadata.pop("message_branch_id", None)
+        metadata.pop("message_branch_version_id", None)
         if account_id:
             metadata["codex_account_id"] = account_id
         metadata["forked_from_task_id"] = source.id
@@ -1218,6 +1353,63 @@ async def fork_codex_task(
         db.add(forked_task)
         await db.flush()
 
+        if body.message_branch:
+            if body.anchor.type == "initial":
+                existing_version = (await db.execute(
+                    select(MessageBranchVersion).where(
+                        MessageBranchVersion.task_id == source.id,
+                        MessageBranchVersion.is_initial.is_(True),
+                    )
+                )).scalar_one_or_none()
+            else:
+                existing_version = (await db.execute(
+                    select(MessageBranchVersion).where(
+                        MessageBranchVersion.task_id == source.id,
+                        MessageBranchVersion.message_log_id == body.anchor.id,
+                    )
+                )).scalar_one_or_none()
+
+            if existing_version is None:
+                branch = MessageBranch(created_by=get_current_user_id(request))
+                db.add(branch)
+                await db.flush()
+                existing_version = MessageBranchVersion(
+                    branch_id=branch.id,
+                    task_id=source.id,
+                    message_log_id=(
+                        body.anchor.id if body.anchor.type == "user_message" else None
+                    ),
+                    is_initial=body.anchor.type == "initial",
+                    ordinal=0,
+                )
+                db.add(existing_version)
+                await db.flush()
+
+            next_ordinal = int((await db.execute(
+                select(func.max(MessageBranchVersion.ordinal)).where(
+                    MessageBranchVersion.branch_id == existing_version.branch_id
+                )
+            )).scalar_one() or 0) + 1
+            forked_version = MessageBranchVersion(
+                branch_id=existing_version.branch_id,
+                task_id=forked_task.id,
+                message_log_id=None,
+                is_initial=False,
+                ordinal=next_ordinal,
+            )
+            db.add(forked_version)
+            await db.flush()
+            metadata["message_branch_id"] = existing_version.branch_id
+            metadata["message_branch_version_id"] = forked_version.id
+            # JSON columns do not detect in-place mutation of the same dict
+            # object assigned during Task construction.
+            forked_task.metadata_ = deepcopy(metadata)
+            flag_modified(forked_task, "metadata_")
+        else:
+            metadata.pop("message_branch_id", None)
+            metadata.pop("message_branch_version_id", None)
+            forked_task.metadata_ = deepcopy(metadata)
+
         for row in rows:
             if row.id > cutoff:
                 break
@@ -1280,7 +1472,7 @@ async def fork_codex_task(
             cleanup.result()
         raise
 
-    if forked_task.project_id:
+    if forked_task.project_id and not body.message_branch:
         try:
             from backend.services.task_sharing import auto_share_new_task
             await auto_share_new_task(

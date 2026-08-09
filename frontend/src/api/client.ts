@@ -241,6 +241,8 @@ export interface Task {
     fork_seed_message?: string;
     fork_seed_log_id?: number | null;
     fork_seed_uploads?: UploadResult[];
+    message_branch_id?: number;
+    message_branch_version_id?: number;
     ccm_worker_managed_task?: boolean;
     ccm_user_skill_snapshots?: unknown[];
   } | null;
@@ -341,6 +343,23 @@ export interface CodexForkAnchor {
   attachments: FileAttachment[];
   available?: boolean;
   unavailable_reason?: string | null;
+}
+
+export interface MessageBranchVersion {
+  task_id: number;
+  message_id: number | null;
+  is_initial: boolean;
+  ordinal: number;
+  title: string;
+  preview: string;
+}
+
+export interface MessageBranchState {
+  branch_id: number;
+  message_id: number | null;
+  is_initial: boolean;
+  current_index: number;
+  versions: MessageBranchVersion[];
 }
 
 export interface AskUserOption {
@@ -1291,14 +1310,21 @@ export const api = {
     request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
   listForkAnchors: (id: number) =>
     request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
+  listMessageBranches: (id: number) =>
+    request<MessageBranchState[]>(`/api/tasks/${id}/message-branches`),
   forkTask: (
     id: number,
     anchor: { type: 'initial' | 'latest'; id?: never } | { type: 'user_message'; id: number },
     title?: string,
+    messageBranch = false,
   ) =>
     request<Task>(`/api/tasks/${id}/fork`, {
       method: 'POST',
-      body: JSON.stringify({ anchor, ...(title?.trim() ? { title: title.trim() } : {}) }),
+      body: JSON.stringify({
+        anchor,
+        ...(title?.trim() ? { title: title.trim() } : {}),
+        ...(messageBranch ? { message_branch: true } : {}),
+      }),
     }),
   distillTask: (id: number, customInstruction?: string, expectedRouting?: TaskRoutingExpectation) =>
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),

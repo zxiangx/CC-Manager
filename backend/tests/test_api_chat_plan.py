@@ -211,6 +211,131 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert copied_raw["fork_source_log_id"] == first_message["id"]
 
 
+@pytest.mark.asyncio
+async def test_edited_message_fork_keeps_both_contexts_and_binds_new_message(
+    client, session_factory,
+):
+    created = await client.post("/api/tasks", json={
+        "title": "Source",
+        "description": "initial",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    source_id = created.json()["id"]
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+        source.status = "completed"
+        source.session_id = "thread-source"
+        source.last_cwd = "/tmp/project"
+        before = LogEntry(
+            instance_id=1,
+            task_id=source_id,
+            event_type="message",
+            role="assistant",
+            content="before",
+            raw_json='{"item_id":"item-1","turn_id":"turn-1"}',
+            is_error=False,
+        )
+        original = LogEntry(
+            instance_id=1,
+            task_id=source_id,
+            event_type="user_message",
+            role="user",
+            content="old instruction",
+            raw_json='{"raw_content":"old instruction"}',
+            is_error=False,
+        )
+        after = LogEntry(
+            instance_id=1,
+            task_id=source_id,
+            event_type="message",
+            role="assistant",
+            content="after",
+            raw_json='{"item_id":"item-2","turn_id":"turn-2"}',
+            is_error=False,
+        )
+        db.add_all([before, original, after])
+        await db.commit()
+        await db.refresh(original)
+        original_id = original.id
+
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
+    ]
+    with (
+        patch(
+            "backend.api.chat._codex_fork_home",
+            return_value=("/tmp/codex-home", "codex-a"),
+        ),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-source", "turns": turns}),
+        ),
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-edited"}),
+        ),
+    ):
+        fork_response = await client.post(
+            f"/api/tasks/{source_id}/fork",
+            json={
+                "anchor": {"type": "user_message", "id": original_id},
+                "message_branch": True,
+            },
+        )
+    assert fork_response.status_code == 201, fork_response.text
+    forked = fork_response.json()
+    forked_id = forked["id"]
+    assert forked["metadata_"]["fork_seed_message"] == "old instruction"
+    assert isinstance(forked["metadata_"]["message_branch_version_id"], int)
+
+    source_branches = (await client.get(
+        f"/api/tasks/{source_id}/message-branches"
+    )).json()
+    assert len(source_branches) == 1
+    assert source_branches[0]["message_id"] == original_id
+    assert source_branches[0]["current_index"] == 0
+    assert [version["task_id"] for version in source_branches[0]["versions"]] == [
+        source_id,
+        forked_id,
+    ]
+    assert [version["preview"] for version in source_branches[0]["versions"]] == [
+        "old instruction",
+        "old instruction",
+    ]
+
+    with patch(
+        "backend.main.dispatcher.enqueue_message",
+        new=AsyncMock(),
+    ):
+        sent = await client.post(
+            f"/api/tasks/{forked_id}/chat",
+            json={"message": "new instruction"},
+        )
+    assert sent.status_code == 200, sent.text
+
+    fork_branches = (await client.get(
+        f"/api/tasks/{forked_id}/message-branches"
+    )).json()
+    assert len(fork_branches) == 1
+    assert fork_branches[0]["current_index"] == 1
+    assert isinstance(fork_branches[0]["message_id"], int)
+    assert [version["preview"] for version in fork_branches[0]["versions"]] == [
+        "old instruction",
+        "new instruction",
+    ]
+
+    # The branch is reachable through the message arrows but does not create
+    # a duplicate Session row in the normal sidebar.
+    visible_tasks = (await client.get("/api/tasks?include_archived=true")).json()
+    assert [task["id"] for task in visible_tasks] == [source_id]
+    assert (await client.get(
+        "/api/tasks/count?include_archived=true"
+    )).json() == {"total": 1}
+
+
 def test_codex_fork_resolver_prefers_unique_terminal_turn_over_stale_alias():
     from backend.api.chat import ForkAnchor, _resolve_fork_turn
 

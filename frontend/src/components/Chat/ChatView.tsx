@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry, MessageBranchState } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -298,6 +298,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [forkTitle, setForkTitle] = useState('');
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState<string | null>(null);
+  const [messageBranches, setMessageBranches] = useState<MessageBranchState[]>([]);
+  const [editingMessageKey, setEditingMessageKey] = useState<string | null>(null);
+  const [switchingBranchId, setSwitchingBranchId] = useState<number | null>(null);
   const refreshHistoryRef = useRef<() => void>(() => {});
   // A pending HTTP snapshot can arrive after the corresponding WS resolution.
   // Keep request-scoped tombstones for this mounted task so such a snapshot
@@ -1702,6 +1705,69 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     } catch { /* ignore */ }
   };
 
+  const refreshMessageBranches = useCallback(async () => {
+    if (task.provider !== 'codex' || !task.session_id || task.worker_id != null || task.shared_from_id != null) {
+      setMessageBranches([]);
+      return;
+    }
+    try {
+      setMessageBranches(await api.listMessageBranches(task.id));
+    } catch {
+      // Branch controls are an enhancement; a stale mixed-version backend
+      // must not prevent the rest of the conversation from rendering.
+      setMessageBranches([]);
+    }
+  }, [task.id, task.provider, task.session_id, task.worker_id, task.shared_from_id]);
+
+  useEffect(() => {
+    void refreshMessageBranches();
+  }, [refreshMessageBranches]);
+
+  const messageBranchByLogId = useMemo(() => {
+    const byLogId = new Map<number, MessageBranchState>();
+    for (const branch of messageBranches) {
+      if (!branch.is_initial && branch.message_id != null) {
+        byLogId.set(branch.message_id, branch);
+      }
+    }
+    return byLogId;
+  }, [messageBranches]);
+  const initialMessageBranch = useMemo(
+    () => messageBranches.find((branch) => branch.is_initial) || null,
+    [messageBranches],
+  );
+
+  const editMessageBranch = async (anchor: { type: 'initial' } | { type: 'user_message'; id: number }, key: string) => {
+    if (editingMessageKey || isProcessing) return;
+    setEditingMessageKey(key);
+    setError(null);
+    try {
+      const forked = await api.forkTask(task.id, anchor, undefined, true);
+      onTaskForked?.(forked);
+      onTaskUpdated?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not create an editable message branch');
+    } finally {
+      setEditingMessageKey(null);
+    }
+  };
+
+  const switchMessageBranch = async (branch: MessageBranchState, nextIndex: number) => {
+    if (switchingBranchId != null || nextIndex < 0 || nextIndex >= branch.versions.length) return;
+    const target = branch.versions[nextIndex];
+    if (target.task_id === task.id) return;
+    setSwitchingBranchId(branch.branch_id);
+    setError(null);
+    try {
+      const targetTask = await api.getTask(target.task_id);
+      onTaskForked?.(targetTask);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not switch message branch');
+    } finally {
+      setSwitchingBranchId(null);
+    }
+  };
+
   const openFork = async () => {
     if (task.provider !== 'codex' || !task.session_id) return;
     setForkOpen(true);
@@ -1836,6 +1902,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (!fromQueue) {
         consumeForkSeedUploads();
       }
+      await refreshMessageBranches();
       setModelOverride(null);
     } catch (e) {
       setSending(false);
@@ -2404,6 +2471,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <div className="flex items-center justify-end gap-1 mt-0.5 pr-1">
                   {task.created_at && <MessageTimestamp timestamp={task.created_at} />}
                   <MessageCopyButton text={task.description} />
+                  {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
+                    <MessageBranchControls
+                      branch={initialMessageBranch}
+                      canEdit={!isProcessing}
+                      editing={editingMessageKey === 'initial'}
+                      switching={switchingBranchId === initialMessageBranch?.branch_id}
+                      onEdit={() => editMessageBranch({ type: 'initial' }, 'initial')}
+                      onSwitch={(index) => initialMessageBranch && switchMessageBranch(initialMessageBranch, index)}
+                    />
+                  )}
                 </div>
               </div>
             </div>
@@ -2422,6 +2499,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               message={group.message}
               taskId={task.id}
               onAskUserResolved={markAskUserResolved}
+              branch={messageBranchByLogId.get(group.message.id) || null}
+              canEditBranch={
+                task.provider === 'codex'
+                && !!task.session_id
+                && task.worker_id == null
+                && task.shared_from_id == null
+                && !isProcessing
+                && group.message.persisted === true
+                && group.message.event_type === 'user_message'
+                && group.message.role === 'user'
+                && !group.message.source
+              }
+              editingBranch={editingMessageKey === `message-${group.message.id}`}
+              switchingBranch={switchingBranchId === messageBranchByLogId.get(group.message.id)?.branch_id}
+              onEditBranch={() => editMessageBranch(
+                { type: 'user_message', id: group.message.id },
+                `message-${group.message.id}`,
+              )}
+              onSwitchBranch={(index) => {
+                const branch = messageBranchByLogId.get(group.message.id);
+                if (branch) void switchMessageBranch(branch, index);
+              }}
             />
           )
         )}
@@ -3412,14 +3511,84 @@ function AskUserCard({
   );
 }
 
+function MessageBranchControls({
+  branch,
+  canEdit,
+  editing,
+  switching,
+  onEdit,
+  onSwitch,
+}: {
+  branch: MessageBranchState | null;
+  canEdit: boolean;
+  editing: boolean;
+  switching: boolean;
+  onEdit: () => void;
+  onSwitch: (index: number) => void;
+}) {
+  const count = branch?.versions.length || 1;
+  const index = branch?.current_index || 0;
+  return (
+    <span className="inline-flex items-center gap-0.5">
+      <button
+        type="button"
+        onClick={onEdit}
+        disabled={!canEdit || editing}
+        aria-label="Edit this message in a new branch"
+        title="Edit this message and keep the original context"
+        className="rounded p-1 text-gray-500 opacity-70 transition-colors hover:text-indigo-400 focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
+      >
+        {editing ? <Loader2 size={14} className="animate-spin" /> : <Pencil size={14} />}
+      </button>
+      {branch && count > 1 && (
+        <span className="inline-flex items-center gap-0.5 text-[10px] text-gray-500">
+          <button
+            type="button"
+            onClick={() => onSwitch(index - 1)}
+            disabled={switching || index === 0}
+            aria-label="Previous message branch"
+            title={index > 0 ? branch.versions[index - 1].preview : undefined}
+            className="rounded p-0.5 hover:text-indigo-400 disabled:opacity-25"
+          >
+            <ChevronLeft size={12} />
+          </button>
+          <span aria-label={`Message branch ${index + 1} of ${count}`}>{index + 1}/{count}</span>
+          <button
+            type="button"
+            onClick={() => onSwitch(index + 1)}
+            disabled={switching || index >= count - 1}
+            aria-label="Next message branch"
+            title={index < count - 1 ? branch.versions[index + 1].preview : undefined}
+            className="rounded p-0.5 hover:text-indigo-400 disabled:opacity-25"
+          >
+            {switching ? <Loader2 size={12} className="animate-spin" /> : <ChevronRight size={12} />}
+          </button>
+        </span>
+      )}
+    </span>
+  );
+}
+
 const MessageBubble = memo(function MessageBubble({
   message,
   taskId,
   onAskUserResolved,
+  branch,
+  canEditBranch,
+  editingBranch,
+  switchingBranch,
+  onEditBranch,
+  onSwitchBranch,
 }: {
   message: ChatMessage;
   taskId: number;
   onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
+  branch: MessageBranchState | null;
+  canEditBranch: boolean;
+  editingBranch: boolean;
+  switchingBranch: boolean;
+  onEditBranch: () => void;
+  onSwitchBranch: (index: number) => void;
 }) {
   const isUser = message.role === 'user';
 
@@ -3658,6 +3827,16 @@ const MessageBubble = memo(function MessageBubble({
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} />}
           {message.content && <MessageCopyButton text={isUser ? (message.raw_content ?? stripSenderPrefix(message.content)) : message.content} />}
+          {isUser && !message.source && (
+            <MessageBranchControls
+              branch={branch}
+              canEdit={canEditBranch}
+              editing={editingBranch}
+              switching={switchingBranch}
+              onEdit={onEditBranch}
+              onSwitch={onSwitchBranch}
+            />
+          )}
         </div>
       </div>
     </div>

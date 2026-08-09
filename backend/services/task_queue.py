@@ -10,6 +10,7 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.message_branch import MessageBranchVersion
 from backend.models.task import Task
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
@@ -17,6 +18,15 @@ from backend.services.worker_routing_config import (
 
 
 PR_REVIEW_SUPERSEDED_METADATA_KEY = "pr_review_superseded"
+
+
+def _visible_task_predicate():
+    """Keep implementation-only edited-message Tasks out of the sidebar."""
+
+    hidden_branch_task_ids = select(MessageBranchVersion.task_id).where(
+        MessageBranchVersion.ordinal > 0
+    )
+    return Task.id.not_in(hidden_branch_task_ids)
 
 
 class _UnixTimestamp(FunctionElement):
@@ -226,7 +236,10 @@ class TaskQueue:
     ) -> list[Task]:
         auto_sort = await self._auto_sort_enabled()
         effective_key = _effective_key_expr(auto_sort)
-        stmt = select(Task).where(Task.shared_from_id.is_(None)).order_by(Task.starred.desc(), effective_key.desc(), Task.id.desc())
+        stmt = select(Task).where(
+            Task.shared_from_id.is_(None),
+            _visible_task_predicate(),
+        ).order_by(Task.starred.desc(), effective_key.desc(), Task.id.desc())
         if archived_only:
             stmt = stmt.where(Task.archived == True)
         elif not include_archived:
@@ -272,7 +285,10 @@ class TaskQueue:
         has_unread: bool | None = None,
         user_id: int | None = None,
     ) -> int:
-        stmt = select(func.count(Task.id)).where(Task.shared_from_id.is_(None))
+        stmt = select(func.count(Task.id)).where(
+            Task.shared_from_id.is_(None),
+            _visible_task_predicate(),
+        )
         if archived_only:
             stmt = stmt.where(Task.archived == True)
         elif not include_archived:

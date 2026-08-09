@@ -17,7 +17,9 @@ vi.mock('../../api/client', () => ({
     updateTask: vi.fn().mockResolvedValue({}),
     stopTaskSession: vi.fn().mockResolvedValue({}),
     listForkAnchors: vi.fn().mockResolvedValue([]),
+    listMessageBranches: vi.fn().mockResolvedValue([]),
     forkTask: vi.fn().mockResolvedValue({}),
+    getTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
     listMonitorSessions: vi.fn().mockResolvedValue([]),
     getAskUserPending: vi.fn().mockResolvedValue({ pending: [] }),
@@ -151,6 +153,7 @@ describe('ChatView', () => {
     (api.getTaskUserMessageIndex as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.listMessageBranches as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -1630,6 +1633,101 @@ describe('ChatView', () => {
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
 
       expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
+    });
+
+    it('edits a persisted user message by creating an immutable message branch', async () => {
+      const task = makeTask({
+        id: 21,
+        description: null,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const message: ChatMessage = {
+        id: 456,
+        event_type: 'user_message',
+        role: 'user',
+        content: 'old instruction',
+        raw_content: 'old instruction',
+        is_error: false,
+        timestamp: '2024-01-01T00:01:00Z',
+      };
+      const forked = makeTask({ id: 22, provider: 'codex', status: 'completed' });
+      const onTaskForked = vi.fn();
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([message]);
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
+
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskForked={onTaskForked}
+        />,
+      );
+
+      expect(await screen.findByText('old instruction')).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', {
+        name: 'Edit this message in a new branch',
+      }));
+
+      await waitFor(() => {
+        expect(api.forkTask).toHaveBeenCalledWith(
+          task.id,
+          { type: 'user_message', id: message.id },
+          undefined,
+          true,
+        );
+        expect(onTaskForked).toHaveBeenCalledWith(forked);
+      });
+    });
+
+    it('switches between old and edited contexts with message arrows', async () => {
+      const task = makeTask({
+        id: 31,
+        description: null,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const message: ChatMessage = {
+        id: 789,
+        event_type: 'user_message',
+        role: 'user',
+        content: 'old instruction',
+        raw_content: 'old instruction',
+        is_error: false,
+        timestamp: '2024-01-01T00:01:00Z',
+      };
+      const target = makeTask({ id: 32, provider: 'codex', status: 'completed' });
+      const onTaskForked = vi.fn();
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([message]);
+      (api.listMessageBranches as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        branch_id: 7,
+        message_id: message.id,
+        is_initial: false,
+        current_index: 0,
+        versions: [
+          { task_id: task.id, message_id: message.id, is_initial: false, ordinal: 0, title: 'Old', preview: 'old instruction' },
+          { task_id: target.id, message_id: 999, is_initial: false, ordinal: 1, title: 'New', preview: 'new instruction' },
+        ],
+      }]);
+      (api.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(target);
+
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskForked={onTaskForked}
+        />,
+      );
+
+      expect(await screen.findByLabelText('Message branch 1 of 2')).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Next message branch' }));
+
+      await waitFor(() => {
+        expect(api.getTask).toHaveBeenCalledWith(target.id);
+        expect(onTaskForked).toHaveBeenCalledWith(target);
+      });
     });
 
     it('does not add fork actions to assistant messages', async () => {

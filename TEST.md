@@ -646,10 +646,12 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_worker_relay_proxy.py::test_initial_worker_forward_uses_skill_update_that_wins_claim_lock` / `test_initial_worker_forward_rejects_skill_update_after_claim` | 确定性覆盖首次 dispatch 的两个锁顺序：先完成的 pending Skill 保存进入远端创建 payload；claim 先完成后活跃 Skill 修改返回 409，Manager/Worker 不分叉 |
 | `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock；pending/终态仍允许保存，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
 | `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
+| `test_api_chat_plan.py::test_edited_message_fork_keeps_both_contexts_and_binds_new_message` | 编辑旧消息时原 Task/旧指令保持不变，新 Task seed 首次发送后绑定新 user log，分支 API 返回两个可切换的真实 context |
 | `test_api_chat_plan.py::test_codex_fork_resolver_prefers_unique_terminal_turn_over_stale_alias` | resumed app-server 早期事件沿用旧 turn alias 时，以唯一 terminal turn 还原所选消息边界，禁止取首事件切错 context |
 | `test_api_chat_plan.py::test_codex_fork_legacy_copied_anchor_uses_native_parent_lineage` | 二次 Fork 的旧复制前缀经逐行一致性校验回溯父 Task，并在真正拥有 turn 的 thread/home 执行原生 Fork |
 | `test_service_instance_manager.py::test_launch_codex_app_server_routes_turn_to_canonical_home` | `turn/start` 准入后把 exact native `thread_id + turn_id` 原子回写到对应用户消息，供压缩/换号后的 Fork 使用 |
 | `ChatView.test.tsx` unavailable Fork anchor 用例 | 无法证明原生边界的消息显示具体原因且不可选，Create fork 保持禁用 |
+| `ChatView.test.tsx` 消息编辑分支用例 | 已落库用户消息的铅笔入口以 `message_branch=true` 创建 Fork；`‹ n/m ›` 左右箭头加载对应 Task，而不是只替换显示文本 |
 | `ChatView.test.tsx` Live turn injection 用例 | 普通发送框在本地 Codex/Claude turn 运行时自动走 inject/steer，无模式开关；附件确认、失败保留和 Worker 队列回退保持不变 |
 | 前端 `skillCapabilities.test.ts` | Claude 不变；Codex Monitor 仅在主 MCP 与 Monitor capability 均确认且任务为本地范围时开放，Worker/Shared/未知/kill switch 关闭时只保留安全子集 |
 | 前端 `TaskBadges.test.tsx::preserves hidden Skills when runtime capability discovery fails` | Runtime Settings 瞬时失败时切换 Sub-Agent 保留当前隐藏 ordinary Skills；失败 capability 不做页面生命周期缓存，后续加载可恢复 |

@@ -69,6 +69,7 @@ import backend.models.instance  # noqa: F401
 import backend.models.project  # noqa: F401
 import backend.models.project_todo  # noqa: F401
 import backend.models.log_entry  # noqa: F401
+import backend.models.message_branch  # noqa: F401
 import backend.models.worktree  # noqa: F401
 import backend.models.global_settings  # noqa: F401
 import backend.models.tag  # noqa: F401

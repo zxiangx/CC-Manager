@@ -37,7 +37,8 @@ PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
-CURRENT_HEAD_REVISION = "4b7d2e9a6c10"
+CODEX_MONITOR_SWITCH_REVISION = "4b7d2e9a6c10"
+CURRENT_HEAD_REVISION = "6d9e2f4a1b70"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -423,7 +424,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "message_branches", "message_branch_versions", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -915,7 +916,7 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
-            == ATTENTION_TAG_REVISION
+            == CODEX_MONITOR_SWITCH_REVISION
         )
         assert (
             script.get_revision(PR_REVIEW_PANEL_REVISION).down_revision

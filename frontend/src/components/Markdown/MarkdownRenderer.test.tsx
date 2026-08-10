@@ -91,6 +91,27 @@ describe('MarkdownRenderer math support', () => {
     expect(container.textContent).not.toContain('[(');
   });
 
+  it('rejoins a display formula split by multiple standalone equals lines', () => {
+    const markdown = String.raw`\[
+\widetilde{\mathcal S}_t
+=
+\operatorname{Change}
+\left(
+\mathcal R_t,S_t^\star,\tau_t,F_t
+\right),
+\qquad
+\widetilde{\mathcal S}_t
+=
+\left\{\widetilde S_{t,k}\right\}_{k=1}^{K_t}.
+\]`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelectorAll('.katex-display')).toHaveLength(1);
+    expect(container.querySelector('h1')).toBeNull();
+    expect(container.textContent).toContain('Change');
+    expect(container.textContent).not.toContain('[widetilde');
+  });
+
   it('preserves real headings that contain inline math and prose', () => {
     const markdown = String.raw`### \(P_t\) 又是什么？`;
     const { container } = render(<MarkdownRenderer content={markdown} />);

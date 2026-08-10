@@ -179,12 +179,30 @@ function parseHeadingPrefixedDisplayMath(
   // and recover the original display formula from their shared source range.
   // This is deliberately gated by a leading `\[` and a complete closing `\]`.
   const continuation = children[index + 1];
-  if (headingRaw.trimStart().startsWith('\\[') && continuation?.type === 'paragraph') {
+  if (headingRaw.trimStart().startsWith('\\[')) {
     const start = heading.position?.start?.offset;
-    const end = continuation.position?.end?.offset;
-    if (typeof start === 'number' && typeof end === 'number') {
-      const setextFormula = parseDisplayMathSource(source.slice(start, end));
-      if (setextFormula) return { node: setextFormula, consumed: 2 };
+    let previousEnd = heading.position?.end?.offset;
+    if (typeof start === 'number' && typeof previousEnd === 'number') {
+      for (let cursor = index + 1; cursor < children.length; cursor += 1) {
+        const sibling = children[cursor];
+        if (sibling.type !== 'heading' && sibling.type !== 'paragraph') break;
+
+        const siblingStart = sibling.position?.start?.offset;
+        const siblingEnd = sibling.position?.end?.offset;
+        if (
+          typeof siblingStart !== 'number'
+          || typeof siblingEnd !== 'number'
+          || !/^(?:\r\n|\r|\n)$/.test(source.slice(previousEnd, siblingStart))
+        ) {
+          break;
+        }
+
+        const setextFormula = parseDisplayMathSource(source.slice(start, siblingEnd));
+        if (setextFormula) {
+          return { node: setextFormula, consumed: cursor - index + 1 };
+        }
+        previousEnd = siblingEnd;
+      }
     }
   }
 

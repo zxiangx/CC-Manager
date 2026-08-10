@@ -1030,3 +1030,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **运行模型**：Codex 原生 thread 仍以精确 turn fork 保证上下文正确，但隐藏 Task 仅作为 runtime。可见 canonical Task 持久记录分支根和上次选中的 runtime Task；重新打开时从服务端恢复，跨设备一致。历史、WebSocket、发送、停止、Goal、Monitor 和配置操作跟随当前 runtime，标题、星标和关注标签仍属于 canonical Session。
 - **状态与兼容**：侧栏 list/count/status filter 映射当前分支状态，WebSocket 将选中隐藏分支的状态和后台活动镜像到 canonical Session，避免“实际执行但圆点不蓝”。旧版已经创建的隐藏分支可沿受约束的 branch membership/fork lineage 解析并在首次切换时补齐根关联。发送临时失败会复用已创建的内部 Fork，不会重复生成分支。
 - **验证**：Chat/Fork/状态广播/Alembic 相关后端 `113 passed`；ChatView `114 passed`；TypeScript/Vite production build、`git diff --check` 通过。SQLite 从空库 upgrade 到 `8c1f4a7d2e90`、downgrade 到 `6d9e2f4a1b70`、再次 upgrade 均通过。ChatView 和 API 客户端仍有本次修改前已存在的 ESLint 基线问题，本次新增 wrapper lint 问题已清零。
+
+### 2026-08-10 — 标题误判公式恢复与按最后对话排序
+
+- **公式修复**：模型输出 `# \\[`、`### $$` 时，Markdown 会把 opener 解析成 heading、把公式主体拆到后续节点。统一 math remark 插件现在只对“纯 opener heading + 匹配闭合正文”的严格 AST 形态合并为 display math；真实标题、行内公式、代码、链接和 HTML 仍保持原语义。
+- **排序修复**：默认自动模式不再按打开时间或遗留 `sort_order` 排序，而是在标星分组内按最后一条非空 user/assistant message 倒序；同一 Session 的所有隐藏编辑分支聚合到 canonical Task。关闭自动模式后仍保留手动拖拽排序。生产 2GB SQLite 数据只读实测采用 task-id 索引的查询约 95ms，避免按 event type 扫描整库。
+- **验证**：排序相关后端完整矩阵 `211 passed`；前端全量 `42 files / 568 tests`（TZ=UTC）、production build及改动文件 ESLint通过，`git diff --check` 通过。

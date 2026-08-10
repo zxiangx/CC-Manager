@@ -42,6 +42,34 @@ describe('MarkdownRenderer math support', () => {
     expect(container.querySelector('strong')).toBeNull();
   });
 
+  it('recovers backslash display math prefixed by a Markdown heading marker', () => {
+    const markdown = String.raw`# \[
+\nabla_z L_{\text{SFT}}=p_s-e_y
+\]`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('.katex-display')).not.toBeNull();
+    expect(container.querySelector('h1')).toBeNull();
+    expect(container.textContent).toContain('∇');
+  });
+
+  it('recovers dollar display math prefixed by a Markdown heading marker', () => {
+    const markdown = `### $$\nr^2\n$$`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('.katex-display')).not.toBeNull();
+    expect(container.querySelector('h3')).toBeNull();
+  });
+
+  it('preserves real headings that contain inline math and prose', () => {
+    const markdown = String.raw`### \(P_t\) 又是什么？`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('h3')).not.toBeNull();
+    expect(container.querySelector('h3 .katex')).not.toBeNull();
+    expect(container.textContent).toContain('又是什么？');
+  });
+
   it('supports display dollars while leaving single-dollar prose literal', () => {
     const markdown = String.raw`The parameter $p$ stays literal.
 
@@ -112,9 +140,16 @@ $$`;
       '    \\[not_indented_math\\]',
       '',
       '```tex',
+      '# \\[',
       '\\[',
       '\\nabla x',
       '\\]',
+      '```',
+      '',
+      '```tex',
+      '### $$',
+      'x^2',
+      '$$',
       '```',
     ].join('\n');
     const { container } = render(<MarkdownRenderer content={markdown} />);

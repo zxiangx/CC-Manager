@@ -128,6 +128,73 @@ function parseDisplayMath(paragraph: MarkdownNode, source: string): MarkdownNode
   return displayMathNode(value);
 }
 
+interface HeadingDisplayMathMatch {
+  node: MarkdownNode;
+  consumed: number;
+}
+
+function displayValueWithCloser(
+  raw: string,
+  opener: '\\[' | '$$',
+): string | null {
+  if (!raw.startsWith(opener)) return null;
+
+  const closing = opener === '\\['
+    ? findDelimiter(raw, ']', opener.length)
+    : raw.indexOf('$$', opener.length);
+  if (closing < 0 || !/^[ \t]*$/.test(raw.slice(closing + 2))) return null;
+  return raw.slice(opener.length, closing);
+}
+
+/**
+ * Recover a display formula when a model accidentally emits its opener as an
+ * ATX heading (`# \\[` or `### $$`). Markdown has already split that source
+ * into a heading plus a paragraph, so the repair must join AST siblings rather
+ * than rewrite raw Markdown. A heading containing any prose is left alone.
+ */
+function parseHeadingPrefixedDisplayMath(
+  children: MarkdownNode[],
+  index: number,
+  source: string,
+): HeadingDisplayMathMatch | null {
+  const heading = children[index];
+  if (heading.type !== 'heading') return null;
+
+  const headingRaw = sourceForNode(heading, source);
+  if (headingRaw === null) return null;
+  const match = /^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*$/.exec(headingRaw);
+  if (!match) return null;
+  const body = match[1];
+  const opener = body.startsWith('\\[') ? '\\[' : body.startsWith('$$') ? '$$' : null;
+  if (!opener) return null;
+
+  const sameLineValue = displayValueWithCloser(body, opener);
+  if (sameLineValue !== null) {
+    return { node: displayMathNode(sameLineValue), consumed: 1 };
+  }
+  if (body !== opener) return null;
+
+  const continuation = children[index + 1];
+  if (!continuation || continuation.type !== 'paragraph') return null;
+  const continuationRaw = sourceForNode(continuation, source);
+  if (continuationRaw === null) return null;
+  if (opener === '$$') {
+    // remark-math recognizes the orphaned closing `$$` as an empty math node,
+    // leaving the formula body in the paragraph between it and the heading.
+    const closing = children[index + 2];
+    if (
+      closing?.type === 'math'
+      && closing.value === ''
+      && sourceForNode(closing, source)?.trim() === '$$'
+    ) {
+      return { node: displayMathNode(continuationRaw), consumed: 3 };
+    }
+  }
+  const value = displayValueWithCloser(opener + continuationRaw, opener);
+  if (value === null) return null;
+  return { node: displayMathNode(value), consumed: 2 };
+}
+
 function splitInlineMath(node: MarkdownNode, source: string): MarkdownNode[] | null {
   const raw = sourceForNode(node, source);
   if (raw === null) return null;
@@ -176,22 +243,37 @@ function transformChildren(parent: MarkdownNode, source: string): void {
   if (!parent.children || SKIP_DESCENDANTS.has(parent.type)) return;
 
   const transformed: MarkdownNode[] = [];
-  for (const child of parent.children) {
+  for (let index = 0; index < parent.children.length;) {
+    const headingDisplayMath = parseHeadingPrefixedDisplayMath(
+      parent.children,
+      index,
+      source,
+    );
+    if (headingDisplayMath) {
+      transformed.push(headingDisplayMath.node);
+      index += headingDisplayMath.consumed;
+      continue;
+    }
+
+    const child = parent.children[index];
     if (child.type === 'paragraph') {
       const displayMath = parseDisplayMath(child, source);
       if (displayMath) {
         transformed.push(displayMath);
+        index += 1;
         continue;
       }
     }
 
     if (child.type === 'text') {
       transformed.push(...(splitInlineMath(child, source) || [child]));
+      index += 1;
       continue;
     }
 
     transformChildren(child, source);
     transformed.push(child);
+    index += 1;
   }
   parent.children = transformed;
 }

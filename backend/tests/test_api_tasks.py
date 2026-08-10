@@ -3944,9 +3944,10 @@ async def test_stop_session_cleared_only_returns_ok(client):
 
 
 @pytest.mark.asyncio
-async def test_list_order_starred_then_access_then_manual(client, session_factory):
-    """排序：标星置顶 → 手动 sort_order / 最近访问时间（越新越靠前）。"""
+async def test_list_order_starred_then_latest_conversation(client, session_factory):
+    """自动排序：标星置顶，其余按最后一条真实对话消息倒序。"""
     from datetime import datetime, timedelta
+    from backend.models.log_entry import LogEntry
     from backend.models.task import Task
 
     ids = []
@@ -3959,18 +3960,29 @@ async def test_list_order_starred_then_access_then_manual(client, session_factor
     now = datetime.utcnow()
     async with session_factory() as db:
         a, b, c, d = [await db.get(Task, i) for i in ids]
+        for task in (a, b, c, d):
+            task.created_at = now - timedelta(hours=5)
         a.last_accessed_at = now - timedelta(hours=3)
-        b.last_accessed_at = now - timedelta(hours=1)   # 最近访问
+        b.last_accessed_at = now - timedelta(hours=4)
         c.last_accessed_at = now - timedelta(hours=2)
-        c.starred = True                                 # 标星 → 置顶
-        d.last_accessed_at = now - timedelta(hours=4)
-        d.sort_order = now.timestamp() + 999             # 手动拖到最前（非星组）
+        c.starred = True
+        d.last_accessed_at = now
+        d.sort_order = now.timestamp() + 999
+        for task, age in ((a, 3), (b, 1), (c, 4), (d, 2)):
+            db.add(LogEntry(
+                task_id=task.id,
+                instance_id=None,
+                event_type="message",
+                role="assistant",
+                content=f"reply-{task.id}",
+                timestamp=now - timedelta(hours=age),
+            ))
         await db.commit()
 
     resp = await client.get("/api/tasks?limit=50")
     order = [t["id"] for t in resp.json() if t["id"] in ids]
-    # c 标星置顶；非星组按位置键：d 手动键最大 → b（访问较近）→ a
-    assert order == [ids[2], ids[3], ids[1], ids[0]]
+    # c 标星置顶；非星组忽略访问时间和手动键，严格按 b → d → a 的对话时间。
+    assert order == [ids[2], ids[1], ids[3], ids[0]]
 
 
 @pytest.mark.asyncio
@@ -4001,10 +4013,8 @@ async def test_chat_history_touches_last_accessed(client, session_factory):
 
 
 @pytest.mark.asyncio
-async def test_open_chat_moves_task_to_front_of_group(client, session_factory):
-    """Touch updates last_accessed_at; for tasks without sort_order,
-    the query sorts by last_accessed_at (auto_sort_on_access=True default),
-    so the most recently accessed task appears first."""
+async def test_open_chat_does_not_change_conversation_order(client, session_factory):
+    """Opening a chat updates access metadata without changing auto order."""
     from datetime import datetime, timedelta
     from backend.models.task import Task
 
@@ -4030,11 +4040,11 @@ async def test_open_chat_moves_task_to_front_of_group(client, session_factory):
     order = [t["id"] for t in resp.json() if t["id"] in ids]
     assert order[0] == ids[2]
 
-    # Touch t0 → t0's last_accessed_at becomes now → should sort first
+    # Touch t0 only records access; with no new message, t2 remains first.
     await client.get(f"/api/tasks/{ids[0]}/chat/history?touch=true")
     resp = await client.get("/api/tasks?limit=50")
     order = [t["id"] for t in resp.json() if t["id"] in ids]
-    assert order[0] == ids[0]
+    assert order[0] == ids[2]
 
 
 @pytest.mark.asyncio
@@ -4042,6 +4052,7 @@ async def test_update_sort_order_via_api_moves_task(client):
     """回归：sort_order 曾只加在 TaskCreate 上，PUT 被 pydantic 丢弃 →
     前端拖拽永远不生效。必须走 API 全链路验证。"""
     ids = []
+    await client.put("/api/settings/runtime", json={"auto_sort_on_access": False})
     for i in range(3):
         resp = await client.post("/api/tasks", json={
             "title": f"T{i}", "description": "d", "target_repo": "/tmp",

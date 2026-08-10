@@ -325,12 +325,12 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
           )}
           {runtime && (
             <div className="flex items-center justify-between gap-3">
-              <span className="text-xs text-gray-400">访问置顶</span>
+              <span className="text-xs text-gray-400">按对话时间</span>
               <button
                 onClick={toggleAutoSort}
                 disabled={switching}
                 className={toggleCls(runtime.auto_sort_on_access)}
-                title={runtime.auto_sort_on_access ? '开启：打开聊天自动置顶任务' : '关闭：打开聊天不改变排序'}
+                title={runtime.auto_sort_on_access ? '开启：按最后一次对话时间自动排序' : '关闭：使用手动排序'}
               >
                 <span className={knobCls(runtime.auto_sort_on_access)} />
               </button>

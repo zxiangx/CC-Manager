@@ -1,5 +1,4 @@
-"""Tests for task sorting: star toggle sort_order recalc, auto_sort_on_access setting,
-and list_tasks ordering."""
+"""Tests for task sorting: star pinning, conversation activity, and manual mode."""
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta
@@ -7,6 +6,8 @@ from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.task import Task
+from backend.models.log_entry import LogEntry
+from backend.models.message_branch import MessageBranch, MessageBranchVersion
 from backend.models.global_settings import GlobalSettings
 from backend.services.task_queue import TaskQueue
 
@@ -106,7 +107,9 @@ async def test_list_tasks_starred_first(queue: TaskQueue, db_session: AsyncSessi
 
 @pytest.mark.asyncio
 async def test_list_tasks_sort_by_effective_key_desc(queue: TaskQueue, db_session: AsyncSession):
-    """Within same starred group, higher effective_key comes first."""
+    """Manual mode keeps explicit sort_order behavior."""
+    db_session.add(GlobalSettings(id=1, auto_sort_on_access=False))
+    await db_session.commit()
     t1 = await queue.create(title="Lower", description="d", target_repo="/tmp")
     t1.sort_order = 100.0
     t2 = await queue.create(title="Higher", description="d", target_repo="/tmp")
@@ -195,24 +198,101 @@ async def test_touch_with_setting_off_no_sort_order(client: AsyncClient, session
 
 
 @pytest.mark.asyncio
-async def test_list_tasks_auto_sort_on_uses_last_accessed(queue: TaskQueue, db_session: AsyncSession):
-    """With auto_sort_on_access=True, tasks without sort_order should sort by last_accessed_at."""
+async def test_list_tasks_auto_sort_on_uses_latest_conversation(queue: TaskQueue, db_session: AsyncSession):
+    """Automatic mode uses real conversation activity, not access/manual keys."""
     now = datetime.utcnow()
     t_old = await queue.create(title="Old", description="d", target_repo="/tmp")
     t_old.created_at = now - timedelta(hours=2)
-    t_old.last_accessed_at = now  # recently accessed
-    t_old.sort_order = None
+    t_old.last_accessed_at = now
+    t_old.sort_order = now.timestamp() + 9999
 
     t_new = await queue.create(title="New", description="d", target_repo="/tmp")
-    t_new.created_at = now - timedelta(hours=1)
-    t_new.last_accessed_at = now - timedelta(hours=1)
+    t_new.created_at = now - timedelta(hours=3)
+    t_new.last_accessed_at = now - timedelta(hours=3)
     t_new.sort_order = None
+    db_session.add_all([
+        LogEntry(
+            task_id=t_old.id,
+            instance_id=None,
+            event_type="message",
+            role="assistant",
+            content="old reply",
+            timestamp=now - timedelta(hours=2),
+        ),
+        LogEntry(
+            task_id=t_new.id,
+            instance_id=None,
+            event_type="message",
+            role="user",
+            content="new prompt",
+            timestamp=now - timedelta(minutes=1),
+        ),
+    ])
     await db_session.commit()
 
-    # auto_sort default is True — t_old accessed more recently → first
     tasks = await queue.list_tasks()
-    assert tasks[0].id == t_old.id
-    assert tasks[1].id == t_new.id
+    assert tasks[0].id == t_new.id
+    assert tasks[1].id == t_old.id
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_counts_hidden_branch_conversation_activity(
+    queue: TaskQueue,
+    db_session: AsyncSession,
+):
+    """An edited-message Task contributes activity to its canonical session."""
+    canonical = await queue.create(
+        title="Canonical",
+        description="d",
+        target_repo="/tmp",
+    )
+    other = await queue.create(title="Other", description="d", target_repo="/tmp")
+    hidden = await queue.create(
+        title="Hidden branch",
+        description="d",
+        target_repo="/tmp",
+        message_branch_root_task_id=canonical.id,
+    )
+    now = datetime.utcnow()
+    canonical.created_at = now - timedelta(hours=3)
+    other.created_at = now - timedelta(hours=3)
+    branch = MessageBranch()
+    db_session.add(branch)
+    await db_session.flush()
+    db_session.add_all([
+        MessageBranchVersion(
+            branch_id=branch.id,
+            task_id=canonical.id,
+            ordinal=0,
+            is_initial=True,
+        ),
+        MessageBranchVersion(
+            branch_id=branch.id,
+            task_id=hidden.id,
+            ordinal=1,
+            is_initial=False,
+        ),
+        LogEntry(
+            task_id=other.id,
+            instance_id=None,
+            event_type="message",
+            role="assistant",
+            content="older reply",
+            timestamp=now - timedelta(hours=1),
+        ),
+        LogEntry(
+            task_id=hidden.id,
+            instance_id=None,
+            event_type="message",
+            role="assistant",
+            content="latest branch reply",
+            timestamp=now,
+        ),
+    ])
+    await db_session.commit()
+
+    tasks = await queue.list_tasks()
+    assert [task.id for task in tasks] == [canonical.id, other.id]
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ import errno
 import os
 from datetime import datetime
 
-from sqlalchemy import Float, case, delete as sa_delete, func, select, update
+from sqlalchemy import DateTime, Float, case, delete as sa_delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
@@ -74,6 +74,29 @@ def _compile_unix_timestamp_mysql(element, compiler, **kw):
 def _compile_unix_timestamp_default(element, compiler, **kw):
     value = compiler.process(list(element.clauses)[0], **kw)
     return f"EXTRACT(EPOCH FROM {value})"
+
+
+class _GreatestTimestamp(FunctionElement):
+    """Cross-dialect greatest-of-two for non-null timestamp expressions."""
+
+    type = DateTime()
+    inherit_cache = True
+
+
+@compiles(_GreatestTimestamp, "sqlite")
+def _compile_greatest_timestamp_sqlite(element, compiler, **kw):
+    values = ", ".join(
+        compiler.process(value, **kw) for value in element.clauses
+    )
+    return f"MAX({values})"
+
+
+@compiles(_GreatestTimestamp)
+def _compile_greatest_timestamp_default(element, compiler, **kw):
+    values = ", ".join(
+        compiler.process(value, **kw) for value in element.clauses
+    )
+    return f"GREATEST({values})"
 
 
 def task_retry_not_superseded_predicate():
@@ -211,16 +234,59 @@ def append_task_generation_predicates(
 def _effective_key_expr(auto_sort_on_access: bool = True):
     """Build the SQL expression for task sort key.
 
-    auto_sort_on_access=True:  COALESCE(sort_order, ts(last_accessed_at ?? created_at))
+    auto_sort_on_access=True:  ts(latest logical-conversation message ?? created_at)
     auto_sort_on_access=False: COALESCE(sort_order, ts(created_at))
     """
     if auto_sort_on_access:
-        fallback = _UnixTimestamp(
-            func.coalesce(Task.last_accessed_at, Task.created_at)
+        branch_task = Task.__table__.alias("conversation_branch_task")
+        branch_log = LogEntry.__table__.alias("conversation_branch_log")
+        message_predicates = (
+            LogEntry.event_type == "message",
+            LogEntry.role.in_(("user", "assistant")),
+            LogEntry.content.is_not(None),
+            LogEntry.content != "",
         )
-    else:
-        fallback = _UnixTimestamp(Task.created_at)
-    return func.coalesce(Task.sort_order, fallback)
+        canonical_latest = (
+            select(func.max(LogEntry.timestamp))
+            .where(
+                LogEntry.task_id == Task.id,
+                *message_predicates,
+            )
+            .correlate(Task.__table__)
+            .scalar_subquery()
+        )
+        branch_latest_for_task = (
+            select(func.max(branch_log.c.timestamp))
+            .where(
+                branch_log.c.task_id == branch_task.c.id,
+                branch_log.c.event_type == "message",
+                branch_log.c.role.in_(("user", "assistant")),
+                branch_log.c.content.is_not(None),
+                branch_log.c.content != "",
+            )
+            .correlate(branch_task)
+            .scalar_subquery()
+        )
+        branch_latest = (
+            select(branch_latest_for_task)
+            .where(branch_task.c.message_branch_root_task_id == Task.id)
+            .order_by(
+                case(
+                    (branch_latest_for_task.is_(None), 1),
+                    else_=0,
+                ).asc(),
+                branch_latest_for_task.desc(),
+            )
+            .limit(1)
+            .correlate(Task.__table__)
+            .scalar_subquery()
+        )
+        latest_message_at = _GreatestTimestamp(
+            func.coalesce(canonical_latest, Task.created_at),
+            func.coalesce(branch_latest, Task.created_at),
+        )
+        return _UnixTimestamp(latest_message_at)
+    return func.coalesce(Task.sort_order, _UnixTimestamp(Task.created_at))
 
 
 class TaskQueue:

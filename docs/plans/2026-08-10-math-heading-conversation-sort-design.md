@@ -11,12 +11,13 @@ Two narrow changes are required:
 
 ## Markdown design
 
-`MarkdownRenderer` normalizes only lines whose entire meaningful suffix starts
-with a display-math delimiter. It removes one leading ATX marker before the
-Markdown parser runs. The scanner tracks fenced code blocks, so examples inside
-code remain literal. Ordinary headings, including headings containing inline
-math and prose, remain headings. Existing AST-based backslash-math parsing and
-KaTeX safety settings remain unchanged.
+The existing math remark plugin recognizes an ATX heading whose entire body is
+a display-math opener, then combines it with the immediately following
+paragraph only when that paragraph ends with the matching closer. It replaces
+those Markdown AST siblings with one display-math node. A complete one-line
+heading-wrapped display formula is handled the same way. Code nodes never enter
+this sibling transform. Ordinary headings, including headings containing inline
+math and prose, remain headings. Existing KaTeX safety settings remain unchanged.
 
 ## Sorting design
 

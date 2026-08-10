@@ -61,6 +61,36 @@ describe('MarkdownRenderer math support', () => {
     expect(container.querySelector('h3')).toBeNull();
   });
 
+  it('renders punctuated display formulas after a Markdown heading', () => {
+    const markdown = String.raw`### 4. Evaluation and Retention
+
+统一写成：
+
+\[
+\mathcal J_t
+=
+\operatorname{Assess}
+\left(
+\widetilde{\mathcal S}_t,F_t;\mathcal E_t
+\right),
+\],
+
+\[
+(\mathcal R_{t+1},D_t)
+=
+\operatorname{Retain}
+\left(
+\mathcal R_t,\widetilde{\mathcal S}_t,\mathcal J_t
+\right).
+\].`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('h3')).not.toBeNull();
+    expect(container.querySelectorAll('.katex-display')).toHaveLength(2);
+    expect(container.textContent).toContain('Retain');
+    expect(container.textContent).not.toContain('[(');
+  });
+
   it('preserves real headings that contain inline math and prose', () => {
     const markdown = String.raw`### \(P_t\) 又是什么？`;
     const { container } = render(<MarkdownRenderer content={markdown} />);

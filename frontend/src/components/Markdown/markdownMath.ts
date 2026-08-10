@@ -111,21 +111,30 @@ function stripOneLineEnding(value: string, fromStart: boolean): string {
   return value.replace(/(?:\r\n|\r|\n)$/, '');
 }
 
-function parseDisplayMath(paragraph: MarkdownNode, source: string): MarkdownNode | null {
-  const raw = sourceForNode(paragraph, source);
-  if (raw === null) return null;
+function trailingDisplayPunctuation(raw: string): string | null {
+  const match = /^[ \t]*([,.;:!?])?[ \t]*$/.exec(raw);
+  return match ? match[1] || '' : null;
+}
 
+function parseDisplayMathSource(raw: string): MarkdownNode | null {
   const leadingWhitespace = raw.match(/^[ \t]*/)?.[0].length || 0;
   const opening = findDelimiter(raw, '[', leadingWhitespace);
   if (opening !== leadingWhitespace) return null;
 
   const closing = findDelimiter(raw, ']', opening + 2);
-  if (closing < 0 || !/^[ \t]*$/.test(raw.slice(closing + 2))) return null;
+  if (closing < 0) return null;
+  const punctuation = trailingDisplayPunctuation(raw.slice(closing + 2));
+  if (punctuation === null) return null;
 
   let value = raw.slice(opening + 2, closing);
   value = stripOneLineEnding(value, true);
   value = stripOneLineEnding(value, false);
-  return displayMathNode(value);
+  return displayMathNode(value + punctuation);
+}
+
+function parseDisplayMath(paragraph: MarkdownNode, source: string): MarkdownNode | null {
+  const raw = sourceForNode(paragraph, source);
+  return raw === null ? null : parseDisplayMathSource(raw);
 }
 
 interface HeadingDisplayMathMatch {
@@ -142,8 +151,10 @@ function displayValueWithCloser(
   const closing = opener === '\\['
     ? findDelimiter(raw, ']', opener.length)
     : raw.indexOf('$$', opener.length);
-  if (closing < 0 || !/^[ \t]*$/.test(raw.slice(closing + 2))) return null;
-  return raw.slice(opener.length, closing);
+  if (closing < 0) return null;
+  const punctuation = trailingDisplayPunctuation(raw.slice(closing + 2));
+  if (punctuation === null) return null;
+  return raw.slice(opener.length, closing) + punctuation;
 }
 
 /**
@@ -162,6 +173,21 @@ function parseHeadingPrefixedDisplayMath(
 
   const headingRaw = sourceForNode(heading, source);
   if (headingRaw === null) return null;
+
+  // A standalone `=` inside a multiline formula is parsed by Markdown as a
+  // Setext heading underline. Rejoin that heading with the following paragraph
+  // and recover the original display formula from their shared source range.
+  // This is deliberately gated by a leading `\[` and a complete closing `\]`.
+  const continuation = children[index + 1];
+  if (headingRaw.trimStart().startsWith('\\[') && continuation?.type === 'paragraph') {
+    const start = heading.position?.start?.offset;
+    const end = continuation.position?.end?.offset;
+    if (typeof start === 'number' && typeof end === 'number') {
+      const setextFormula = parseDisplayMathSource(source.slice(start, end));
+      if (setextFormula) return { node: setextFormula, consumed: 2 };
+    }
+  }
+
   const match = /^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*$/.exec(headingRaw);
   if (!match) return null;
   const body = match[1];
@@ -174,7 +200,6 @@ function parseHeadingPrefixedDisplayMath(
   }
   if (body !== opener) return null;
 
-  const continuation = children[index + 1];
   if (!continuation || continuation.type !== 'paragraph') return null;
   const continuationRaw = sourceForNode(continuation, source);
   if (continuationRaw === null) return null;

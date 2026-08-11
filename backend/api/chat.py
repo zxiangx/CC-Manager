@@ -361,31 +361,16 @@ def _resolve_fork_turn(
     anchor: ForkAnchor,
     rows: list[LogEntry],
     turns: list[dict],
+    index: "_ForkTurnIndex | None" = None,
 ) -> tuple[str, int]:
     """Resolve the completed native turn immediately before a user message."""
 
-    if not turns:
-        raise HTTPException(409, "Codex session has no persisted turns to fork")
-    turn_ids = [str(turn.get("id") or "") for turn in turns]
-    if any(not turn_id for turn_id in turn_ids):
-        raise HTTPException(409, "Codex returned an invalid turn history")
-    turn_index = {turn_id: index for index, turn_id in enumerate(turn_ids)}
-    item_to_turn: dict[str, str] = {}
-    for turn_id, turn in zip(turn_ids, turns):
-        for item_id in _turn_item_ids(turn.get("items") or []):
-            item_to_turn[item_id] = turn_id
+    resolved_index = index or _build_fork_turn_index(rows, turns)
+    turn_ids = resolved_index.turn_ids
+    turn_index = resolved_index.turn_index
+    row_turns = resolved_index.row_turns
 
-    row_turns: dict[int, str] = {}
-    for row in rows:
-        item_id, direct_turn_id = _native_ids(row.raw_json)
-        resolved = direct_turn_id or (item_to_turn.get(item_id) if item_id else None)
-        if resolved in turn_index:
-            row_turns[row.id] = resolved
-
-    selected_index = next(
-        (index for index, row in enumerate(rows) if row.id == anchor.id),
-        None,
-    )
+    selected_index = resolved_index.row_index.get(anchor.id)
     if selected_index is None:
         raise HTTPException(404, "Fork anchor message not found")
     selected = rows[selected_index]
@@ -440,6 +425,49 @@ def _resolve_fork_turn(
         raise HTTPException(409, "The preceding Codex turn is still running")
 
     return target_turn_id, selected.id - 1
+
+
+@dataclass(frozen=True)
+class _ForkTurnIndex:
+    """Reusable native-turn mapping for every anchor in one thread snapshot."""
+
+    turn_ids: tuple[str, ...]
+    turn_index: dict[str, int]
+    row_turns: dict[int, str]
+    row_index: dict[int, int]
+
+
+def _build_fork_turn_index(
+    rows: list[LogEntry],
+    turns: list[dict],
+) -> _ForkTurnIndex:
+    """Build the expensive native item mapping once per thread snapshot."""
+
+    if not turns:
+        raise HTTPException(409, "Codex session has no persisted turns to fork")
+    turn_ids = tuple(str(turn.get("id") or "") for turn in turns)
+    if any(not turn_id for turn_id in turn_ids):
+        raise HTTPException(409, "Codex returned an invalid turn history")
+    turn_index = {turn_id: position for position, turn_id in enumerate(turn_ids)}
+    item_to_turn: dict[str, str] = {}
+    for turn_id, turn in zip(turn_ids, turns):
+        for item_id in _turn_item_ids(turn.get("items") or []):
+            item_to_turn[item_id] = turn_id
+
+    row_turns: dict[int, str] = {}
+    row_index: dict[int, int] = {}
+    for position, row in enumerate(rows):
+        row_index[row.id] = position
+        item_id, direct_turn_id = _native_ids(row.raw_json)
+        resolved = direct_turn_id or (item_to_turn.get(item_id) if item_id else None)
+        if resolved in turn_index:
+            row_turns[row.id] = resolved
+    return _ForkTurnIndex(
+        turn_ids=turn_ids,
+        turn_index=turn_index,
+        row_turns=row_turns,
+        row_index=row_index,
+    )
 
 
 @dataclass(frozen=True)
@@ -716,6 +744,7 @@ async def _resolve_fork_lineage_anchor(
     anchor_id: int,
     *,
     rows_cache: dict[int, list[LogEntry]] | None = None,
+    row_index_cache: dict[int, dict[int, int]] | None = None,
     link_cache: dict[tuple[int, int], tuple[Task, int]] | None = None,
 ) -> _ForkLineageAnchor:
     """Walk copied log provenance back to the Task that owns the native turn.
@@ -727,6 +756,15 @@ async def _resolve_fork_lineage_anchor(
 
     rows_cache = rows_cache if rows_cache is not None else {task.id: rows}
     rows_cache.setdefault(task.id, rows)
+    row_index_cache = (
+        row_index_cache
+        if row_index_cache is not None
+        else {task.id: {row.id: index for index, row in enumerate(rows)}}
+    )
+    if task.id not in row_index_cache:
+        row_index_cache[task.id] = {
+            row.id: index for index, row in enumerate(rows)
+        }
     link_cache = link_cache if link_cache is not None else {}
     current_task = task
     current_rows = rows
@@ -742,10 +780,7 @@ async def _resolve_fork_lineage_anchor(
             current_task, current_anchor_id = cached_link
             current_rows = rows_cache[current_task.id]
             continue
-        selected_index = next(
-            (i for i, row in enumerate(current_rows) if row.id == current_anchor_id),
-            None,
-        )
+        selected_index = row_index_cache[current_task.id].get(current_anchor_id)
         if selected_index is None:
             raise HTTPException(404, "Fork anchor message not found")
         selected = current_rows[selected_index]
@@ -781,6 +816,10 @@ async def _resolve_fork_lineage_anchor(
         if parent_rows is None:
             parent_rows = await _task_log_rows(db, parent.id)
             rows_cache[parent.id] = parent_rows
+        if parent.id not in row_index_cache:
+            row_index_cache[parent.id] = {
+                row.id: index for index, row in enumerate(parent_rows)
+            }
 
         if parent_log_id is None:
             marker_index = _fork_marker_index(current_rows, parent.id)
@@ -866,6 +905,17 @@ def _codex_fork_home(
         raise HTTPException(409, "Codex session id is unavailable")
     account_id = (task.metadata_ or {}).get("codex_account_id")
     if codex_pool:
+        # A current thread's explicit account affinity is authoritative. The
+        # old path scanned every rollout in every current and retired account
+        # before consulting this binding, which made large installations slow.
+        if account_id and target_session_id == task.session_id:
+            home = codex_pool.home_for_account(str(account_id))
+            if not home:
+                raise HTTPException(
+                    409,
+                    "The Codex account bound to this task no longer exists",
+                )
+            return codex_pool.canonical_home(home), str(account_id)
         matches = codex_pool.locate_session_homes(target_session_id)
         if target_session_id != task.session_id:
             if len(matches) > 1:
@@ -1162,11 +1212,12 @@ async def list_codex_fork_anchors(
         })
     native_cache: dict[
         tuple[int, str],
-        tuple[list[LogEntry], list[dict]] | HTTPException,
+        tuple[list[LogEntry], list[dict], _ForkTurnIndex] | HTTPException,
     ] = {}
     if anchors[0]["available"]:
         try:
-            codex_home, _account_id = _codex_fork_home(
+            codex_home, _account_id = await asyncio.to_thread(
+                _codex_fork_home,
                 source,
                 str(source.session_id),
             )
@@ -1188,15 +1239,28 @@ async def list_codex_fork_anchors(
                 for turn in (native_thread.get("turns") or [])
                 if isinstance(turn, dict)
             ]
+            try:
+                source_index = await asyncio.to_thread(
+                    _build_fork_turn_index,
+                    rows,
+                    source_turns,
+                )
+            except HTTPException as exc:
+                native_cache[(source.id, str(source.session_id))] = exc
+                raise
             native_cache[(source.id, str(source.session_id))] = (
                 rows,
                 source_turns,
+                source_index,
             )
             _resolve_latest_fork_turn(source_turns, rows)
         except HTTPException as exc:
             anchors[0]["available"] = False
             anchors[0]["unavailable_reason"] = str(exc.detail)
     lineage_rows_cache = {source.id: rows}
+    lineage_row_index_cache = {
+        source.id: {row.id: index for index, row in enumerate(rows)}
+    }
     lineage_link_cache: dict[tuple[int, int], tuple[Task, int]] = {}
     authorized_lineage_tasks = {source.id}
     for row in rows:
@@ -1215,6 +1279,7 @@ async def list_codex_fork_anchors(
                     rows,
                     row.id,
                     rows_cache=lineage_rows_cache,
+                    row_index_cache=lineage_row_index_cache,
                     link_cache=lineage_link_cache,
                 )
                 if lineage.task.id not in authorized_lineage_tasks:
@@ -1223,7 +1288,8 @@ async def list_codex_fork_anchors(
                 cache_key = (lineage.task.id, lineage.thread_id)
                 cached = native_cache.get(cache_key)
                 if cached is None:
-                    codex_home, _account_id = _codex_fork_home(
+                    codex_home, _account_id = await asyncio.to_thread(
+                        _codex_fork_home,
                         lineage.task,
                         lineage.thread_id,
                     )
@@ -1241,25 +1307,38 @@ async def list_codex_fork_anchors(
                             f"Native Codex history is unavailable: {exc}",
                         )
                     else:
-                        cached = (
-                            lineage.rows,
-                            [
-                                turn
-                                for turn in (native_thread.get("turns") or [])
-                                if isinstance(turn, dict)
-                            ],
-                        )
+                        cached_turns = [
+                            turn
+                            for turn in (native_thread.get("turns") or [])
+                            if isinstance(turn, dict)
+                        ]
+                        try:
+                            cached_index = await asyncio.to_thread(
+                                _build_fork_turn_index,
+                                lineage.rows,
+                                cached_turns,
+                            )
+                        except HTTPException as exc:
+                            cached = exc
+                        else:
+                            cached = (
+                                lineage.rows,
+                                cached_turns,
+                                cached_index,
+                            )
                     native_cache[cache_key] = cached
                 if isinstance(cached, HTTPException):
                     raise cached
-                native_rows, turns = cached
-                _resolve_fork_turn(
+                native_rows, turns, turn_index = cached
+                await asyncio.to_thread(
+                    _resolve_fork_turn,
                     anchor=ForkAnchor(
                         type="user_message",
                         id=lineage.anchor_id,
                     ),
                     rows=native_rows,
                     turns=turns,
+                    index=turn_index,
                 )
             except HTTPException as exc:
                 available = False
@@ -1352,7 +1431,8 @@ async def fork_codex_task(
         if body.anchor.type == "user_message"
         else str(native_source.session_id or "")
     )
-    codex_home, account_id = _codex_fork_home(
+    codex_home, account_id = await asyncio.to_thread(
+        _codex_fork_home,
         native_source,
         native_thread_id,
     )
@@ -1383,7 +1463,8 @@ async def fork_codex_task(
             if body.anchor.type == "latest":
                 last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
             else:
-                last_turn_id, cutoff = _resolve_fork_turn(
+                last_turn_id, cutoff = await asyncio.to_thread(
+                    _resolve_fork_turn,
                     anchor=native_anchor,
                     rows=native_rows,
                     turns=turns,

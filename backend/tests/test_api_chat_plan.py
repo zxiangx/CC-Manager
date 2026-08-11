@@ -600,6 +600,109 @@ def test_codex_fork_resolver_does_not_guess_by_message_ordinal():
     )
 
 
+def test_codex_fork_turn_index_is_reused_across_anchors():
+    from backend.api.chat import (
+        ForkAnchor,
+        _build_fork_turn_index,
+        _resolve_fork_turn,
+        _turn_item_ids,
+    )
+
+    rows = [
+        LogEntry(
+            id=1,
+            event_type="message",
+            role="assistant",
+            content="first",
+            raw_json='{"item_id":"item-1","turn_id":"turn-1"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=2,
+            event_type="user_message",
+            role="user",
+            content="first anchor",
+            raw_json='{"raw_content":"first anchor"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=3,
+            event_type="message",
+            role="assistant",
+            content="second",
+            raw_json='{"item_id":"item-2","turn_id":"turn-2"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=4,
+            event_type="user_message",
+            role="user",
+            content="second anchor",
+            raw_json='{"raw_content":"second anchor"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=5,
+            event_type="message",
+            role="assistant",
+            content="third",
+            raw_json='{"item_id":"item-3","turn_id":"turn-3"}',
+            is_error=False,
+        ),
+    ]
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
+        {"id": "turn-3", "status": "completed", "items": [{"id": "item-3"}]},
+    ]
+
+    with patch("backend.api.chat._turn_item_ids", wraps=_turn_item_ids) as collect:
+        index = _build_fork_turn_index(rows, turns)
+        build_call_count = collect.call_count
+        assert build_call_count > 0
+        assert _resolve_fork_turn(
+            anchor=ForkAnchor(type="user_message", id=2),
+            rows=rows,
+            turns=turns,
+            index=index,
+        ) == ("turn-1", 1)
+        assert _resolve_fork_turn(
+            anchor=ForkAnchor(type="user_message", id=4),
+            rows=rows,
+            turns=turns,
+            index=index,
+        ) == ("turn-2", 3)
+
+        assert collect.call_count == build_call_count
+
+
+def test_codex_fork_home_uses_current_account_binding_without_global_scan(
+    tmp_path,
+):
+    from types import SimpleNamespace
+    from backend.api.chat import _codex_fork_home
+
+    account_home = str((tmp_path / "codex-account").resolve())
+    pool = SimpleNamespace(
+        home_for_account=MagicMock(return_value=account_home),
+        canonical_home=MagicMock(return_value=account_home),
+        locate_session_homes=MagicMock(
+            side_effect=AssertionError("global rollout scan must not run")
+        ),
+    )
+    task = SimpleNamespace(
+        session_id="thread-current",
+        metadata_={"codex_account_id": "codex-a"},
+    )
+
+    with patch("backend.main.codex_pool", pool):
+        assert _codex_fork_home(task) == (account_home, "codex-a")
+
+    pool.home_for_account.assert_called_once_with("codex-a")
+    pool.canonical_home.assert_called_once_with(account_home)
+    pool.locate_session_homes.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_codex_fork_legacy_copied_anchor_uses_native_parent_lineage(
     client,

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   ChevronRight, ChevronDown, Folder, FolderOpen, FileText,
   AlertCircle, Loader2, Plus, Trash2, Server, HardDrive, Download, Upload,
-  GitBranch, RefreshCw,
+  GitBranch, RefreshCw, Pencil, Save, X,
 } from '../components/icons';
 import { api, getToken } from '../api/client';
 import type { Project } from '../api/client';
@@ -333,6 +333,16 @@ export function FilesPage() {
   const [rootEntries, setRootEntries] = useState<DirEntry[] | null>(null);
   const [rootLoading, setRootLoading] = useState(false);
   const [rootError, setRootError] = useState<string | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+
+  // Project-scoped AGENTS.md editor state
+  const [agentsEditorOpen, setAgentsEditorOpen] = useState(false);
+  const [agentsContent, setAgentsContent] = useState('');
+  const [agentsExists, setAgentsExists] = useState(false);
+  const [agentsLoading, setAgentsLoading] = useState(false);
+  const [agentsSaving, setAgentsSaving] = useState(false);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [agentsSaved, setAgentsSaved] = useState(false);
 
   // SSH state
   const [profiles, setProfiles] = useState<SSHProfile[]>(loadProfiles);
@@ -420,8 +430,11 @@ export function FilesPage() {
     setRootLoading(true);
     setRootError(null);
     setRootEntries(null);
+    setRootPath('');
     setSelectedFile(null);
     setFileContent(null);
+    setAgentsEditorOpen(false);
+    setAgentsError(null);
     try {
       const res = await api.listDir(path.trim());
       setRootPath(res.path);
@@ -440,7 +453,60 @@ export function FilesPage() {
 
   const handleLocalSelect = async (path: string, isDir: boolean) => {
     if (isDir) return;
+    setAgentsEditorOpen(false);
     openFile(path, false, null);
+  };
+
+  const openAgentsEditor = async () => {
+    if (selectedProjectId === null || !rootPath) return;
+    setAgentsEditorOpen(true);
+    setAgentsLoading(true);
+    setAgentsError(null);
+    setAgentsSaved(false);
+    setAgentsContent('');
+    setAgentsExists(false);
+    setSelectedFile(`${rootPath.replace(/\/$/, '')}/AGENTS.md`);
+    setFileContent(null);
+    try {
+      const result = await api.getProjectAgentsMd(selectedProjectId);
+      setAgentsContent(result.content);
+      setAgentsExists(result.exists);
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : 'Failed to load AGENTS.md');
+    } finally {
+      setAgentsLoading(false);
+    }
+  };
+
+  const saveAgentsMd = async () => {
+    if (selectedProjectId === null) return;
+    setAgentsSaving(true);
+    setAgentsError(null);
+    setAgentsSaved(false);
+    try {
+      const result = await api.updateProjectAgentsMd(selectedProjectId, agentsContent);
+      setAgentsContent(result.content);
+      setAgentsExists(result.exists);
+      setAgentsSaved(true);
+      try {
+        const refreshed = await api.listDir(rootPath);
+        setRootEntries(refreshed.entries);
+      } catch {
+        // Saving succeeded; a failed tree refresh must not report a false
+        // write failure. The next browse will refresh the directory normally.
+      }
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : 'Failed to save AGENTS.md');
+    } finally {
+      setAgentsSaving(false);
+    }
+  };
+
+  const closeAgentsEditor = () => {
+    setAgentsEditorOpen(false);
+    setAgentsError(null);
+    setAgentsSaved(false);
+    setSelectedFile(null);
   };
 
   // --- SSH helpers ---
@@ -571,13 +637,21 @@ export function FilesPage() {
               <HardDrive size={12} /> Local
             </button>
             <button
-              onClick={() => setMode('ssh')}
+              onClick={() => {
+                setMode('ssh');
+                setAgentsEditorOpen(false);
+                setSelectedFile(null);
+              }}
               className={`flex items-center gap-1 px-3 py-1.5 ${mode === 'ssh' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
             >
               <Server size={12} /> SSH
             </button>
             <button
-              onClick={() => setMode('git')}
+              onClick={() => {
+                setMode('git');
+                setAgentsEditorOpen(false);
+                setSelectedFile(null);
+              }}
               className={`flex items-center gap-1 px-3 py-1.5 ${mode === 'git' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
             >
               <GitBranch size={12} /> Git
@@ -591,7 +665,11 @@ export function FilesPage() {
               <select
                 onChange={(e) => {
                   const proj = projects.find((p) => String(p.id) === e.target.value);
-                  if (proj?.local_path) { setInputPath(proj.local_path); loadLocalRoot(proj.local_path); }
+                  if (proj?.local_path) {
+                    setSelectedProjectId(proj.id);
+                    setInputPath(proj.local_path);
+                    loadLocalRoot(proj.local_path);
+                  }
                 }}
                 defaultValue=""
                 className="bg-gray-700 text-gray-300 text-sm rounded px-2 py-1.5 border border-gray-600 focus:outline-none focus:border-indigo-500"
@@ -605,7 +683,10 @@ export function FilesPage() {
             <input
               type="text"
               value={inputPath}
-              onChange={(e) => setInputPath(e.target.value)}
+              onChange={(e) => {
+                setInputPath(e.target.value);
+                setSelectedProjectId(null);
+              }}
               onKeyDown={(e) => e.key === 'Enter' && loadLocalRoot(inputPath)}
               placeholder="/path/to/directory"
               className="flex-1 bg-gray-700 text-gray-300 text-sm rounded px-3 py-1.5 border border-gray-600 focus:outline-none focus:border-indigo-500 min-w-48"
@@ -629,6 +710,16 @@ export function FilesPage() {
                   Upload
                 </button>
               </>
+            )}
+            {rootPath && selectedProjectId !== null && (
+              <button
+                onClick={openAgentsEditor}
+                disabled={rootLoading || agentsLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 text-white text-sm rounded hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {agentsLoading ? <Loader2 size={14} className="animate-spin" /> : <Pencil size={14} />}
+                Edit AGENTS.md
+              </button>
             )}
           </div>
           {uploadError && (
@@ -831,12 +922,60 @@ export function FilesPage() {
 
           {/* File viewer */}
           <div className="flex-1 min-h-80 bg-gray-800 rounded-lg overflow-hidden flex flex-col">
-            {!selectedFile && (
+            {!selectedFile && !agentsEditorOpen && (
               <div className="flex-1 flex items-center justify-center text-gray-600 text-sm">
                 Select a file to preview
               </div>
             )}
-            {selectedFile && (
+            {agentsEditorOpen && (
+              <>
+                <div className="px-4 py-2 border-b border-gray-700 text-xs text-gray-400 flex items-center gap-2">
+                  <span className="truncate flex-1" title={`${rootPath}/AGENTS.md`}>
+                    {rootPath}/AGENTS.md {!agentsExists && !agentsLoading ? '(new file)' : ''}
+                  </span>
+                  {agentsSaved && <span className="text-emerald-400">Saved</span>}
+                  <button
+                    onClick={saveAgentsMd}
+                    disabled={agentsLoading || agentsSaving}
+                    className="flex items-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {agentsSaving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+                    {agentsSaving ? 'Saving...' : 'Save'}
+                  </button>
+                  <button
+                    onClick={closeAgentsEditor}
+                    disabled={agentsSaving}
+                    className="p-1 text-gray-400 hover:text-gray-200 disabled:opacity-50"
+                    title="Close editor"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+                {agentsLoading ? (
+                  <div className="flex items-center gap-2 p-4 text-gray-400 text-sm">
+                    <Loader2 size={14} className="animate-spin" /> Loading AGENTS.md...
+                  </div>
+                ) : (
+                  <textarea
+                    aria-label="AGENTS.md content"
+                    value={agentsContent}
+                    onChange={(event) => {
+                      setAgentsContent(event.target.value);
+                      setAgentsSaved(false);
+                    }}
+                    spellCheck={false}
+                    className="flex-1 min-h-72 w-full resize-none bg-gray-900 p-4 text-xs text-gray-200 font-mono leading-relaxed focus:outline-none focus:ring-1 focus:ring-inset focus:ring-indigo-500"
+                    placeholder="# Project instructions"
+                  />
+                )}
+                {agentsError && (
+                  <div className="flex items-center gap-2 px-4 py-2 border-t border-red-500/30 bg-red-500/10 text-red-400 text-sm">
+                    <AlertCircle size={14} /> {agentsError}
+                  </div>
+                )}
+              </>
+            )}
+            {selectedFile && !agentsEditorOpen && (
               <>
                 <div className="px-4 py-2 border-b border-gray-700 text-xs text-gray-400 flex items-center gap-2">
                   <span className="truncate flex-1" title={selectedFile}>{selectedFile}</span>

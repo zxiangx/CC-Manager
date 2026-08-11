@@ -1182,6 +1182,13 @@ export const api = {
     request<{ tracked: string[]; discovered: string[] }>(`/api/projects/${projectId}/scan-env-files`, {
       method: 'POST',
     }),
+  getProjectAgentsMd: (projectId: number) =>
+    request<{ content: string; exists: boolean }>(`/api/projects/${projectId}/agents-md`),
+  updateProjectAgentsMd: (projectId: number, content: string) =>
+    request<{ content: string; exists: boolean }>(`/api/projects/${projectId}/agents-md`, {
+      method: 'PUT',
+      body: JSON.stringify({ content }),
+    }),
 
   // Claude Pool
   getPoolStatus: () => request<PoolUsageStatus>('/api/pool/status'),

@@ -2,6 +2,8 @@ import asyncio
 import fnmatch
 import os
 import pathlib
+import stat
+import tempfile
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -26,6 +28,9 @@ from backend.services.git_config import merge_git_config, settings_to_dict
 from backend.services.dispatcher import _build_git_env
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+MAX_AGENT_INSTRUCTIONS_SIZE = 1 * 1024 * 1024
+
 
 async def _require_project_access(request: Request, project_id: int, db: AsyncSession):
     """Backward-compatible local alias for the shared Project ACL."""
@@ -638,9 +643,141 @@ class EnvFileContent(BaseModel):
     content: str
 
 
+class AgentInstructionsContent(BaseModel):
+    content: str
+    exists: bool = True
+
+
+class AgentInstructionsUpdate(BaseModel):
+    content: str
+
+
 class ScanEnvFilesResponse(BaseModel):
     tracked: list[str]    # already in env_files
     discovered: list[str] # found in repo but not yet tracked
+
+
+def _agents_md_target(local_path: str) -> tuple[pathlib.Path, pathlib.Path]:
+    """Return the project root and the only writable instruction target."""
+    try:
+        root = pathlib.Path(local_path).expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise HTTPException(400, "Project directory does not exist")
+    if not root.is_dir():
+        raise HTTPException(400, "Project path is not a directory")
+
+    agents_path = root / "AGENTS.md"
+    if agents_path.is_symlink():
+        # CCM normally creates AGENTS.md as this exact same-directory symlink.
+        # Do not let a project-scoped editor become an arbitrary symlink writer.
+        target = agents_path.resolve(strict=False)
+        if target != root / "CLAUDE.md":
+            raise HTTPException(400, "AGENTS.md has an unsafe symlink target")
+    else:
+        target = agents_path
+
+    if target.exists() and not target.is_file():
+        raise HTTPException(400, "AGENTS.md is not a regular file")
+    return root, target
+
+
+def _read_agents_md(local_path: str) -> AgentInstructionsContent:
+    _root, target = _agents_md_target(local_path)
+    if not target.exists():
+        return AgentInstructionsContent(content="", exists=False)
+    size = target.stat().st_size
+    if size > MAX_AGENT_INSTRUCTIONS_SIZE:
+        raise HTTPException(413, "AGENTS.md exceeds the 1 MiB editor limit")
+    try:
+        return AgentInstructionsContent(
+            content=target.read_text(encoding="utf-8"),
+            exists=True,
+        )
+    except UnicodeDecodeError:
+        raise HTTPException(400, "AGENTS.md is not valid UTF-8")
+    except PermissionError:
+        raise HTTPException(403, "Permission denied")
+
+
+def _write_agents_md(local_path: str, content: str) -> AgentInstructionsContent:
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_AGENT_INSTRUCTIONS_SIZE:
+        raise HTTPException(413, "AGENTS.md exceeds the 1 MiB editor limit")
+    root, target = _agents_md_target(local_path)
+    if target.parent != root:
+        raise HTTPException(400, "AGENTS.md must resolve inside the project root")
+
+    existing_mode = 0o644
+    if target.exists():
+        existing_mode = stat.S_IMODE(target.stat().st_mode)
+
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=root,
+            prefix=".ccm-agents-",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            temporary.write(encoded)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_path, existing_mode)
+        os.replace(temporary_path, target)
+        temporary_path = None
+    except PermissionError:
+        raise HTTPException(403, "Permission denied")
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+    return AgentInstructionsContent(content=content, exists=True)
+
+
+@router.get("/{project_id}/agents-md", response_model=AgentInstructionsContent)
+async def get_agents_md(
+    project_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Read only the selected project's root AGENTS.md."""
+    await require_project_access(request, project_id, db)
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if project.worker_id:
+        raise HTTPException(
+            409,
+            "Worker projects are not available in the local file browser",
+        )
+    if not project.local_path:
+        raise HTTPException(400, "Project has no local path")
+    return _read_agents_md(project.local_path)
+
+
+@router.put("/{project_id}/agents-md", response_model=AgentInstructionsContent)
+async def update_agents_md(
+    project_id: int,
+    body: AgentInstructionsUpdate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Atomically write only the selected project's root AGENTS.md."""
+    await require_project_access(request, project_id, db)
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if project.worker_id:
+        raise HTTPException(
+            409,
+            "Worker projects are not available in the local file browser",
+        )
+    if not project.local_path:
+        raise HTTPException(400, "Project has no local path")
+    return _write_agents_md(project.local_path, body.content)
 
 
 @router.get("/{project_id}/env-files", response_model=EnvFilesListResponse)

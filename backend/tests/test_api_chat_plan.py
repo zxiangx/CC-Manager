@@ -844,14 +844,9 @@ async def test_codex_fork_legacy_copied_anchor_uses_native_parent_lineage(
     assert payload["metadata_"]["forked_from_task_id"] == child_id
     assert payload["metadata_"]["forked_from_native_task_id"] == parent_id
     assert payload["metadata_"]["codex_account_id"] == "parent-account"
-    assert read_thread.await_count == 3
-    assert read_thread.await_args_list[0].args == (
-        "/tmp/child-home",
-        "thread-child",
-    )
-    assert all(
-        call.args == ("/tmp/parent-home", "thread-parent")
-        for call in read_thread.await_args_list[1:]
+    read_thread.assert_awaited_once_with(
+        "/tmp/parent-home",
+        "thread-parent",
     )
     fork_thread.assert_awaited_once_with(
         "/tmp/parent-home",

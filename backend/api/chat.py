@@ -1177,6 +1177,11 @@ async def list_codex_fork_anchors(
         raise HTTPException(400, "This task has no Codex session to fork")
 
     rows = await _task_log_rows(db, task_id)
+    latest_blocked_reason = None
+    if source.status == "migrating":
+        latest_blocked_reason = "Wait for the session migration to finish"
+    elif source.status in {"executing", "running", "queued", "pending"}:
+        latest_blocked_reason = "Wait for the active turn to finish"
     anchors = [{
         "type": "latest",
         "id": None,
@@ -1186,12 +1191,8 @@ async def list_codex_fork_anchors(
             if source.completed_at else None
         ),
         "attachments": [],
-        "available": source.status != "migrating",
-        "unavailable_reason": (
-            "Wait for the session migration to finish"
-            if source.status == "migrating"
-            else None
-        ),
+        "available": latest_blocked_reason is None,
+        "unavailable_reason": latest_blocked_reason,
     }]
     if source.description:
         source_migrating = source.status == "migrating"
@@ -1210,59 +1211,6 @@ async def list_codex_fork_anchors(
                 if source_migrating else None
             ),
         })
-    native_cache: dict[
-        tuple[int, str],
-        tuple[list[LogEntry], list[dict], _ForkTurnIndex] | HTTPException,
-    ] = {}
-    if anchors[0]["available"]:
-        try:
-            codex_home, _account_id = await asyncio.to_thread(
-                _codex_fork_home,
-                source,
-                str(source.session_id),
-            )
-            from backend.main import instance_manager
-            from backend.services.codex_app_server import CodexAppServerError
-
-            try:
-                native_thread = await instance_manager.read_codex_thread(
-                    codex_home,
-                    str(source.session_id),
-                )
-            except CodexAppServerError as exc:
-                raise HTTPException(
-                    409,
-                    f"Native Codex history is unavailable: {exc}",
-                ) from exc
-            source_turns = [
-                turn
-                for turn in (native_thread.get("turns") or [])
-                if isinstance(turn, dict)
-            ]
-            try:
-                source_index = await asyncio.to_thread(
-                    _build_fork_turn_index,
-                    rows,
-                    source_turns,
-                )
-            except HTTPException as exc:
-                native_cache[(source.id, str(source.session_id))] = exc
-                raise
-            native_cache[(source.id, str(source.session_id))] = (
-                rows,
-                source_turns,
-                source_index,
-            )
-            _resolve_latest_fork_turn(source_turns, rows)
-        except HTTPException as exc:
-            anchors[0]["available"] = False
-            anchors[0]["unavailable_reason"] = str(exc.detail)
-    lineage_rows_cache = {source.id: rows}
-    lineage_row_index_cache = {
-        source.id: {row.id: index for index, row in enumerate(rows)}
-    }
-    lineage_link_cache: dict[tuple[int, int], tuple[Task, int]] = {}
-    authorized_lineage_tasks = {source.id}
     for row in rows:
         if not _is_forkable_user_message(row):
             continue
@@ -1271,78 +1219,6 @@ async def list_codex_fork_anchors(
         unavailable_reason = (
             "Wait for the session migration to finish" if not available else None
         )
-        if available:
-            try:
-                lineage = await _resolve_fork_lineage_anchor(
-                    db,
-                    source,
-                    rows,
-                    row.id,
-                    rows_cache=lineage_rows_cache,
-                    row_index_cache=lineage_row_index_cache,
-                    link_cache=lineage_link_cache,
-                )
-                if lineage.task.id not in authorized_lineage_tasks:
-                    await require_task_control(request, lineage.task, db)
-                    authorized_lineage_tasks.add(lineage.task.id)
-                cache_key = (lineage.task.id, lineage.thread_id)
-                cached = native_cache.get(cache_key)
-                if cached is None:
-                    codex_home, _account_id = await asyncio.to_thread(
-                        _codex_fork_home,
-                        lineage.task,
-                        lineage.thread_id,
-                    )
-                    from backend.main import instance_manager
-                    from backend.services.codex_app_server import CodexAppServerError
-
-                    try:
-                        native_thread = await instance_manager.read_codex_thread(
-                            codex_home,
-                            lineage.thread_id,
-                        )
-                    except CodexAppServerError as exc:
-                        cached = HTTPException(
-                            409,
-                            f"Native Codex history is unavailable: {exc}",
-                        )
-                    else:
-                        cached_turns = [
-                            turn
-                            for turn in (native_thread.get("turns") or [])
-                            if isinstance(turn, dict)
-                        ]
-                        try:
-                            cached_index = await asyncio.to_thread(
-                                _build_fork_turn_index,
-                                lineage.rows,
-                                cached_turns,
-                            )
-                        except HTTPException as exc:
-                            cached = exc
-                        else:
-                            cached = (
-                                lineage.rows,
-                                cached_turns,
-                                cached_index,
-                            )
-                    native_cache[cache_key] = cached
-                if isinstance(cached, HTTPException):
-                    raise cached
-                native_rows, turns, turn_index = cached
-                await asyncio.to_thread(
-                    _resolve_fork_turn,
-                    anchor=ForkAnchor(
-                        type="user_message",
-                        id=lineage.anchor_id,
-                    ),
-                    rows=native_rows,
-                    turns=turns,
-                    index=turn_index,
-                )
-            except HTTPException as exc:
-                available = False
-                unavailable_reason = str(exc.detail)
         anchors.append({
             "type": "user_message",
             "id": row.id,

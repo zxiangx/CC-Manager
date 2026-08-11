@@ -5181,7 +5181,13 @@ class CodexAppServerRegistry:
         codex_home: str | os.PathLike[str] | None,
         thread_id: str,
     ) -> dict[str, Any]:
-        """Read one idle native thread from its exact account home."""
+        """Read one native thread from its exact account home.
+
+        ``thread/read`` is a snapshot operation and the app-server explicitly
+        supports it while a turn is active.  The registry reservation prevents
+        a concurrent resume/rebind without interrupting the already admitted
+        turn or its steer requests.
+        """
 
         home = normalize_codex_home(codex_home)
         token = object()
@@ -5204,10 +5210,6 @@ class CodexAppServerRegistry:
             if server is None:
                 server = self._new_server(home)
                 self._servers[home] = server
-            if server.has_active_thread(thread_id):
-                raise CodexAppServerBusyError(
-                    f"Codex thread {thread_id} still has an active turn"
-                )
             if owner is None:
                 self._thread_owners[thread_id] = home
                 reserved_owner = True
@@ -5353,7 +5355,12 @@ class CodexAppServerRegistry:
         *,
         last_turn_id: str,
     ) -> dict[str, Any]:
-        """Fork an idle native thread and register the new thread owner."""
+        """Fork through one completed turn and register the new owner.
+
+        App-server permits ``thread/fork(lastTurnId=...)`` while the source has
+        a newer active turn.  The completed-turn id is the immutable snapshot
+        boundary; the source turn continues normally and is never copied.
+        """
 
         home = normalize_codex_home(codex_home)
         token = object()
@@ -5376,10 +5383,6 @@ class CodexAppServerRegistry:
             if server is None:
                 server = self._new_server(home)
                 self._servers[home] = server
-            if server.has_active_thread(thread_id):
-                raise CodexAppServerBusyError(
-                    f"Codex thread {thread_id} still has an active turn"
-                )
             if owner is None:
                 self._thread_owners[thread_id] = home
                 reserved_owner = True

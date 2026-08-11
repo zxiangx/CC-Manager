@@ -6389,6 +6389,10 @@ async def test_registry_fork_keeps_source_and_new_thread_in_same_home(
         "backend.services.codex_app_server.CodexAppServer",
         _RegistryFakeServer,
     ):
+        server = registry._new_server(home)
+        server.active_threads.add(source_id)
+        registry._servers[home] = server
+        registry._thread_owners[source_id] = home
         source = await registry.read_thread(home, source_id)
         forked = await registry.fork_thread(
             home,
@@ -6399,6 +6403,7 @@ async def test_registry_fork_keeps_source_and_new_thread_in_same_home(
         assert forked["id"] == "thread-source-fork"
         assert registry._thread_owners[source_id] == home
         assert registry._thread_owners[forked["id"]] == home
+        assert server.has_active_thread(source_id) is True
         assert source_id not in registry._starting_threads
         assert home not in registry._starting
 

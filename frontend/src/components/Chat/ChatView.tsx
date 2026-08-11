@@ -2618,7 +2618,7 @@ function ChatRuntimeView({
                   {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
                     <MessageBranchControls
                       branch={initialMessageBranch}
-                      canEdit={!isProcessing}
+                      canEdit
                       editing={editingMessageKey === 'initial'}
                       switching={switchingBranchId === initialMessageBranch?.branch_id}
                       onEdit={() => editMessageBranch(
@@ -2653,7 +2653,6 @@ function ChatRuntimeView({
                 && !!task.session_id
                 && task.worker_id == null
                 && task.shared_from_id == null
-                && !isProcessing
                 && group.message.persisted === true
                 && group.message.event_type === 'user_message'
                 && group.message.role === 'user'
@@ -3005,7 +3004,7 @@ function ChatRuntimeView({
               )}
             </div>
             {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
-              <ForkButton onClick={openFork} disabled={isProcessing} />
+              <ForkButton onClick={openFork} />
             )}
             {/* Message navigation — always visible, right-aligned */}
             <div className="ml-auto flex items-center gap-0.5">
@@ -3339,14 +3338,13 @@ function MessageCopyButton({ text }: { text: string }) {
   );
 }
 
-function ForkButton({ onClick, disabled = false }: { onClick: () => void; disabled?: boolean }) {
+function ForkButton({ onClick }: { onClick: () => void }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      disabled={disabled}
       className="inline-flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-indigo-500/10 hover:text-indigo-400 focus-visible:text-indigo-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
-      title={disabled ? '当前 Codex turn 结束后才能分叉' : '从一条用户消息之前的上下文创建 Fork'}
+      title="从一条用户消息之前的已完成上下文创建 Fork"
       aria-label="Fork Codex session"
     >
       <GitBranch size={16} />

@@ -1136,15 +1136,15 @@ async def list_codex_fork_anchors(
             if source.completed_at else None
         ),
         "attachments": [],
-        "available": source.status not in {"in_progress", "executing", "migrating"},
+        "available": source.status != "migrating",
         "unavailable_reason": (
-            "Wait for the current Codex turn to finish"
-            if source.status in {"in_progress", "executing", "migrating"}
+            "Wait for the session migration to finish"
+            if source.status == "migrating"
             else None
         ),
     }]
     if source.description:
-        source_active = source.status in {"in_progress", "executing", "migrating"}
+        source_migrating = source.status == "migrating"
         anchors.append({
             "type": "initial",
             "id": None,
@@ -1154,10 +1154,10 @@ async def list_codex_fork_anchors(
                 if source.created_at else None
             ),
             "attachments": (source.metadata_ or {}).get("attachments") or [],
-            "available": not source_active,
+            "available": not source_migrating,
             "unavailable_reason": (
-                "Wait for the current Codex turn to finish"
-                if source_active else None
+                "Wait for the session migration to finish"
+                if source_migrating else None
             ),
         })
     native_cache: dict[
@@ -1188,11 +1188,11 @@ async def list_codex_fork_anchors(
                 for turn in (native_thread.get("turns") or [])
                 if isinstance(turn, dict)
             ]
-            _resolve_latest_fork_turn(source_turns, rows)
             native_cache[(source.id, str(source.session_id))] = (
                 rows,
                 source_turns,
             )
+            _resolve_latest_fork_turn(source_turns, rows)
         except HTTPException as exc:
             anchors[0]["available"] = False
             anchors[0]["unavailable_reason"] = str(exc.detail)
@@ -1203,9 +1203,9 @@ async def list_codex_fork_anchors(
         if not _is_forkable_user_message(row):
             continue
         metadata = _raw_log_metadata(row)
-        available = source.status not in {"in_progress", "executing", "migrating"}
+        available = source.status != "migrating"
         unavailable_reason = (
-            "Wait for the current Codex turn to finish" if not available else None
+            "Wait for the session migration to finish" if not available else None
         )
         if available:
             try:
@@ -1299,8 +1299,8 @@ async def fork_codex_task(
         raise HTTPException(409, "Remote Worker task forks are not supported yet")
     if not source.session_id:
         raise HTTPException(400, "This task has no Codex session to fork")
-    if source.status in {"in_progress", "executing", "migrating"}:
-        raise HTTPException(409, "Wait for the current Codex turn to finish")
+    if source.status == "migrating":
+        raise HTTPException(409, "Wait for the session migration to finish")
 
     rows = await _task_log_rows(db, task_id)
     selected: LogEntry | None = None

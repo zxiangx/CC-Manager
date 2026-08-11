@@ -1570,6 +1570,39 @@ describe('ChatView', () => {
       });
     });
 
+    it('keeps Fork available while the source Codex session is executing', async () => {
+      const task = makeTask({ id: 13, provider: 'codex', status: 'executing' });
+      const stableAnchor = {
+        type: 'user_message' as const,
+        id: 457,
+        content: 'Fork from the stable context before this request',
+        timestamp: '2024-01-01T00:01:00Z',
+        attachments: [],
+        available: true,
+      };
+      (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          type: 'latest' as const,
+          id: null,
+          content: '完整复制当前上下文',
+          timestamp: null,
+          attachments: [],
+          available: false,
+          unavailable_reason: 'The latest Codex turn is not completed',
+        },
+        stableAnchor,
+      ]);
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      const forkButton = screen.getByLabelText('Fork Codex session');
+      expect(forkButton).toBeEnabled();
+      await userEvent.click(forkButton);
+      expect(await screen.findByText(stableAnchor.content)).toBeInTheDocument();
+      expect(api.listForkAnchors).toHaveBeenCalledWith(task.id);
+      expect(screen.getByRole('button', { name: /完整复制当前上下文/ })).toBeDisabled();
+    });
+
     it('can copy the complete latest Codex context without a seed message', async () => {
       const task = makeTask({ id: 14, provider: 'codex', status: 'completed' });
       const latest = {

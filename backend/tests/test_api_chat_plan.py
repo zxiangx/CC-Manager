@@ -964,7 +964,7 @@ async def test_codex_fork_from_initial_prompt_creates_empty_thread(
 
 
 @pytest.mark.asyncio
-async def test_codex_fork_rejects_active_source_without_native_rpc(
+async def test_codex_fork_active_source_uses_last_completed_turn_without_stopping_it(
     client, session_factory,
 ):
     created = await client.post("/api/tasks", json={
@@ -978,19 +978,81 @@ async def test_codex_fork_rejects_active_source_without_native_rpc(
         task = await db.get(Task, task_id)
         task.status = "executing"
         task.session_id = "thread-active"
+        task.last_cwd = "/tmp/project"
+        task.metadata_ = {"codex_account_id": "codex-a"}
+        completed = LogEntry(
+            instance_id=1,
+            task_id=task_id,
+            event_type="message",
+            role="assistant",
+            content="stable answer",
+            raw_json='{"item_id":"item-1","turn_id":"turn-1"}',
+            is_error=False,
+        )
+        anchor = LogEntry(
+            instance_id=1,
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="work still running",
+            raw_json='{"raw_content":"work still running"}',
+            is_error=False,
+        )
+        active = LogEntry(
+            instance_id=1,
+            task_id=task_id,
+            event_type="message",
+            role="assistant",
+            content="partial progress",
+            raw_json='{"item_id":"item-2","turn_id":"turn-2"}',
+            is_error=False,
+        )
+        db.add_all([completed, anchor, active])
         await db.commit()
+        await db.refresh(anchor)
+        anchor_id = anchor.id
 
-    with patch(
-        "backend.main.instance_manager.read_codex_thread",
-        new=AsyncMock(),
-    ) as read_thread:
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "inProgress", "items": [{"id": "item-2"}]},
+    ]
+    with (
+        patch(
+            "backend.api.chat._codex_fork_home",
+            return_value=("/tmp/codex-home", "codex-a"),
+        ),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-active", "turns": turns}),
+        ),
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-fork"}),
+        ) as fork_thread,
+    ):
+        anchors = await client.get(f"/api/tasks/{task_id}/fork-anchors")
+        assert anchors.status_code == 200, anchors.text
+        by_type = {item["type"]: item for item in anchors.json() if item["type"] != "user_message"}
+        assert by_type["latest"]["available"] is False
+        assert by_type["initial"]["available"] is True
+        user_anchor = next(item for item in anchors.json() if item.get("id") == anchor_id)
+        assert user_anchor["available"] is True
+
         response = await client.post(
             f"/api/tasks/{task_id}/fork",
-            json={"anchor": {"type": "user_message", "id": 1}},
+            json={"anchor": {"type": "user_message", "id": anchor_id}},
         )
 
-    assert response.status_code == 409
-    read_thread.assert_not_awaited()
+    assert response.status_code == 201, response.text
+    assert response.json()["metadata_"]["forked_from_turn_id"] == "turn-1"
+    fork_thread.assert_awaited_once_with(
+        "/tmp/codex-home",
+        "thread-active",
+        last_turn_id="turn-1",
+    )
+    async with session_factory() as db:
+        source = await db.get(Task, task_id)
+        assert source.status == "executing"
 
 
 @pytest.mark.asyncio

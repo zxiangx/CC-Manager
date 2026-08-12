@@ -508,32 +508,33 @@ class InstanceManager:
         content: str,
         *,
         input_items: list[dict] | None = None,
-    ) -> bool:
+    ) -> str | None:
         """Steer a live Codex app-server turn without starting a new turn.
 
         Codex ``exec`` subprocesses do not expose same-turn steering, so a
-        missing app-server/context deliberately returns False.
+        missing app-server/context deliberately returns ``None``.  A success
+        returns the exact native turn id for durable edit/fork mapping.
         """
         if (
             self._codex_app_server is None
             or not thread_id
             or (not content and not input_items)
         ):
-            return False
+            return None
         try:
             if input_items is None:
-                return await self._codex_app_server.steer_turn(
+                return await self._codex_app_server.steer_turn_with_id(
                     thread_id,
                     content,
                 )
-            return await self._codex_app_server.steer_turn(
+            return await self._codex_app_server.steer_turn_with_id(
                 thread_id,
                 content,
                 input_items=input_items,
             )
         except Exception:
             logger.exception("Codex inject failed for thread %s", thread_id)
-            return False
+            return None
 
     async def release_pty_session(self, session_id: str) -> None:
         """Return a PTY session to nothing — stop it and remove from the pool.

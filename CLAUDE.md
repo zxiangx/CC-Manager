@@ -410,4 +410,4 @@ uv run alembic history         # 查看历史
 ## 2026-08-13 lifecycle overrides
 
 - **Codex Goal lineage 闸门（覆盖旧的提前释放约定）**: active Goal 发现 native descendant 后必须立即以 `thread/goal/set paused` 阻止下一 root turn；旧 root identity 与 exact CCM owner 保留到全部 descendant 权威 idle，随后才释放 identity、恢复 Goal 并接住 Codex 原生 continuation。暂停/恢复 RPC 不可确认时持续持有 owner 重试，绝不能在 child 收尾时提前放行。
-- **注入消息编辑（覆盖旧的 inject 禁止约定）**: Fork/编辑允许真实人类 `source=inject` 消息。它不是原生 item 边界，必须唯一映射 containing turn、Fork 到其前一 completed turn，并把注入前的本 turn 用户输入作为一次性隐藏 replay prefix；无法证明时 409。Monitor/Sub-Agent/模型/tool/system 仍禁止编辑。
+- **注入消息编辑（覆盖旧的 inject 禁止约定）**: Fork/编辑允许真实人类 `source=inject` 消息。它不是原生 item 边界：新注入必须持久化 race-fenced `turn/steer` 回包的 exact turn id；旧注入取下一条普通用户消息前的首个可映射 native event 作为 containing turn，后续 Goal 自动 turn 不得造成假歧义。Fork 到 containing turn 的前一 completed turn，只回放映射到同一 containing turn 且位于注入前的用户输入；既无 exact id 又无安全后继事件时 409，禁止按消息序号或最后一个 Goal turn 猜测。Monitor/Sub-Agent/模型/tool/system 仍禁止编辑。

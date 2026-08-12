@@ -225,7 +225,7 @@ def test_parse_codex_agent_message():
 @pytest.mark.asyncio
 async def test_inject_codex_message_forwards_native_attachment_inputs():
     registry = MagicMock()
-    registry.steer_turn = AsyncMock(return_value=True)
+    registry.steer_turn_with_id = AsyncMock(return_value="turn-live")
     manager = InstanceManager(MagicMock(), MagicMock())
     manager._codex_app_server = registry
     input_items = [
@@ -242,8 +242,8 @@ async def test_inject_codex_message_forwards_native_attachment_inputs():
         "thread-1",
         "inspect both attachments",
         input_items=input_items,
-    ) is True
-    registry.steer_turn.assert_awaited_once_with(
+    ) == "turn-live"
+    registry.steer_turn_with_id.assert_awaited_once_with(
         "thread-1",
         "inspect both attachments",
         input_items=input_items,

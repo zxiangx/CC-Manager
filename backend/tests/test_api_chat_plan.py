@@ -384,9 +384,22 @@ async def test_edited_injection_replays_containing_turn_inputs(
                 ),
             ),
             LogEntry(
-                instance_id=1, task_id=source_id, event_type="system_event",
-                role="system", content="turn done", is_error=False,
-                raw_json='{"type":"turn.completed","turn_id":"turn-2"}',
+                instance_id=1, task_id=source_id, event_type="message",
+                role="assistant", content="audit updated", is_error=False,
+                raw_json='{"item_id":"item-2b","turn_id":"turn-2"}',
+            ),
+            # A native Goal can start several more turns before the next
+            # ordinary user message.  They do not make the earlier steer
+            # ambiguous: its first following native event is still turn-2.
+            LogEntry(
+                instance_id=1, task_id=source_id, event_type="message",
+                role="assistant", content="goal continuation 1", is_error=False,
+                raw_json='{"item_id":"item-3","turn_id":"turn-3"}',
+            ),
+            LogEntry(
+                instance_id=1, task_id=source_id, event_type="message",
+                role="assistant", content="goal continuation 2", is_error=False,
+                raw_json='{"item_id":"item-4","turn_id":"turn-4"}',
             ),
         ]
         db.add_all(rows)
@@ -396,7 +409,11 @@ async def test_edited_injection_replays_containing_turn_inputs(
 
     turns = [
         {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
-        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
+        {"id": "turn-2", "status": "completed", "items": [
+            {"id": "item-2"}, {"id": "item-2b"},
+        ]},
+        {"id": "turn-3", "status": "completed", "items": [{"id": "item-3"}]},
+        {"id": "turn-4", "status": "completed", "items": [{"id": "item-4"}]},
     ]
     with (
         patch(
@@ -455,6 +472,94 @@ async def test_edited_injection_replays_containing_turn_inputs(
         assert json.loads(edited_row.raw_json)[
             "replayed_injected_turn_inputs"
         ] == 1
+
+
+def test_injected_goal_turn_uses_first_following_native_event():
+    from backend.api.chat import ForkAnchor, _resolve_injected_fork_turn
+
+    rows = [
+        LogEntry(
+            id=1, event_type="message", role="assistant", content="one",
+            raw_json='{"turn_id":"turn-1"}', is_error=False,
+        ),
+        LogEntry(
+            id=2, event_type="user_message", role="user", content="start",
+            raw_json='{"raw_content":"start","turn_id":"turn-2"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=3, event_type="message", role="assistant", content="two",
+            raw_json='{"turn_id":"turn-2"}', is_error=False,
+        ),
+        LogEntry(
+            id=4, event_type="message", role="assistant", content="goal starts",
+            raw_json='{"turn_id":"turn-3"}', is_error=False,
+        ),
+        LogEntry(
+            id=5, event_type="user_message", role="user", content="change it",
+            raw_json='{"source":"inject","raw_content":"change it"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=6, event_type="message", role="assistant", content="changed",
+            raw_json='{"turn_id":"turn-3"}', is_error=False,
+        ),
+        LogEntry(
+            id=7, event_type="message", role="assistant", content="later goal",
+            raw_json='{"turn_id":"turn-4"}', is_error=False,
+        ),
+    ]
+    turns = [
+        {"id": f"turn-{number}", "status": "completed"}
+        for number in range(1, 5)
+    ]
+
+    target_turn_id, cutoff, replay_prefix = _resolve_injected_fork_turn(
+        anchor=ForkAnchor(type="user_message", id=5),
+        rows=rows,
+        turns=turns,
+    )
+
+    assert target_turn_id == "turn-2"
+    assert cutoff == 4
+    assert replay_prefix == []
+
+
+def test_injected_turn_uses_persisted_steer_id_without_later_events():
+    from backend.api.chat import ForkAnchor, _resolve_injected_fork_turn
+
+    rows = [
+        LogEntry(
+            id=1, event_type="message", role="assistant", content="one",
+            raw_json='{"turn_id":"turn-1"}', is_error=False,
+        ),
+        LogEntry(
+            id=2, event_type="user_message", role="user", content="start",
+            raw_json='{"raw_content":"start","turn_id":"turn-2"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=3, event_type="user_message", role="user", content="change",
+            raw_json=(
+                '{"source":"inject","raw_content":"change",'
+                '"turn_id":"turn-2"}'
+            ),
+            is_error=False,
+        ),
+    ]
+
+    target_turn_id, cutoff, replay_prefix = _resolve_injected_fork_turn(
+        anchor=ForkAnchor(type="user_message", id=3),
+        rows=rows,
+        turns=[
+            {"id": "turn-1", "status": "completed"},
+            {"id": "turn-2", "status": "inProgress"},
+        ],
+    )
+
+    assert target_turn_id == "turn-1"
+    assert cutoff == 2
+    assert replay_prefix == ["start"]
 
 
 @pytest.mark.asyncio
@@ -3399,7 +3504,7 @@ async def test_codex_inject_steers_without_pty_mode(
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = False
-    mock_im.inject_codex_message = AsyncMock(return_value=True)
+    mock_im.inject_codex_message = AsyncMock(return_value="turn-steered")
     mock_broadcaster = MagicMock(broadcast=AsyncMock())
 
     with patch("backend.main.instance_manager", mock_im), \
@@ -3428,6 +3533,7 @@ async def test_codex_inject_steers_without_pty_mode(
         ).scalar_one()
     event = injected[0].args[1]
     assert event["id"] == stored.id
+    assert json.loads(stored.raw_json)["turn_id"] == "turn-steered"
     assert event["task_id"] == task_id
     assert event["timestamp"].endswith("Z")
 

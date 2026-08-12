@@ -4101,14 +4101,33 @@ class CodexAppServer:
         *,
         input_items: list[dict[str, Any]] | None = None,
     ) -> bool:
+        """Append user input and report whether the exact turn accepted it."""
+
+        return (
+            await self.steer_turn_with_id(
+                thread_id,
+                content,
+                input_items=input_items,
+            )
+            is not None
+        )
+
+    async def steer_turn_with_id(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> str | None:
         """Append user input to the currently active regular turn.
 
         ``expectedTurnId`` makes the request race-safe: if the turn finishes
         between the local context lookup and the RPC, app-server rejects the
-        stale steer instead of attaching it to a later turn.
+        stale steer instead of attaching it to a later turn.  Return the exact
+        native turn id so callers can persist an authoritative edit anchor.
         """
         if not self.is_alive or not thread_id or (not content and not input_items):
-            return False
+            return None
         if input_items is None:
             steer_input: list[dict[str, Any]] = [
                 {"type": "text", "text": content},
@@ -4162,7 +4181,7 @@ class CodexAppServer:
             or context.turn_id is None
             or context.process.returncode is not None
         ):
-            return False
+            return None
 
         expected_turn_id = context.turn_id
         try:
@@ -4197,7 +4216,11 @@ class CodexAppServer:
                 except Exception as retry_exc:
                     exc = retry_exc
                 else:
-                    return response.get("turnId") == actual_turn_id
+                    return (
+                        actual_turn_id
+                        if response.get("turnId") == actual_turn_id
+                        else None
+                    )
             # A normal turn-boundary race and non-steerable turns (review or
             # manual compact) are protocol rejections, not transport crashes.
             logger.info(
@@ -4206,8 +4229,12 @@ class CodexAppServer:
                 expected_turn_id,
                 exc,
             )
-            return False
-        return response.get("turnId") == expected_turn_id
+            return None
+        return (
+            expected_turn_id
+            if response.get("turnId") == expected_turn_id
+            else None
+        )
 
     async def _request(
         self, method: str, params: dict[str, Any] | None,
@@ -6173,6 +6200,52 @@ class CodexAppServerRegistry:
             if input_items is None:
                 return await server.steer_turn(thread_id, content)
             return await server.steer_turn(
+                thread_id,
+                content,
+                input_items=input_items,
+            )
+        finally:
+            assert home is not None
+
+            async def _release_steer_reservation() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+
+            await _settle_registry_cleanup(_release_steer_reservation())
+
+    async def steer_turn_with_id(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Steer a live turn and return its exact accepted native id."""
+
+        home: str | None = None
+        async with self._lock:
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
+            home = self._thread_owners.get(thread_id)
+            if home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is draining: {home}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is being rebound"
+                )
+            server = self._servers.get(home) if home else None
+            if server is not None and home is not None:
+                self._starting[home] = self._starting.get(home, 0) + 1
+        if server is None:
+            return None
+        try:
+            if input_items is None:
+                return await server.steer_turn_with_id(thread_id, content)
+            return await server.steer_turn_with_id(
                 thread_id,
                 content,
                 input_items=input_items,

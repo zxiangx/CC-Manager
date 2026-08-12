@@ -395,23 +395,29 @@ def _resolve_injected_fork_turn(
             segment_end = position
             break
 
-    segment_turn_ids: list[str] = []
-    terminal_turn_ids: list[str] = []
-    for candidate in rows[segment_start:segment_end]:
-        candidate_turn_id = resolved_index.row_turns.get(candidate.id)
-        if not candidate_turn_id:
-            continue
-        segment_turn_ids.append(candidate_turn_id)
-        raw = _raw_log_metadata(candidate)
-        if raw.get("type") in {"turn.completed", "turn.failed"}:
-            terminal_turn_ids.append(candidate_turn_id)
-    unique_terminal_ids = list(dict.fromkeys(terminal_turn_ids))
-    unique_segment_ids = list(dict.fromkeys(segment_turn_ids))
-    if len(unique_terminal_ids) == 1:
-        containing_turn_id = unique_terminal_ids[0]
-    elif not unique_terminal_ids and len(unique_segment_ids) == 1:
-        containing_turn_id = unique_segment_ids[0]
-    else:
+    def effective_user_turn(position: int) -> str | None:
+        """Map a persisted user row to its accepted native turn.
+
+        New injections persist the exact ``turn/steer`` response.  Historical
+        rows predate that metadata, but an accepted steer is committed before
+        its next native event.  Therefore the first mapped event before the
+        next ordinary user turn is its containing turn.  Later Goal turns in
+        the same ordinary-message segment must not make that anchor ambiguous.
+        """
+
+        direct = resolved_index.row_turns.get(rows[position].id)
+        if direct:
+            return direct
+        for candidate in rows[position + 1:segment_end]:
+            if _is_ordinary_user_message(candidate):
+                break
+            candidate_turn_id = resolved_index.row_turns.get(candidate.id)
+            if candidate_turn_id:
+                return candidate_turn_id
+        return None
+
+    containing_turn_id = effective_user_turn(selected_index)
+    if containing_turn_id is None:
         raise HTTPException(
             409,
             "This injected message cannot be mapped safely to one Codex turn",
@@ -429,21 +435,19 @@ def _resolve_injected_fork_turn(
         raise HTTPException(409, "The preceding Codex turn is still running")
 
     replay_prefix: list[str] = []
-    for candidate in rows[segment_start:selected_index]:
+    for position in range(segment_start, selected_index):
+        candidate = rows[position]
         if not (
             _is_ordinary_user_message(candidate)
             or _raw_log_metadata(candidate).get("source") == "inject"
         ):
             continue
+        if effective_user_turn(position) != containing_turn_id:
+            continue
         raw = _raw_log_metadata(candidate)
         content = str(raw.get("raw_content") or candidate.content or "").strip()
         if content:
             replay_prefix.append(content)
-    if not replay_prefix:
-        raise HTTPException(
-            409,
-            "The original turn input for this injected message is unavailable",
-        )
     return (
         str(previous.get("id") or ""),
         selected.id - 1,
@@ -2449,6 +2453,7 @@ async def _store_injected_message(
     sender_display_name: str | None,
     uploads: list[ValidatedUploadAttachment],
     instance_id: int | None,
+    native_turn_id: str | None = None,
 ) -> None:
     attachments = [upload.public_dict() for upload in uploads]
     file_paths = [upload.path for upload in uploads]
@@ -2459,6 +2464,8 @@ async def _store_injected_message(
         "source": "inject",
         "raw_content": raw_content,
     }
+    if native_turn_id:
+        raw_metadata["turn_id"] = native_turn_id
     if attachments:
         raw_metadata.update({
             "attachments": attachments,
@@ -2576,6 +2583,7 @@ async def inject_message(
         from backend.main import instance_manager, broadcaster
 
         provider = (task.provider or "claude").lower()
+        native_turn_id: str | None = None
         transport_content = _inject_transport_content(
             body.message,
             uploads,
@@ -2589,7 +2597,7 @@ async def inject_message(
                     "Codex app-server 未开启，当前 exec 链路不支持执行中注入",
                 )
             if uploads:
-                ok = await instance_manager.inject_codex_message(
+                steer_result = await instance_manager.inject_codex_message(
                     task.session_id,
                     transport_content,
                     input_items=_codex_inject_input_items(
@@ -2598,10 +2606,16 @@ async def inject_message(
                     ),
                 )
             else:
-                ok = await instance_manager.inject_codex_message(
+                steer_result = await instance_manager.inject_codex_message(
                     task.session_id,
                     transport_content,
                 )
+            ok = bool(steer_result)
+            # Real InstanceManager calls return the exact id.  Keep bool
+            # compatibility for rolling deploys and test doubles, but never
+            # persist ``True`` as a fake native turn id.
+            if isinstance(steer_result, str):
+                native_turn_id = steer_result
             unavailable_detail = (
                 "注入失败：当前 Codex turn 已结束、暂不可 steer、附件输入被 "
                 "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"
@@ -2672,6 +2686,7 @@ async def inject_message(
             sender_display_name=sender_display_name,
             uploads=uploads,
             instance_id=task.instance_id,
+            native_turn_id=native_turn_id,
         )
         return {
             "ok": True,

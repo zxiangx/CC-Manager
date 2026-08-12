@@ -2546,7 +2546,7 @@ async def test_required_mcp_missing_turn_id_is_explicit_and_detaches_context():
 
 
 @pytest.mark.asyncio
-async def test_steer_turn_targets_the_active_turn():
+async def test_steer_turn_with_id_returns_the_exact_active_turn():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
@@ -2560,7 +2560,9 @@ async def test_steer_turn_targets_the_active_turn():
         resume_session_id=None, git_env=None, task_id=1,
     )
 
-    assert await server.steer_turn("thread-1", "focus on the failing test") is True
+    assert await server.steer_turn_with_id(
+        "thread-1", "focus on the failing test"
+    ) == "turn-1"
     steer_call = server._request.await_args_list[2]
     assert steer_call.args == (
         "turn/steer",
@@ -6418,6 +6420,24 @@ async def test_registry_routes_each_canonical_home_to_one_server(
     )
     assert server_a.steered == [(thread_a, "a-only")]
     assert server_b.steered == []
+
+
+@pytest.mark.asyncio
+async def test_registry_steer_with_id_preserves_exact_turn_identity(tmp_path):
+    home = normalize_codex_home(tmp_path / "steer-id")
+    server = MagicMock()
+    server.steer_turn_with_id = AsyncMock(return_value="turn-exact")
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners["thread-target"] = home
+
+    assert await registry.steer_turn_with_id(
+        "thread-target", "new direction"
+    ) == "turn-exact"
+    server.steer_turn_with_id.assert_awaited_once_with(
+        "thread-target", "new direction"
+    )
+    assert home not in registry._starting
 
 
 @pytest.mark.asyncio

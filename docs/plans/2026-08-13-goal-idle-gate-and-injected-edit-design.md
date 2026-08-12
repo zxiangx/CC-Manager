@@ -27,13 +27,22 @@ The existing in-session branch model remains unchanged: the original and edited
 versions are separate hidden Tasks selected through the left/right controls,
 and reopening the visible session restores the last selected branch.
 
+Every new Codex injection persists the exact turn id returned by the successful
+race-fenced `turn/steer` call. Historical injections do not have that metadata.
+For those rows, the first subsequent event that maps to the same native thread,
+before the next ordinary user message, is the authoritative containing turn.
+This is important for Goal sessions: later automatic Goal turns may occur in
+the same ordinary-message segment, but they do not make the earlier steer
+ambiguous. Only earlier user inputs mapped to the same containing turn are
+replayed.
+
 ## Safety rules
 
 - Only human `source=inject` rows become editable; Monitor and sub-agent rows do
   not.
-- An injected row is accepted only when it maps to exactly one native turn and
-  that turn has a completed predecessor.
-- Ambiguous history returns a conflict instead of guessing.
+- An injected row is accepted only when its persisted steer id or its first
+  following native event identifies a turn with a completed predecessor.
+- Historical rows with no safe following native event return a conflict
+  instead of guessing from message ordinal or later Goal turns.
 - Replay metadata is one-shot and removed after the first edited message is
   durably admitted.
-

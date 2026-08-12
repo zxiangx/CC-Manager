@@ -3215,6 +3215,39 @@ async def test_cleared_goal_closes_retained_between_turn_context():
 
 
 @pytest.mark.asyncio
+async def test_clear_thread_goal_requires_confirmation_and_verifies_absence():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"goal": {"threadId": "thread-clear", "status": "paused"}},
+        {"cleared": True},
+        {"goal": None},
+    ])
+
+    assert await server.clear_thread_goal("thread-clear") is True
+    assert server._request.await_args_list == [
+        (("thread/goal/get", {"threadId": "thread-clear"}),),
+        (("thread/goal/clear", {"threadId": "thread-clear"}),),
+        (("thread/goal/get", {"threadId": "thread-clear"}),),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_thread_goal_is_idempotent_when_goal_is_absent():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={"goal": None})
+
+    assert await server.clear_thread_goal("thread-no-goal") is False
+    server._request.assert_awaited_once_with(
+        "thread/goal/get",
+        {"threadId": "thread-no-goal"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_goal_continuation_rebinds_while_descendant_is_finishing():
     """An older descendant guard must not drop the next Goal turn."""
 
@@ -3409,8 +3442,11 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
 
 
 @pytest.mark.asyncio
-async def test_standard_resume_reactivates_paused_goal_before_steering():
-    """A new user message is an explicit resume signal for a paused Goal."""
+@pytest.mark.parametrize("resumable_status", ["paused", "blocked"])
+async def test_standard_resume_reactivates_resumable_goal_before_steering(
+    resumable_status,
+):
+    """A message/retry resumes Goals that the user did not cancel."""
 
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -3438,7 +3474,7 @@ async def test_standard_resume_reactivates_paused_goal_before_steering():
             goal_checks += 1
             return {
                 "goal": {
-                    "status": "paused" if goal_checks == 1 else "complete",
+                    "status": resumable_status if goal_checks == 1 else "complete",
                 },
             }
         if method == "thread/goal/set":
@@ -3506,7 +3542,7 @@ async def test_standard_resume_reactivates_paused_goal_before_steering():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "goal_status",
-    [None, "blocked", "usageLimited", "budgetLimited", "complete"],
+    [None, "usageLimited", "budgetLimited", "complete"],
 )
 async def test_standard_resume_does_not_bypass_non_paused_goal_status(
     goal_status,

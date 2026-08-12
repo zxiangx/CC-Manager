@@ -958,6 +958,57 @@ async def get_task(task_id: int, request: Request, queue: TaskQueue = Depends(_g
     return task
 
 
+def _require_native_goal_task(task: Task) -> tuple[str, str]:
+    if (task.provider or "").lower() != "codex":
+        raise HTTPException(400, "Native Goals are only available for Codex Tasks")
+    if not task.session_id:
+        raise HTTPException(409, "This Task does not have a Codex thread yet")
+    return _resolve_codex_thread_routing_home(task), task.session_id
+
+
+@router.get("/{task_id}/native-goal")
+async def get_native_goal(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the authoritative persisted Codex Goal for a Task."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+    worker_task = await _worker_task_or_none(db, task_id)
+    if worker_task is not None:
+        return await _proxy(
+            worker_task,
+            "GET",
+            f"/api/tasks/{task_id}/native-goal",
+        )
+    codex_home, thread_id = _require_native_goal_task(task)
+    from backend.main import instance_manager
+
+    try:
+        goal = await instance_manager.read_codex_thread_goal(
+            codex_home,
+            thread_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Could not read native Goal task=%s thread=%s error=%s",
+            task_id,
+            thread_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            409,
+            "The native Goal is temporarily unavailable; its persisted state was not changed",
+        ) from exc
+    return {"goal": goal}
+
+
 def _normalized_task_update_values(updates: dict) -> dict:
     """Mirror TaskQueue's explicit-NULL handling for one fenced UPDATE."""
 
@@ -3371,6 +3422,70 @@ async def stop_task_session(
     return await _finish_task_operation(
         _stop_task_session_local_impl(task_id, db)
     )
+
+
+@router.delete("/{task_id}/native-goal")
+async def cancel_native_goal(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop the current Goal turn, clear the Goal, and verify it is gone."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(
+        db,
+        task_id,
+        action="cancelled its native Goal",
+    )
+    worker_task = await _worker_task_or_none(db, task_id)
+    if worker_task is not None:
+        return await _proxy(
+            worker_task,
+            "DELETE",
+            f"/api/tasks/{task_id}/native-goal",
+        )
+    codex_home, thread_id = _require_native_goal_task(task)
+
+    # The ordinary stop path owns all Task/Instance/consumer lifecycle
+    # bookkeeping and intentionally pauses a followed Goal before interrupting
+    # it. An already-idle Goal has no process to stop, which is harmless here.
+    try:
+        await _finish_task_operation(_stop_task_session_local_impl(task_id, db))
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+
+    from backend.main import instance_manager
+    try:
+        cleared = await instance_manager.clear_codex_thread_goal(
+            codex_home,
+            thread_id,
+        )
+        remaining = await instance_manager.read_codex_thread_goal(
+            codex_home,
+            thread_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Could not clear native Goal task=%s thread=%s error=%s",
+            task_id,
+            thread_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            409,
+            "The Goal turn was stopped, but CCM could not prove that the persisted Goal was cleared",
+        ) from exc
+    if remaining is not None:
+        raise HTTPException(409, "The native Goal still exists after cancellation")
+    return {"goal": None, "cancelled": bool(cleared)}
 
 
 async def _cancel_local_task_impl(

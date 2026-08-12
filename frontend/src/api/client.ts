@@ -173,6 +173,25 @@ export interface ProjectTodo {
 
 export type CodexServiceTier = 'default' | 'priority';
 
+export type NativeGoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usageLimited'
+  | 'budgetLimited'
+  | 'complete';
+
+export interface NativeGoal {
+  threadId: string;
+  objective: string;
+  status: NativeGoalStatus;
+  tokensUsed: number;
+  tokenBudget?: number | null;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface TaskRoutingExpectation {
   provider: string;
   model: string | null;
@@ -1320,6 +1339,10 @@ export const api = {
     request<Task>(`/api/tasks/${id}/unread`, { method: 'POST' }),
   stopTaskSession: (id: number) =>
     request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
+  getNativeGoal: (id: number) =>
+    request<{ goal: NativeGoal | null }>(`/api/tasks/${id}/native-goal`),
+  cancelNativeGoal: (id: number) =>
+    request<{ goal: null; cancelled: boolean }>(`/api/tasks/${id}/native-goal`, { method: 'DELETE' }),
   listForkAnchors: (id: number) =>
     request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
   listMessageBranches: (id: number) =>

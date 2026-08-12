@@ -29,6 +29,114 @@ async def test_create_task(client):
 
 
 @pytest.mark.asyncio
+async def test_native_goal_endpoint_reads_persisted_codex_goal(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Goal view",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-goal-view"
+        await db.commit()
+
+    expected = {
+        "threadId": "thread-goal-view",
+        "objective": "Finish the durable objective",
+        "status": "active",
+        "tokensUsed": 123,
+        "timeUsedSeconds": 45,
+        "createdAt": 1,
+        "updatedAt": 2,
+    }
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-goal-home",
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "read_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=expected,
+        ) as read_goal,
+    ):
+        response = await client.get(f"/api/tasks/{task_id}/native-goal")
+
+    assert response.status_code == 200
+    assert response.json() == {"goal": expected}
+    read_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-view",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_native_goal_stops_then_clears_and_verifies(
+    client,
+    session_factory,
+):
+    from fastapi import HTTPException
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Goal cancel",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-goal-cancel"
+        await db.commit()
+
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-goal-home",
+        ),
+        patch(
+            "backend.api.tasks._stop_task_session_local_impl",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(400, "already idle"),
+        ) as stop_goal_turn,
+        patch.object(
+            backend.main.instance_manager,
+            "clear_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as clear_goal,
+        patch.object(
+            backend.main.instance_manager,
+            "read_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as verify_goal,
+    ):
+        response = await client.delete(f"/api/tasks/{task_id}/native-goal")
+
+    assert response.status_code == 200
+    assert response.json() == {"goal": None, "cancelled": True}
+    stop_goal_turn.assert_awaited_once()
+    clear_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-cancel",
+    )
+    verify_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-cancel",
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_task_wakes_dispatcher_after_commit(client):
     """New work should not wait for the dispatcher's 2-second safety poll."""
     from backend.main import dispatcher

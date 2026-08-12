@@ -1839,6 +1839,30 @@ class InstanceManager:
                 registry = self._ensure_codex_app_server_registry()
                 return await registry.read_thread(home, thread_id)
 
+    async def read_codex_thread_goal(
+        self, codex_home: str, thread_id: str,
+    ) -> dict | None:
+        """Read the persisted native Goal for one exact Codex thread."""
+
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.read_thread_goal(home, thread_id)
+
+    async def clear_codex_thread_goal(
+        self, codex_home: str, thread_id: str,
+    ) -> bool:
+        """Clear one idle native Goal after its Task turn has been stopped."""
+
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.clear_thread_goal(home, thread_id)
+
     @asynccontextmanager
     async def codex_thread_routing_guard(
         self,

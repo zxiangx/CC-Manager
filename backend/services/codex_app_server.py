@@ -1965,12 +1965,12 @@ class CodexAppServer:
             return response_turn_id
         raise CodexAppServerError("Could not adopt active native Goal turn")
 
-    async def _resume_paused_native_goal(
+    async def _resume_native_goal(
         self,
         context: _TurnContext,
         steer_input: list[dict[str, Any]],
     ) -> str:
-        """Reactivate one paused Goal and steer the pending user message.
+        """Reactivate one resumable Goal and steer the pending user message.
 
         Setting a persisted Goal back to ``active`` starts its continuation
         turn asynchronously.  Register the CCM owner before that request,
@@ -1982,7 +1982,7 @@ class CodexAppServer:
         started = context.goal_started_future
         if started is None:
             raise CodexAppServerError(
-                "Paused Codex Goal has no prepared start observer"
+                "Resumable Codex Goal has no prepared start observer"
             )
         response = await self._request(
             "thread/goal/set",
@@ -1991,7 +1991,7 @@ class CodexAppServer:
         goal = response.get("goal") if isinstance(response, dict) else None
         if not isinstance(goal, dict) or goal.get("status") != "active":
             raise CodexAppServerError(
-                "thread/goal/set did not reactivate the paused Codex Goal"
+                "thread/goal/set did not reactivate the resumable Codex Goal"
             )
 
         turn_id = context.turn_id
@@ -2743,7 +2743,7 @@ class CodexAppServer:
         # non-Goal active work remain fail-closed.
         thread_status_type = self._thread_status_type(thread.get("status"))
         adopt_active_goal = False
-        resume_paused_goal = False
+        resume_native_goal = False
         if thread_status_type != "idle":
             if (
                 resume_session_id
@@ -2776,14 +2776,14 @@ class CodexAppServer:
             and not disable_autonomous_features
             and not tools_disabled
         ):
-            # Stop intentionally pauses a native Goal. A later user message is
-            # an explicit continuation signal, so restore that same Goal
-            # rather than starting an unrelated regular turn and leaving the
-            # persisted objective stranded forever.
-            paused_goal = await self._read_thread_goal(str(thread_id))
-            resume_paused_goal = bool(
-                isinstance(paused_goal, dict)
-                and paused_goal.get("status") == "paused"
+            # Stop intentionally pauses a native Goal, while transient model
+            # failures can leave it blocked. Neither state is an explicit user
+            # cancellation: the next admitted message/retry must reactivate
+            # the same persisted objective instead of silently abandoning it.
+            resumable_goal = await self._read_thread_goal(str(thread_id))
+            resume_native_goal = bool(
+                isinstance(resumable_goal, dict)
+                and resumable_goal.get("status") in {"paused", "blocked"}
             )
         if (
             resume_session_id
@@ -2871,7 +2871,7 @@ class CodexAppServer:
             ),
             goal_started_future=(
                 asyncio.get_running_loop().create_future()
-                if resume_paused_goal
+                if resume_native_goal
                 else None
             ),
         )
@@ -3031,10 +3031,10 @@ class CodexAppServer:
             turn_process.admitted_turn_id = str(adopted_turn_id)
             return turn_process, thread_id
 
-        if resume_paused_goal:
+        if resume_native_goal:
             self._mark_following_native_goal(context)
             resume = asyncio.create_task(
-                self._resume_paused_native_goal(
+                self._resume_native_goal(
                     context,
                     list(turn_params["input"]),
                 ),
@@ -3053,13 +3053,13 @@ class CodexAppServer:
                 confirmed = await _settle_registry_cleanup(
                     self._cancel_resumed_native_goal(
                         context,
-                        "Codex paused Goal resume failed",
+                        "Codex resumable Goal resume failed",
                     )
                 )
                 if not confirmed:
                     raise _UnconfirmedTurnCancellation(
                         turn_process,
-                        "Codex paused Goal resume failed and its active "
+                        "Codex resumable Goal resume failed and its active "
                         "generation could not be stopped",
                     )
                 raise
@@ -3653,6 +3653,53 @@ class CodexAppServer:
             else None
         )
         return goal
+
+    async def read_thread_goal(
+        self,
+        thread_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one persisted native Goal without relying on chat history."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+        return await self._read_thread_goal(thread_id)
+
+    async def clear_thread_goal(
+        self,
+        thread_id: str,
+    ) -> bool:
+        """Clear one persisted native Goal and verify the authoritative state.
+
+        Active Goal turns must be interrupted through InstanceManager before
+        this method is called.  Keeping that lifecycle operation separate lets
+        the registry safely share one app-server transport across Tasks.
+        """
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+        if self.has_active_thread(thread_id):
+            raise CodexAppServerBusyError(
+                f"Codex thread {thread_id} still has an active CCM turn"
+            )
+        existing = await self._read_thread_goal(thread_id)
+        if existing is None:
+            return False
+        response = await self._request(
+            "thread/goal/clear",
+            {"threadId": thread_id},
+        )
+        if not isinstance(response, dict) or response.get("cleared") is not True:
+            raise CodexAppServerError(
+                f"thread/goal/clear did not confirm clearing {thread_id}"
+            )
+        remaining = await self._read_thread_goal(thread_id)
+        if remaining is not None:
+            raise CodexAppServerError(
+                f"Codex Goal still exists after clear for {thread_id}"
+            )
+        return True
 
     async def _require_no_resumable_thread_goal(
         self,
@@ -5175,6 +5222,96 @@ class CodexAppServerRegistry:
             self._starting[home] = starting - 1
         else:
             self._starting.pop(home, None)
+
+    async def _thread_goal_operation(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+        *,
+        clear: bool,
+    ) -> dict[str, Any] | None | bool:
+        """Reserve a native thread for one Goal snapshot or clear RPC."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        home = normalize_codex_home(codex_home)
+        token = object()
+        reserved_owner = False
+        async with self._lock:
+            if self._shutdown_requested or home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is unavailable: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._starting_threads or thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server = self._new_server(home)
+                self._servers[home] = server
+            if clear and server.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active CCM turn"
+                )
+            if owner is None:
+                self._thread_owners[thread_id] = home
+                reserved_owner = True
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        succeeded = False
+        try:
+            result = (
+                await server.clear_thread_goal(thread_id)
+                if clear
+                else await server.read_thread_goal(thread_id)
+            )
+            succeeded = True
+            return result
+        finally:
+            async def _release_goal_operation() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+                    if (
+                        reserved_owner
+                        and not succeeded
+                        and self._thread_owners.get(thread_id) == home
+                    ):
+                        self._thread_owners.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_goal_operation())
+
+    async def read_thread_goal(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> dict[str, Any] | None:
+        result = await self._thread_goal_operation(
+            codex_home,
+            thread_id,
+            clear=False,
+        )
+        return result if isinstance(result, dict) else None
+
+    async def clear_thread_goal(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> bool:
+        result = await self._thread_goal_operation(
+            codex_home,
+            thread_id,
+            clear=True,
+        )
+        return bool(result)
 
     async def read_thread(
         self,

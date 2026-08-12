@@ -23,6 +23,7 @@ import {
 } from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
+import { NativeGoalPanel } from './NativeGoalPanel';
 import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
@@ -2131,6 +2132,9 @@ function ChatRuntimeView({
             )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {task.provider === 'codex' && task.session_id && task.shared_from_id == null && (
+              <NativeGoalPanel taskId={task.id} onCancelled={() => onTaskUpdated?.()} />
+            )}
             <SubAgentIndicator
               taskId={task.id}
               count={monitorCount}

@@ -3248,14 +3248,17 @@ async def test_clear_thread_goal_is_idempotent_when_goal_is_absent():
 
 
 @pytest.mark.asyncio
-async def test_goal_continuation_rebinds_while_descendant_is_finishing():
-    """An older descendant guard must not drop the next Goal turn."""
+async def test_goal_continuation_waits_until_descendant_is_idle():
+    """A native Goal must not continue while an older child is active."""
 
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    goal_status = "active"
+
+    async def request(method, params):
+        nonlocal goal_status
         if method == "thread/start":
             return {
                 "thread": {
@@ -3266,7 +3269,10 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
         if method == "turn/start":
             return {"turn": {"id": "turn-goal-parent"}}
         if method == "thread/goal/get":
-            return {"goal": {"status": "complete"}}
+            return {"goal": {"status": goal_status}}
+        if method == "thread/goal/set":
+            goal_status = params["status"]
+            return {"goal": {"status": goal_status}}
         raise AssertionError(f"unexpected request: {method}")
 
     server._request = AsyncMock(side_effect=request)
@@ -3291,6 +3297,13 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
         "turnId": "turn-goal-parent",
         "goal": {"status": "active"},
     })
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if server._contexts_by_thread[
+            "thread-goal-descendant"
+        ].goal_paused_for_descendants:
+            break
+    assert goal_status == "paused"
     server._handle_notification("turn/completed", {
         "threadId": "thread-goal-descendant",
         "turn": {
@@ -3301,8 +3314,18 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
     })
 
     context = server._contexts_by_thread["thread-goal-descendant"]
-    assert context.turn_id is None
+    assert context.turn_id == "turn-goal-parent"
     assert "thread-goal-child" in context.active_descendant_thread_ids
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-goal-child",
+        "status": {"type": "idle"},
+    })
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if goal_status == "active" and context.turn_id is None:
+            break
+    assert goal_status == "active"
+    assert context.turn_id is None
 
     server._handle_notification("turn/started", {
         "threadId": "thread-goal-descendant",
@@ -3312,12 +3335,9 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
         "threadId": "thread-goal-descendant",
         "turnId": "turn-goal-next",
         "itemId": "continued-message",
-        "delta": "next turn was not dropped",
+        "delta": "next turn started after the child became idle",
     })
-    server._handle_notification("thread/status/changed", {
-        "threadId": "thread-goal-child",
-        "status": {"type": "idle"},
-    })
+    goal_status = "complete"
     server._handle_notification("thread/goal/updated", {
         "threadId": "thread-goal-descendant",
         "turnId": "turn-goal-next",
@@ -3341,10 +3361,90 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
     while line := await process.stdout.readline():
         rows.append(json.loads(line))
     assert any(
-        row.get("delta") == "next turn was not dropped"
+        row.get("delta") == "next turn started after the child became idle"
         for row in rows
     )
     assert sum(row.get("type") == "turn.completed" for row in rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_descendant_gate_does_not_resurrect_a_cleared_goal():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    goal: dict | None = {"status": "active"}
+
+    async def request(method, params):
+        nonlocal goal
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-goal-cancelled-at-gate",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-goal-cancelled-at-gate"}}
+        if method == "thread/goal/get":
+            return {"goal": goal}
+        if method == "thread/goal/set" and params["status"] == "paused":
+            goal = {"status": "paused"}
+            return {"goal": goal}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="goal that is cancelled while waiting",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=309,
+    )
+    server._handle_notification("thread/started", {
+        "thread": {
+            "id": "thread-cancelled-child",
+            "parentThreadId": "thread-goal-cancelled-at-gate",
+            "status": {"type": "active"},
+        },
+    })
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-cancelled-at-gate",
+        "turnId": "turn-goal-cancelled-at-gate",
+        "goal": {"status": "active"},
+    })
+    for _ in range(20):
+        await asyncio.sleep(0)
+        context = server._contexts_by_thread[
+            "thread-goal-cancelled-at-gate"
+        ]
+        if context.goal_paused_for_descendants:
+            break
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-goal-cancelled-at-gate",
+        "turn": {
+            "id": "turn-goal-cancelled-at-gate",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    goal = None
+    server._handle_notification("thread/goal/cleared", {
+        "threadId": "thread-goal-cancelled-at-gate",
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-cancelled-child",
+        "status": {"type": "idle"},
+    })
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    assert not any(
+        call.args[0] == "thread/goal/set"
+        and call.args[1].get("status") == "active"
+        for call in server._request.await_args_list
+    )
 
 
 @pytest.mark.asyncio

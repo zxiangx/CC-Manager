@@ -1748,6 +1748,62 @@ describe('ChatView', () => {
       });
     });
 
+    it('offers the same inline branch editor for an injected user message', async () => {
+      const task = makeTask({
+        id: 23,
+        description: null,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const injected: ChatMessage = {
+        id: 458,
+        event_type: 'user_message',
+        role: 'user',
+        content: 'old injected correction',
+        raw_content: 'old injected correction',
+        source: 'inject',
+        is_error: false,
+        timestamp: '2024-01-01T00:01:00Z',
+      };
+      const forked = makeTask({ id: 24, provider: 'codex', status: 'completed' });
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([injected]);
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
+      (api.selectMessageBranchSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        canonical_task_id: task.id,
+        active_task: forked,
+      });
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(await screen.findByText('old injected correction')).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', {
+        name: 'Edit this message in a new branch',
+      }));
+      const editor = screen.getByRole('textbox', { name: 'Edit message' });
+      await userEvent.clear(editor);
+      await userEvent.type(editor, 'new injected correction');
+      await userEvent.click(screen.getByRole('button', {
+        name: 'Send edited message',
+      }));
+
+      await waitFor(() => {
+        expect(api.forkTask).toHaveBeenCalledWith(
+          task.id,
+          { type: 'user_message', id: injected.id },
+          undefined,
+          true,
+        );
+        expect(api.sendTaskChat).toHaveBeenCalledWith(
+          forked.id,
+          'new injected correction',
+          undefined,
+          undefined,
+          null,
+          expect.objectContaining({ provider: 'codex' }),
+        );
+      });
+    });
+
     it('retries a failed edited-message send without creating another fork', async () => {
       const task = makeTask({
         id: 23,

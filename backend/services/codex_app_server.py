@@ -600,6 +600,10 @@ class _TurnContext:
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
     deferred_terminal_notification: dict[str, Any] | None = None
+    goal_descendant_gate_lock: asyncio.Lock | None = None
+    goal_descendant_gate_changed: asyncio.Event | None = None
+    goal_descendant_gate_task: asyncio.Task | None = None
+    goal_paused_for_descendants: bool = False
     following_native_goal: bool = False
     pending_goal_terminal_notification: dict[str, Any] | None = None
     goal_terminal_generation: int = 0
@@ -766,6 +770,17 @@ class CodexAppServer:
         for goal_task in goal_tasks:
             if goal_task is not current_task and not goal_task.done():
                 goal_task.cancel()
+        gate_task = getattr(context, "goal_descendant_gate_task", None)
+        context.goal_descendant_gate_task = None
+        if (
+            gate_task is not None
+            and gate_task is not current_task
+            and not gate_task.done()
+        ):
+            gate_task.cancel()
+        gate_changed = getattr(context, "goal_descendant_gate_changed", None)
+        if gate_changed is not None:
+            gate_changed.set()
         state_changed = getattr(context, "descendant_state_changed", None)
         if state_changed is not None:
             state_changed.set()
@@ -992,6 +1007,7 @@ class CodexAppServer:
             return
         context.active_descendant_thread_ids.add(thread_id)
         self._signal_descendant_state_change(context)
+        self._schedule_goal_descendant_gate(context)
 
     def _mark_descendant_terminal(
         self,
@@ -1000,6 +1016,145 @@ class CodexAppServer:
     ) -> None:
         context.active_descendant_thread_ids.discard(thread_id)
         self._signal_descendant_state_change(context)
+        self._schedule_goal_descendant_gate(context)
+
+    def _schedule_goal_descendant_gate(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Reconcile the native Goal with whole-lineage quiescence."""
+
+        if not self._context_is_current(context) or context.tools_disabled:
+            return
+        changed = context.goal_descendant_gate_changed
+        if changed is None:
+            changed = asyncio.Event()
+            context.goal_descendant_gate_changed = changed
+        changed.set()
+        task = context.goal_descendant_gate_task
+        if task is None or task.done():
+            context.goal_descendant_gate_task = asyncio.create_task(
+                self._run_goal_descendant_gate(context),
+            )
+
+    async def _run_goal_descendant_gate(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Pause while descendants work, then let Codex continue once idle."""
+
+        changed = context.goal_descendant_gate_changed
+        if changed is None:
+            changed = asyncio.Event()
+            context.goal_descendant_gate_changed = changed
+        try:
+            while self._context_is_current(context):
+                changed.clear()
+                try:
+                    await self._reconcile_goal_descendant_gate(context)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A failed pause cannot be treated as permission to let a
+                    # new root turn overlap live descendants. Keep the exact
+                    # owner and retry the gate until the protocol answers.
+                    logger.exception(
+                        "Could not reconcile native Goal descendant gate; "
+                        "retaining owner and retrying task=%s thread=%s",
+                        context.task_id,
+                        context.thread_id,
+                    )
+                    try:
+                        await asyncio.sleep(_GOAL_RECONCILE_INTERVAL)
+                    except asyncio.CancelledError:
+                        raise
+                    changed.set()
+                # Close the clear/reconcile race without keeping a permanent
+                # background task per turn.
+                await asyncio.sleep(0)
+                if not changed.is_set():
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            if context.goal_descendant_gate_task is asyncio.current_task():
+                context.goal_descendant_gate_task = None
+
+    async def _reconcile_goal_descendant_gate(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Make native auto-continuation wait for every child thread."""
+
+        lock = context.goal_descendant_gate_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            context.goal_descendant_gate_lock = lock
+        async with lock:
+            if not self._context_is_current(context):
+                return
+
+            runtime = self._runtime_state_for(context.thread_id)
+            if context.active_descendant_thread_ids:
+                if (
+                    runtime.goal_status != "active"
+                    or context.goal_paused_for_descendants
+                ):
+                    return
+                response = await self._request(
+                    "thread/goal/set",
+                    {"threadId": context.thread_id, "status": "paused"},
+                )
+                goal = response.get("goal") if isinstance(response, dict) else None
+                if not isinstance(goal, dict) or goal.get("status") != "paused":
+                    raise CodexAppServerError(
+                        "Codex did not pause Goal at the descendant gate"
+                    )
+                context.goal_paused_for_descendants = True
+                runtime.goal_status = "paused"
+                context.process.feed({
+                    "type": "system_event",
+                    "content": "Goal 正在等待子 Agent 全部停止后再继续",
+                    "native_goal_status": "paused",
+                    "thread_id": context.thread_id,
+                })
+                return
+
+            if not context.goal_paused_for_descendants:
+                return
+
+            # A user cancellation wins over CCM's temporary gate. Never turn
+            # a cleared or otherwise terminal Goal active again.
+            goal = await self._read_thread_goal(context.thread_id)
+            if not isinstance(goal, dict) or goal.get("status") != "paused":
+                context.goal_paused_for_descendants = False
+                if context.deferred_terminal_notification is not None:
+                    params = context.deferred_terminal_notification
+                    context.deferred_terminal_notification = None
+                    self._publish_turn_context_terminal(context, params)
+                return
+
+            # If the root already completed, release its identity before the
+            # set-active RPC. Codex may publish turn/started immediately.
+            if context.deferred_terminal_notification is not None:
+                params = context.deferred_terminal_notification
+                context.deferred_terminal_notification = None
+                context.goal_terminal_generation += 1
+                context.pending_goal_terminal_notification = dict(params)
+                self._reset_goal_turn_identity(context)
+                self._mark_following_native_goal(context)
+
+            response = await self._request(
+                "thread/goal/set",
+                {"threadId": context.thread_id, "status": "active"},
+            )
+            resumed = response.get("goal") if isinstance(response, dict) else None
+            if not isinstance(resumed, dict) or resumed.get("status") != "active":
+                raise CodexAppServerError(
+                    "Codex did not resume Goal after descendants became idle"
+                )
+            context.goal_paused_for_descendants = False
+            runtime.goal_status = "active"
 
     def _contexts_tracking_descendant(
         self,
@@ -1515,6 +1670,12 @@ class CodexAppServer:
                         and context.deferred_terminal_notification is not None
                         and not context.active_descendant_thread_ids
                     ):
+                        await self._reconcile_goal_descendant_gate(context)
+                    if (
+                        self._context_is_current(context)
+                        and context.deferred_terminal_notification is not None
+                        and not context.active_descendant_thread_ids
+                    ):
                         params = context.deferred_terminal_notification
                         context.deferred_terminal_notification = None
                         self._finish_turn_context(context, params)
@@ -1571,24 +1732,10 @@ class CodexAppServer:
                 context.turn_id,
             )
             return
-        turn = params.get("turn") or {}
-        runtime = self._thread_runtime.get(context.thread_id)
-        goal_may_continue = bool(
-            context.following_native_goal
-            or (
-                runtime is not None
-                and runtime.goal_status == "active"
-            )
-        )
-        if turn.get("status", "completed") == "completed" and goal_may_continue:
-            # Goal continuation is allowed as soon as the root thread is idle,
-            # even while native descendants from the older turn are still
-            # winding down. Release the completed root identity now so its
-            # next turn can bind without dropping early output. The newer turn
-            # invalidates this older deferred terminal below, while descendant
-            # ownership remains attached to the shared context.
-            self._reset_goal_turn_identity(context)
-            self._mark_following_native_goal(context)
+        # Keep the completed root identity fenced until every descendant is
+        # idle. The Goal gate pauses native auto-continuation while children
+        # are active and releases this identity immediately before resuming.
+        self._schedule_goal_descendant_gate(context)
         guard = context.descendant_guard_task
         if guard is None or guard.done():
             context.descendant_guard_task = asyncio.create_task(
@@ -4408,6 +4555,12 @@ class CodexAppServer:
             )
             self._runtime_state_for(thread_id_str).goal_status = goal_status
             context = self._contexts_by_thread.get(thread_id_str)
+            if (
+                context is not None
+                and goal_status == "active"
+                and context.active_descendant_thread_ids
+            ):
+                self._schedule_goal_descendant_gate(context)
             if context is not None and not params.get("turnId"):
                 self._finish_retained_goal_if_terminal(
                     context,

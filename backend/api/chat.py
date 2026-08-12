@@ -346,14 +346,109 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
     return uploads
 
 
+def _is_ordinary_user_message(row: LogEntry) -> bool:
+    """Whether a row starts a normal human/model turn."""
+
+    return (
+        row.event_type == "user_message"
+        and row.role == "user"
+        and not _raw_log_metadata(row).get("source")
+    )
+
+
 def _is_forkable_user_message(row: LogEntry) -> bool:
-    """Only ordinary human follow-up messages are precise fork boundaries."""
+    """Human messages editable through a safe native turn boundary."""
 
     if row.event_type != "user_message" or row.role != "user":
         return False
-    # Injected text belongs to the middle of an active native turn. Monitor,
-    # sub-agent, and other sourced messages are likewise not human turn starts.
-    return not _raw_log_metadata(row).get("source")
+    # Monitor and sub-agent messages are generated control traffic. A human
+    # injection is editable, but it needs the containing-turn replay path
+    # below because it is not itself a native turn boundary.
+    return _raw_log_metadata(row).get("source") in {None, "inject"}
+
+
+def _resolve_injected_fork_turn(
+    *,
+    anchor: ForkAnchor,
+    rows: list[LogEntry],
+    turns: list[dict],
+    index: "_ForkTurnIndex | None" = None,
+) -> tuple[str, int, list[str]]:
+    """Resolve an injected steer by replaying its containing turn inputs."""
+
+    resolved_index = index or _build_fork_turn_index(rows, turns)
+    selected_index = resolved_index.row_index.get(anchor.id)
+    if selected_index is None:
+        raise HTTPException(404, "Fork anchor message not found")
+    selected = rows[selected_index]
+    if _raw_log_metadata(selected).get("source") != "inject":
+        raise HTTPException(400, "Fork anchor is not an injected user message")
+
+    segment_start = 0
+    for position in range(selected_index - 1, -1, -1):
+        if _is_ordinary_user_message(rows[position]):
+            segment_start = position
+            break
+    segment_end = len(rows)
+    for position in range(selected_index + 1, len(rows)):
+        if _is_ordinary_user_message(rows[position]):
+            segment_end = position
+            break
+
+    segment_turn_ids: list[str] = []
+    terminal_turn_ids: list[str] = []
+    for candidate in rows[segment_start:segment_end]:
+        candidate_turn_id = resolved_index.row_turns.get(candidate.id)
+        if not candidate_turn_id:
+            continue
+        segment_turn_ids.append(candidate_turn_id)
+        raw = _raw_log_metadata(candidate)
+        if raw.get("type") in {"turn.completed", "turn.failed"}:
+            terminal_turn_ids.append(candidate_turn_id)
+    unique_terminal_ids = list(dict.fromkeys(terminal_turn_ids))
+    unique_segment_ids = list(dict.fromkeys(segment_turn_ids))
+    if len(unique_terminal_ids) == 1:
+        containing_turn_id = unique_terminal_ids[0]
+    elif not unique_terminal_ids and len(unique_segment_ids) == 1:
+        containing_turn_id = unique_segment_ids[0]
+    else:
+        raise HTTPException(
+            409,
+            "This injected message cannot be mapped safely to one Codex turn",
+        )
+
+    containing_index = resolved_index.turn_index[containing_turn_id]
+    if containing_index == 0:
+        raise HTTPException(
+            409,
+            "There is no completed Codex turn before this injected message",
+        )
+    previous = turns[containing_index - 1]
+    status = str(previous.get("status") or "")
+    if status in {"inProgress", "in_progress", "running"}:
+        raise HTTPException(409, "The preceding Codex turn is still running")
+
+    replay_prefix: list[str] = []
+    for candidate in rows[segment_start:selected_index]:
+        if not (
+            _is_ordinary_user_message(candidate)
+            or _raw_log_metadata(candidate).get("source") == "inject"
+        ):
+            continue
+        raw = _raw_log_metadata(candidate)
+        content = str(raw.get("raw_content") or candidate.content or "").strip()
+        if content:
+            replay_prefix.append(content)
+    if not replay_prefix:
+        raise HTTPException(
+            409,
+            "The original turn input for this injected message is unavailable",
+        )
+    return (
+        str(previous.get("id") or ""),
+        selected.id - 1,
+        replay_prefix,
+    )
 
 
 def _resolve_fork_turn(
@@ -391,7 +486,7 @@ def _resolve_fork_turn(
         segment_turn_ids: list[str] = []
         terminal_turn_ids: list[str] = []
         for candidate in rows[selected_index + 1:]:
-            if _is_forkable_user_message(candidate):
+            if _is_ordinary_user_message(candidate):
                 break
             candidate_turn_id = row_turns.get(candidate.id)
             if not candidate_turn_id:
@@ -1055,6 +1150,14 @@ async def send_chat_message(
         await _validate_chat_command_admission(task, command, db)
 
     command_skills: dict | None = None
+    replay_prefix = (
+        (task.metadata_ or {}).get("fork_seed_replay_prefix") or []
+    )
+    if not (
+        isinstance(replay_prefix, list)
+        and all(isinstance(item, str) and item.strip() for item in replay_prefix)
+    ):
+        replay_prefix = []
 
     # Keep sender identity presentation-only.  The raw text is what the model
     # receives; the prefixed form is only stored/broadcast for the chat UI.
@@ -1067,7 +1170,19 @@ async def send_chat_message(
     # Explicit commands append their invocation instructions. Permanently
     # enabled skills are advertised by the launch-time skill directory; merely
     # enabling one must not be represented as a fresh user invocation.
-    prompt_parts = [model_message]
+    if replay_prefix:
+        replay_lines = "\n\n".join(
+            f"{index}. {item.strip()}"
+            for index, item in enumerate(replay_prefix, start=1)
+        )
+        prompt_parts = [
+            "这是从被编辑的中途注入所在 turn 开头重放的用户指令：\n"
+            f"{replay_lines}\n\n"
+            "下面是用户修改后的中途补充指令，请按它修正并继续：\n"
+            f"{model_message}"
+        ]
+    else:
+        prompt_parts = [model_message]
     if command:
         # $command detected: inject command prompt and set temporary skills
         prompt_parts.append(command.prompt_template)
@@ -1118,6 +1233,12 @@ async def send_chat_message(
     )
     db.add(user_log)
     await _bind_pending_message_branch(db, task, user_log, log_metadata)
+    if replay_prefix:
+        metadata = deepcopy(task.metadata_ or {})
+        metadata.pop("fork_seed_replay_prefix", None)
+        task.metadata_ = metadata
+        flag_modified(task, "metadata_")
+        log_metadata["replayed_injected_turn_inputs"] = len(replay_prefix)
     user_log.raw_json = json.dumps(log_metadata) if log_metadata else None
     await db.commit()
 
@@ -1165,7 +1286,7 @@ async def list_codex_fork_anchors(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """List ordinary user follow-ups that can serve as fork boundaries."""
+    """List human messages that can serve as editable fork anchors."""
 
     source = await db.get(Task, task_id)
     if not source:
@@ -1260,6 +1381,7 @@ async def fork_codex_task(
     rows = await _task_log_rows(db, task_id)
     selected: LogEntry | None = None
     seed_message: str | None = None
+    seed_replay_prefix: list[str] = []
     selected_metadata: dict = {}
     if body.anchor.type == "initial":
         if not source.description:
@@ -1276,7 +1398,7 @@ async def fork_codex_task(
         if not _is_forkable_user_message(selected):
             raise HTTPException(
                 400,
-                "Fork anchors must be ordinary user messages, not injected or generated events",
+                "Fork anchors must be human user messages",
             )
         selected_metadata = _raw_log_metadata(selected)
         seed_message = (
@@ -1339,12 +1461,27 @@ async def fork_codex_task(
             if body.anchor.type == "latest":
                 last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
             else:
-                last_turn_id, cutoff = await asyncio.to_thread(
-                    _resolve_fork_turn,
-                    anchor=native_anchor,
-                    rows=native_rows,
-                    turns=turns,
+                native_selected = next(
+                    row for row in native_rows if row.id == native_anchor.id
                 )
+                if _raw_log_metadata(native_selected).get("source") == "inject":
+                    (
+                        last_turn_id,
+                        cutoff,
+                        seed_replay_prefix,
+                    ) = await asyncio.to_thread(
+                        _resolve_injected_fork_turn,
+                        anchor=native_anchor,
+                        rows=native_rows,
+                        turns=turns,
+                    )
+                else:
+                    last_turn_id, cutoff = await asyncio.to_thread(
+                        _resolve_fork_turn,
+                        anchor=native_anchor,
+                        rows=native_rows,
+                        turns=turns,
+                    )
                 # The native cutoff belongs to the owning ancestor.  Display
                 # history is always copied from the Task the user actually
                 # opened and stops immediately before its selected message.
@@ -1384,10 +1521,15 @@ async def fork_codex_task(
                 body.anchor.id if body.anchor.type == "user_message" else None
             )
             metadata["fork_seed_uploads"] = _fork_seed_uploads(selected_metadata)
+            if seed_replay_prefix:
+                metadata["fork_seed_replay_prefix"] = seed_replay_prefix
+            else:
+                metadata.pop("fork_seed_replay_prefix", None)
         else:
             metadata.pop("fork_seed_message", None)
             metadata.pop("fork_seed_log_id", None)
             metadata.pop("fork_seed_uploads", None)
+            metadata.pop("fork_seed_replay_prefix", None)
         if body.anchor.type == "initial":
             # The empty native thread has not consumed the initial prompt or
             # its files yet. Keep them only in the editable seed composer.

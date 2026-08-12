@@ -105,8 +105,10 @@ async def test_codex_fork_starts_before_selected_user_message(
         db.add_all([first, anchor, second, injected, later_user, later_answer])
         await db.commit()
         await db.refresh(anchor)
+        await db.refresh(injected)
         await db.refresh(later_user)
         anchor_id = anchor.id
+        injected_id = injected.id
         later_user_id = later_user.id
 
     history = await client.get(f"/api/tasks/{task_id}/chat/history")
@@ -138,6 +140,7 @@ async def test_codex_fork_starts_before_selected_user_message(
         ("latest", None, "完整复制当前上下文"),
         ("initial", None, "initial prompt"),
         ("user_message", anchor_id, "fork here"),
+        ("user_message", injected_id, "mid-turn steer"),
         ("user_message", later_user_id, "do not copy"),
     ]
 
@@ -335,6 +338,123 @@ async def test_edited_message_fork_keeps_both_contexts_and_binds_new_message(
     assert (await client.get(
         "/api/tasks/count?include_archived=true"
     )).json() == {"total": 1}
+
+
+@pytest.mark.asyncio
+async def test_edited_injection_replays_containing_turn_inputs(
+    client, session_factory,
+):
+    created = await client.post("/api/tasks", json={
+        "title": "Injected edit",
+        "description": "initial",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    source_id = created.json()["id"]
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+        source.status = "completed"
+        source.session_id = "thread-injected"
+        source.last_cwd = "/tmp/project"
+        rows = [
+            LogEntry(
+                instance_id=1, task_id=source_id, event_type="message",
+                role="assistant", content="first answer", is_error=False,
+                raw_json='{"item_id":"item-1","turn_id":"turn-1"}',
+            ),
+            LogEntry(
+                instance_id=1, task_id=source_id,
+                event_type="user_message", role="user",
+                content="run the audit", is_error=False,
+                raw_json='{"raw_content":"run the audit"}',
+            ),
+            LogEntry(
+                instance_id=1, task_id=source_id, event_type="message",
+                role="assistant", content="audit in progress", is_error=False,
+                raw_json='{"item_id":"item-2","turn_id":"turn-2"}',
+            ),
+            LogEntry(
+                instance_id=1, task_id=source_id,
+                event_type="user_message", role="user",
+                content="only inspect service A", is_error=False,
+                raw_json=(
+                    '{"source":"inject","raw_content":'
+                    '"only inspect service A"}'
+                ),
+            ),
+            LogEntry(
+                instance_id=1, task_id=source_id, event_type="system_event",
+                role="system", content="turn done", is_error=False,
+                raw_json='{"type":"turn.completed","turn_id":"turn-2"}',
+            ),
+        ]
+        db.add_all(rows)
+        await db.commit()
+        await db.refresh(rows[3])
+        injected_id = rows[3].id
+
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
+    ]
+    with (
+        patch(
+            "backend.api.chat._codex_fork_home",
+            return_value=("/tmp/codex-home", "codex-a"),
+        ),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-injected", "turns": turns}),
+        ),
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-injected-edit"}),
+        ) as fork_thread,
+    ):
+        response = await client.post(
+            f"/api/tasks/{source_id}/fork",
+            json={
+                "anchor": {"type": "user_message", "id": injected_id},
+                "message_branch": True,
+            },
+        )
+    assert response.status_code == 201, response.text
+    forked = response.json()
+    assert forked["metadata_"]["fork_seed_message"] == "only inspect service A"
+    assert forked["metadata_"]["fork_seed_replay_prefix"] == ["run the audit"]
+    fork_thread.assert_awaited_once_with(
+        "/tmp/codex-home",
+        "thread-injected",
+        last_turn_id="turn-1",
+    )
+
+    with patch(
+        "backend.main.dispatcher.enqueue_message",
+        new=AsyncMock(),
+    ) as enqueue:
+        sent = await client.post(
+            f"/api/tasks/{forked['id']}/chat",
+            json={"message": "inspect services A and B"},
+        )
+    assert sent.status_code == 200, sent.text
+    native_prompt = enqueue.await_args.kwargs["prompt"]
+    assert "run the audit" in native_prompt
+    assert "inspect services A and B" in native_prompt
+
+    async with session_factory() as db:
+        persisted = await db.get(Task, forked["id"])
+        assert "fork_seed_replay_prefix" not in (persisted.metadata_ or {})
+        edited_row = (await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == forked["id"],
+                LogEntry.event_type == "user_message",
+            ).order_by(LogEntry.id.desc()).limit(1)
+        )).scalar_one()
+        assert edited_row.content == "inspect services A and B"
+        assert json.loads(edited_row.raw_json)[
+            "replayed_injected_turn_inputs"
+        ] == 1
 
 
 @pytest.mark.asyncio

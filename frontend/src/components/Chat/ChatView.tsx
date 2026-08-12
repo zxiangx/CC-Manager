@@ -2277,7 +2277,7 @@ function ChatRuntimeView({
                 “完整复制”会保留最后一个已完成 turn 的全部上下文；选择用户消息则从该消息之前分叉，并把消息预填到输入框中。
               </p>
               <p className="text-xs text-amber-400/90">
-                注入消息属于运行中 turn，无法作为精确边界，因此不会出现在列表中。两个 Task 仍使用同一工作目录。
+                注入消息会从它所在 turn 的开头重放，再用编辑后的内容替换原注入；两个 Task 仍使用同一工作目录。
               </p>
               <div className="space-y-1.5">
                 {forkAnchorsLoading && (
@@ -2661,7 +2661,7 @@ function ChatRuntimeView({
                 && group.message.persisted === true
                 && group.message.event_type === 'user_message'
                 && group.message.role === 'user'
-                && !group.message.source
+                && (!group.message.source || group.message.source === 'inject')
               }
               editingBranch={editingMessageKey === `message-${group.message.id}`}
               editDraft={editingMessageDraft}
@@ -4062,7 +4062,7 @@ const MessageBubble = memo(function MessageBubble({
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} />}
           {message.content && <MessageCopyButton text={isUser ? (message.raw_content ?? stripSenderPrefix(message.content)) : message.content} />}
-          {isUser && !message.source && (
+          {isUser && (!message.source || message.source === 'inject') && (
             <MessageBranchControls
               branch={branch}
               canEdit={canEditBranch}

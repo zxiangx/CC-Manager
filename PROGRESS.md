@@ -1036,3 +1036,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **公式修复**：模型输出 `# \\[`、`### $$` 时，Markdown 会把 opener 解析成 heading、把公式主体拆到后续节点。统一 math remark 插件现在只对“纯 opener heading + 匹配闭合正文”的严格 AST 形态合并为 display math；真实标题、行内公式、代码、链接和 HTML 仍保持原语义。
 - **排序修复**：默认自动模式不再按打开时间或遗留 `sort_order` 排序，而是在标星分组内按最后一条非空 user/assistant message 倒序；同一 Session 的所有隐藏编辑分支聚合到 canonical Task。关闭自动模式后仍保留手动拖拽排序。生产 2GB SQLite 数据只读实测采用 task-id 索引的查询约 95ms，避免按 event type 扫描整库。
 - **验证**：排序相关后端完整矩阵 `211 passed`；前端全量 `42 files / 568 tests`（TZ=UTC）、production build及改动文件 ESLint通过，`git diff --check` 通过。
+
+### 2026-08-13 — Goal 空闲门控与注入消息编辑（commit cd3c014a）
+
+- **Goal 修正**：CCM 不再在根回合结束但子 Agent 仍运行时释放 Goal 续跑条件；存在任何活跃后代时临时暂停原生 Goal，整条 lineage 真正空闲后才恢复。用户在等待期间清除或结束 Goal 时不会被后台门控重新激活，真正发起后续回合的仍是 Codex 原生 Goal runtime。
+- **注入消息编辑**：Codex 运行中通过 steer 注入的用户消息现在与普通消息一样显示编辑与分支切换入口。由于 Codex 只支持按已完成 turn fork，CCM 会精确定位包含该注入的 turn，从前一已完成 turn 建立隐藏分支，并一次性回放该 turn 中注入点之前的用户输入；持久日志和界面仅保存、显示修改后的消息，旧分支仍可左右切回。
+- **边界与验证**：Monitor、子 Agent、系统生成消息仍不可编辑；注入定位不唯一或缺少安全前驱时返回 409，避免错误 context。Codex app-server/chat 定向后端 `262 passed`，ChatView `116 passed`，TypeScript 检查、production build 与 `git diff --check` 通过。

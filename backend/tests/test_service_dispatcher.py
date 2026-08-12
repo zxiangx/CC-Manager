@@ -8399,6 +8399,63 @@ async def test_codex_pr_review_relaunch_uses_fresh_thread_and_full_snapshot_prom
 
 
 @pytest.mark.asyncio
+async def test_codex_capacity_retry_is_iterative_and_unbounded(
+    db_factory,
+    monkeypatch,
+):
+    """Capacity retries continue past the generic budget without recursion."""
+    dispatcher = _make_dispatcher(db_factory)
+    task = Task(
+        id=913,
+        title="capacity wait",
+        provider="codex",
+        model="gpt-5.6-sol",
+        session_id="thread-capacity",
+    )
+    generation = MagicMock()
+    dispatcher._task_claim_is_active = AsyncMock(return_value=True)
+    dispatcher._read_owned_lifecycle_task = AsyncMock(return_value=task)
+    dispatcher._collect_failure_output = AsyncMock(side_effect=[
+        "Selected model is at capacity. Please try a different model.",
+        "Selected model is at capacity. Please try a different model.",
+    ])
+    dispatcher._relaunch_and_wait = AsyncMock(side_effect=[1, 0])
+    dispatcher._complete_owned_task = AsyncMock(return_value=True)
+    dispatcher.instance_manager.get_config_dir = MagicMock(
+        return_value="/tmp/codex-home",
+    )
+    dispatcher.instance_manager.transient_error_seen = MagicMock(
+        side_effect=[True, False],
+    )
+    dispatcher.instance_manager.codex_capacity_error_seen = MagicMock(
+        return_value=True,
+    )
+    monkeypatch.setattr("backend.config.settings.transient_retry_max", 1)
+    monkeypatch.setattr(
+        "backend.config.settings.codex_capacity_retry_delay", 60.0,
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("backend.services.dispatcher.asyncio.sleep", sleep)
+
+    await dispatcher._run_transient_retry(
+        3,
+        task,
+        generation,
+        "/tmp/repo",
+        None,
+    )
+
+    assert dispatcher._relaunch_and_wait.await_count == 2
+    assert sleep.await_count == 2
+    assert all(call.args == (60.0,) for call in sleep.await_args_list)
+    events = [call.args[1] for call in dispatcher.broadcaster.broadcast.await_args_list]
+    assert [event["attempt"] for event in events] == [1, 2]
+    assert all(event["max_attempts"] == 0 for event in events)
+    assert all(event["unbounded"] is True for event in events)
+    dispatcher._complete_owned_task.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_build_task_prompt_invokes_explicit_initial_command(
     db_factory,
     monkeypatch,

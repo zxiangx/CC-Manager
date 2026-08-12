@@ -283,6 +283,11 @@ _CODEX_TRANSIENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CODEX_CAPACITY_RE = re.compile(
+    r"selected model is at capacity",
+    re.IGNORECASE,
+)
+
 
 def is_codex_usage_limited(text: str) -> bool:
     if not text:
@@ -308,6 +313,19 @@ def is_codex_transient(text: str) -> bool:
     if is_codex_usage_limited(text) or is_codex_auth_failure(text):
         return False
     return bool(_CODEX_TRANSIENT_RE.search(text))
+
+
+def is_codex_capacity_error(text: str) -> bool:
+    """Return whether Codex rejected the turn solely for model capacity.
+
+    Capacity is a special transient class: unlike a bounded transport retry,
+    waiting is always preferable to failing the user's task.  Keep this
+    detector narrow so auth, quota, and generic 429/5xx failures retain their
+    existing bounded behavior.
+    """
+    if not text:
+        return False
+    return bool(_CODEX_CAPACITY_RE.search(text))
 
 
 def is_transient_for(provider: str | None, text: str) -> bool:

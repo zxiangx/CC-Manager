@@ -9781,6 +9781,45 @@ async def test_process_event_sets_transient_flag_on_overload_error(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_process_event_sets_exact_codex_capacity_flag(db_factory):
+    async with db_factory() as db:
+        inst = Instance(name="codex-capacity-inst")
+        task = Task(title="t", description="d", provider="codex")
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id, task_id = inst.id, task.id
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im._launch_params[inst_id] = {"provider": "codex"}
+
+    await im._process_event(inst_id, task_id, {
+        "event_type": "system_event",
+        "role": "assistant",
+        "content": "Selected model is at capacity. Please try a different model.",
+        "is_error": True,
+        "raw_json": "{}",
+    })
+
+    assert im.transient_error_seen(inst_id) is True
+    assert im.codex_capacity_error_seen(inst_id) is True
+
+    # Replayed errors from an older turn cannot contaminate this exact flag.
+    im._codex_capacity_seen.clear()
+    await im._process_event(inst_id, task_id, {
+        "event_type": "system_event",
+        "role": "assistant",
+        "content": "Selected model is at capacity. Please try a different model.",
+        "is_error": True,
+        "orphan": True,
+        "raw_json": "{}",
+    })
+    assert im.codex_capacity_error_seen(inst_id) is False
+
+
+@pytest.mark.asyncio
 async def test_process_event_usage_limit_does_not_set_transient_flag(db_factory):
     """A genuine usage-limit banner must rotate, not set the transient flag."""
     async with db_factory() as db:
@@ -9930,12 +9969,14 @@ async def test_launch_resets_transient_flag(db_factory):
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
     im._transient_seen.add(inst_id)  # pretend prior turn hit overload
+    im._codex_capacity_seen.add(inst_id)
 
     with patch("backend.services.instance_manager.asyncio.create_subprocess_exec",
                new_callable=AsyncMock, return_value=mock_proc):
         await im.launch(instance_id=inst_id, prompt="hi", cwd="/tmp")
 
     assert im.transient_error_seen(inst_id) is False
+    assert im.codex_capacity_error_seen(inst_id) is False
     await asyncio.sleep(0.1)
 
 

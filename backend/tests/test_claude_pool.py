@@ -15,6 +15,7 @@ from backend.services.claude_pool import (
     is_auth_failure,
     is_pool_rotatable,
     is_transient_overload,
+    is_codex_capacity_error,
     transient_retry_delay,
     migrate_session,
     migrate_session_async,
@@ -1276,6 +1277,13 @@ class TestCodexTransientDetection:
 
     def test_server_overloaded(self):
         assert is_codex_transient("Selected model is at capacity. Please try a different model.")
+        assert is_codex_capacity_error(
+            "Selected model is at capacity. Please try a different model."
+        )
+
+    def test_capacity_detector_does_not_match_other_transients(self):
+        assert not is_codex_capacity_error("request timed out")
+        assert not is_codex_capacity_error("unexpected status 429 Too Many Requests")
 
     def test_unexpected_status_429(self):
         assert is_codex_transient("unexpected status 429 Too Many Requests: rate limited")
@@ -1483,6 +1491,28 @@ class TestChatTransientRetryCodex:
         im.launch.assert_awaited_once()
         assert im.launch.await_args.kwargs["provider"] == "codex"
         assert im.launch.await_args.kwargs["resume_session_id"] == "thread-1"
+
+    @pytest.mark.asyncio
+    async def test_codex_capacity_retry_ignores_generic_attempt_limit(self, monkeypatch):
+        im = self._im(
+            "codex",
+            "Selected model is at capacity. Please try a different model.",
+            monkeypatch,
+        )
+        monkeypatch.setattr("backend.config.settings.transient_retry_max", 1)
+        monkeypatch.setattr(
+            "backend.config.settings.codex_capacity_retry_delay", 0.01,
+        )
+        im._transient_attempts[1] = 99
+
+        ok = await im._try_chat_transient_retry(1, 42, 1, "")
+
+        assert ok is True
+        im.launch.assert_awaited_once()
+        event = im.broadcaster.broadcast.await_args.args[1]
+        assert event["attempt"] == 100
+        assert event["max_attempts"] == 0
+        assert event["unbounded"] is True
 
     @pytest.mark.asyncio
     async def test_claude_wording_does_not_trigger_codex_retry(self, monkeypatch):

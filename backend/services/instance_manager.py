@@ -321,6 +321,7 @@ class InstanceManager:
         # _process_event. The reliable signal in PTY mode, where the aborted
         # turn still reports exit_code 0.
         self._transient_seen: set[int] = set()
+        self._codex_capacity_seen: set[int] = set()
         # PTY rate-limit detection: instance_ids whose current turn saw an
         # actionable rate_limit_event. Turn-scoped: reset at launch(), checked
         # after _wait_process in the chat path so dispatcher can rotate.
@@ -997,6 +998,7 @@ class InstanceManager:
 
         # New turn → clear per-turn flags.
         self._transient_seen.discard(instance_id)
+        self._codex_capacity_seen.discard(instance_id)
         self._pty_rate_limit_seen.discard(instance_id)
         self._pty_rate_limit_info.pop(instance_id, None)
         self._effective_exit_codes.pop(instance_id, None)
@@ -6599,7 +6601,7 @@ class InstanceManager:
                 return False
 
             from backend.services.claude_pool import (
-                is_transient_for, transient_retry_delay,
+                is_codex_capacity_error, is_transient_for, transient_retry_delay,
                 collect_process_output_for_detection,
             )
 
@@ -6607,6 +6609,16 @@ class InstanceManager:
             provider = (params.get("provider") or "claude").lower()
             log_contents = await self.get_recent_log_contents(task_id, limit=10)
             combined = collect_process_output_for_detection(stderr_text, log_contents)
+            capacity_evidence = stderr_text or (
+                log_contents[0] if log_contents else ""
+            )
+            capacity_retry = (
+                provider == "codex"
+                and (
+                    self.codex_capacity_error_seen(instance_id)
+                    or is_codex_capacity_error(capacity_evidence)
+                )
+            )
             if not (
                 is_transient_for(provider, combined)
                 or self.is_cloudrouter_transient(
@@ -6619,7 +6631,7 @@ class InstanceManager:
                 return False
 
             attempt = self._transient_attempts.get(instance_id, 0) + 1
-            if attempt > _settings.transient_retry_max:
+            if not capacity_retry and attempt > _settings.transient_retry_max:
                 logger.warning(
                     "Chat task %d transient retries exhausted (%d) — failing turn",
                     task_id, _settings.transient_retry_max,
@@ -6638,22 +6650,34 @@ class InstanceManager:
                 cwd = task.last_cwd or task.target_repo
 
             config_dir = self._config_dirs.get(instance_id)
-            delay = transient_retry_delay(
-                attempt,
-                _settings.transient_retry_base_delay,
-                _settings.transient_retry_max_delay,
+            delay = (
+                max(1.0, _settings.codex_capacity_retry_delay)
+                if capacity_retry
+                else transient_retry_delay(
+                    attempt,
+                    _settings.transient_retry_base_delay,
+                    _settings.transient_retry_max_delay,
+                )
             )
             self._transient_attempts[instance_id] = attempt
 
+            retry_limit = 0 if capacity_retry else _settings.transient_retry_max
             logger.info(
-                "Chat task %d transient 429/overload — waiting %.0fs before retry #%d/%d",
-                task_id, delay, attempt, _settings.transient_retry_max,
+                "Chat task %d transient 429/overload — waiting %.0fs before "
+                "retry #%d%s",
+                task_id,
+                delay,
+                attempt,
+                " (unbounded capacity retry)"
+                if capacity_retry
+                else f"/{retry_limit}",
             )
             await self.broadcaster.broadcast(f"task:{task_id}", {
                 "event_type": "transient_retry",
                 "task_id": task_id,
                 "attempt": attempt,
-                "max_attempts": _settings.transient_retry_max,
+                "max_attempts": retry_limit,
+                "unbounded": capacity_retry,
                 "delay": round(delay, 1),
             })
             await asyncio.sleep(delay)
@@ -8557,8 +8581,13 @@ class InstanceManager:
             and not event.get("orphan")
             and not event.get("autonomous")
         ):
-            from backend.services.claude_pool import is_transient_for
+            from backend.services.claude_pool import (
+                is_codex_capacity_error,
+                is_transient_for,
+            )
             event_content = event.get("content") or ""
+            if provider == "codex" and is_codex_capacity_error(event_content):
+                self._codex_capacity_seen.add(instance_id)
             if (
                 is_transient_for(provider, event_content)
                 or self.is_cloudrouter_transient(
@@ -10682,6 +10711,10 @@ class InstanceManager:
         """True if the instance's most recent turn emitted a transient
         server-side 429/overload error (turn-scoped; reset at next launch)."""
         return instance_id in self._transient_seen
+
+    def codex_capacity_error_seen(self, instance_id: int) -> bool:
+        """True only when the current foreground turn hit model capacity."""
+        return instance_id in self._codex_capacity_seen
 
     def pty_rate_limit_seen(self, instance_id: int) -> bool:
         """True if the instance's most recent PTY turn saw an actionable

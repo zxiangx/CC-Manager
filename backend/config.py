@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     transient_retry_max: int = 5            # 最多自动重试次数
     transient_retry_base_delay: float = 10.0  # 首次退避秒数（指数递增）
     transient_retry_max_delay: float = 120.0  # 退避上限秒数
+    codex_capacity_retry_delay: float = 60.0  # 模型容量不足固定等待，且不设次数上限
 
     # --- ask_user：拦截内置 AskUserQuestion，转前端卡片 ---
     ask_user_enabled: bool = True       # 关闭则不注入 hook，AskUserQuestion 回到原生行为

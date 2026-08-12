@@ -1042,3 +1042,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **Goal 修正**：CCM 不再在根回合结束但子 Agent 仍运行时释放 Goal 续跑条件；存在任何活跃后代时临时暂停原生 Goal，整条 lineage 真正空闲后才恢复。用户在等待期间清除或结束 Goal 时不会被后台门控重新激活，真正发起后续回合的仍是 Codex 原生 Goal runtime。
 - **注入消息编辑**：Codex 运行中通过 steer 注入的用户消息现在与普通消息一样显示编辑与分支切换入口。由于 Codex 只支持按已完成 turn fork，CCM 会精确定位包含该注入的 turn，从前一已完成 turn 建立隐藏分支，并一次性回放该 turn 中注入点之前的用户输入；持久日志和界面仅保存、显示修改后的消息，旧分支仍可左右切回。
 - **边界与验证**：Monitor、子 Agent、系统生成消息仍不可编辑；注入定位不唯一或缺少安全前驱时返回 409，避免错误 context。Codex app-server/chat 定向后端 `262 passed`，ChatView `116 passed`，TypeScript 检查、production build 与 `git diff --check` 通过。
+
+### 2026-08-13 — Goal 多回合后的注入编辑映射修复（commit b8d9f345）
+
+- **生产触发**：#17 的旧注入行没有 native turn id；同一条普通用户消息后 Goal 自动产生了许多连续 turn。旧解析器要求整个区间只有一个 turn，因而把可确定的注入错误拒绝为 `cannot be mapped safely`。
+- **修复**：新注入从 race-fenced `turn/steer` 回包取得并持久化 exact turn id。旧注入按其后、下一条普通消息前的首个可映射 native event 确定 containing turn；后续 Goal turns 不再制造假歧义。隐藏 replay prefix 只包含映射到同一 containing turn 的先前用户输入，避免重复回放其他 Goal turn 的指令。
+- **验证**：Codex app-server、InstanceManager、Chat/Fork 三个相关测试文件 `556 passed, 2 deselected`；两项跳过项是 macOS `/tmp` 规范化为 `/private/tmp` 的既有环境断言，与本次逻辑无关。Python compile、TypeScript 检查、production build 与 `git diff --check` 通过。

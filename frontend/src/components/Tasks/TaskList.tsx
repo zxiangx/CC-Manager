@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 
 import { api } from '../../api/client';
 import type { Task, Project } from '../../api/client';
-import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin } from '../icons';
+import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin } from '../icons';
 import { FastModeBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { AttentionTag } from './AttentionTag';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
@@ -89,7 +89,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
       onRefresh();
     }
   };
-  const handleStar = async (id: number) => {
+  const handlePin = async (id: number) => {
     await api.starTask(id);
     onRefresh();
   };
@@ -125,7 +125,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
     } catch { /* ignore */ }
   };
 
-  // 拖拽排序（长按/拖动；标星置顶保留，仅同组内移动）
+  // 拖拽排序（长按/拖动；置顶会话保留，仅同组内移动）
   const handleReordered = useCallback((optimistic?: Task[]) => {
     if (optimistic) {
       onReorder?.(optimistic);
@@ -212,11 +212,12 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
             {/* Action buttons — always top-right aligned */}
             <div className="flex gap-1 shrink-0 items-center">
               <button
-                onClick={() => handleStar(t.id)}
+                onClick={() => handlePin(t.id)}
                 className={`p-1.5 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
-                title={t.starred ? "Unstar" : "Star"}
+                title={t.starred ? "Unpin session" : "Pin session"}
+                aria-pressed={t.starred}
               >
-                <Star size={16} fill={t.starred ? 'currentColor' : 'none'} />
+                <Pin size={16} fill={t.starred ? 'currentColor' : 'none'} />
               </button>
               <button
                 onClick={() => handleToggleUnread(t.id, t.has_unread)}

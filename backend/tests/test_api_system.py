@@ -125,6 +125,41 @@ async def test_restart_and_repair_endpoints_delegate(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remote_update_mutations_are_disabled_but_restart_remains_available(
+    client, monkeypatch,
+):
+    service = MagicMock()
+    service.restart = AsyncMock(return_value={"status": "started"})
+    monkeypatch.setattr("backend.main.update_service", service)
+    monkeypatch.setattr(
+        "backend.api.system.settings.remote_updates_enabled", False,
+    )
+
+    update_response = await client.post(
+        "/api/system/update", json={"dry_run": True},
+    )
+    repair_response = await client.post("/api/system/update/repair", json={})
+    reconcile_response = await client.post("/api/system/update/reconcile")
+    rollback_response = await client.post(
+        "/api/system/update/rollback", json={},
+    )
+    restart_response = await client.post("/api/system/restart")
+
+    for response in (
+        update_response,
+        repair_response,
+        reconcile_response,
+        rollback_response,
+    ):
+        assert response.status_code == 404
+        assert response.json()["detail"] == (
+            "Remote CCM updates are disabled on this deployment"
+        )
+    assert restart_response.status_code == 200
+    service.restart.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_endpoint_returns_structured_conflict(
     client, monkeypatch,
 ):
@@ -184,6 +219,7 @@ async def test_config_returns_default_model(client):
     assert "default_model" in data
     assert isinstance(data["default_model"], str)
     assert len(data["default_model"]) > 0
+    assert data["remote_updates_enabled"] is True
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ import { api, isApiRequestError } from '../../api/client';
 import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry, MessageBranchState } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Pin, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -2158,9 +2158,10 @@ function ChatRuntimeView({
             <button
               onClick={handleStar}
               className={`p-1.5 transition-colors ${starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
-              title={starred ? "Unstar" : "Star"}
+              title={starred ? "Unpin session" : "Pin session"}
+              aria-pressed={starred}
             >
-              <Star size={18} fill={starred ? 'currentColor' : 'none'} />
+              <Pin size={18} fill={starred ? 'currentColor' : 'none'} />
             </button>
             {(isProcessing || stillRunning) && (
               <button

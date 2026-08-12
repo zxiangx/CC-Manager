@@ -19,6 +19,7 @@ vi.mock('../../api/client', () => ({
     getPoolStatus: vi.fn().mockResolvedValue({ enabled: false }),
     getCodexPoolStatus: vi.fn().mockRejectedValue(new Error('disabled')),
     getCloudRouterAccounts: vi.fn().mockResolvedValue([]),
+    config: vi.fn().mockResolvedValue({ remote_updates_enabled: true }),
     startUpdate: vi.fn(),
     health: vi.fn(),
   },
@@ -46,6 +47,7 @@ function renderShell(page = 'tasks', wide = false) {
 
 describe('AppShell layout and z-index architecture', () => {
   beforeEach(() => {
+    vi.mocked(api.config).mockResolvedValue({ remote_updates_enabled: true } as Awaited<ReturnType<typeof api.config>>);
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
       value: vi.fn().mockImplementation((query: string) => ({
@@ -116,12 +118,26 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
   });
 
-  it('keeps the process-wide update control available to administrators', () => {
+  it('keeps the process-wide update control available to administrators when enabled', async () => {
     renderShell();
 
-    expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
+    });
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
+  });
+
+  it('does not mount the update control or start update checks when disabled', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      remote_updates_enabled: false,
+    } as Awaited<ReturnType<typeof api.config>>);
+
+    renderShell();
+
+    await waitFor(() => expect(api.config).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTitle('更新并重启')).not.toBeInTheDocument();
+    expect(api.startUpdate).not.toHaveBeenCalled();
   });
 
   describe('header stacking context', () => {

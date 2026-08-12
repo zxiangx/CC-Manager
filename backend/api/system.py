@@ -64,6 +64,7 @@ async def stats(db: AsyncSession = Depends(get_db)):
 @router.get("/config")
 async def get_config():
     return {
+        "remote_updates_enabled": settings.remote_updates_enabled,
         "default_model": settings.default_model,
         "model_options": [m.strip() for m in settings.model_options.split(",") if m.strip()],
         "default_provider": settings.default_provider,
@@ -137,8 +138,17 @@ def _get_update_service():
     return update_service
 
 
+def _require_remote_updates_enabled() -> None:
+    if not settings.remote_updates_enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="Remote CCM updates are disabled on this deployment",
+        )
+
+
 @router.post("/update", dependencies=[Depends(require_admin)])
 async def start_update(req: UpdateRequest):
+    _require_remote_updates_enabled()
     if req.branch and not _BRANCH_RE.match(req.branch):
         raise HTTPException(status_code=400, detail="Invalid branch name")
     svc = _get_update_service()
@@ -162,6 +172,7 @@ async def update_status():
 
 @router.post("/update/reconcile", dependencies=[Depends(require_admin)])
 async def reconcile_update_blockers():
+    _require_remote_updates_enabled()
     result = await _get_update_service().reconcile_blockers()
     if "error" in result:
         raise HTTPException(status_code=409, detail=result)
@@ -170,6 +181,7 @@ async def reconcile_update_blockers():
 
 @router.post("/update/rollback", dependencies=[Depends(require_admin)])
 async def rollback_update(req: RollbackRequest | None = None):
+    _require_remote_updates_enabled()
     svc = _get_update_service()
     result = await svc.rollback(
         confirm_database_restore=bool(
@@ -193,6 +205,7 @@ async def restart_service():
 
 @router.post("/update/repair", dependencies=[Depends(require_admin)])
 async def repair_update(req: UpdateRequest | None = None):
+    _require_remote_updates_enabled()
     result = await _get_update_service().start_repair(
         skip_frontend_build=req.skip_frontend_build if req else False
     )

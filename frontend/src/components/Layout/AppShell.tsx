@@ -89,6 +89,19 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [hasWorker, setHasWorker] = useState(isAdmin);
+  const [remoteUpdatesEnabled, setRemoteUpdatesEnabled] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    if (!isAdmin) return () => { active = false; };
+    api.config().then((config) => {
+      if (active) setRemoteUpdatesEnabled(config.remote_updates_enabled === true);
+    }).catch(() => {
+      // Fail closed. Mounting UpdateButton starts automatic remote checks, so
+      // an unavailable or legacy capability response must keep it hidden.
+    });
+    return () => { active = false; };
+  }, [isAdmin]);
 
   const refreshWorkerStatus = useCallback(() => {
     if (!isAdmin) {
@@ -292,7 +305,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
               {ccUser.name && (
                 <span className="text-xs text-gray-400 mr-1 hidden sm:inline">{ccUser.name}</span>
               )}
-              {isAdmin && <UpdateButton />}
+              {isAdmin && remoteUpdatesEnabled && <UpdateButton />}
               {isAdmin && <PoolDrawer />}
               <PrefsMenu isAdmin={isAdmin} />
             </div>

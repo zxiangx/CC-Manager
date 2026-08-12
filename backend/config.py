@@ -158,6 +158,9 @@ class Settings(BaseSettings):
     backup_oss_secret_key: str = ""
 
     # --- One-click update & restart ---
+    # Deployment-level kill switch for remote update discovery and mutation.
+    # Manual/local deployment and an ordinary service restart remain possible.
+    remote_updates_enabled: bool = True
     service_name: str = "ccm.service"  # systemd service to restart (e.g. ccm-dev.service)
     service_scope: str = "auto"        # auto | user | system
 

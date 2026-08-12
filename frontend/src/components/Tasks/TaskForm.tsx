@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../api/client';
 import type { CodexServiceTier, Project, TagItem, Task } from '../../api/client';
-import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
+import { Plus, Paperclip, X, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
 import { SecretPicker } from '../Secrets/SecretPicker';
@@ -855,17 +855,19 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             </div>
           )}
         </div>
-        {/* Star */}
+        {/* Pin on creation (persisted by the existing starred field). */}
         <button
           type="button"
           onClick={() => setStarOnCreate(!starOnCreate)}
+          title={starOnCreate ? 'Create session pinned' : 'Pin new session'}
+          aria-pressed={starOnCreate}
           className={`flex items-center gap-1 text-xs px-2 py-1.5 rounded border transition-colors ${
             starOnCreate
               ? 'bg-yellow-600/30 text-yellow-300 border-yellow-500/50 hover:bg-yellow-600/40'
               : 'bg-gray-700 text-gray-400 border-gray-600 hover:bg-gray-600 hover:text-gray-300'
           }`}
         >
-          <Star size={13} fill={starOnCreate ? 'currentColor' : 'none'} />
+          <Pin size={13} fill={starOnCreate ? 'currentColor' : 'none'} />
         </button>
         {(provider !== 'codex' || codexTaskSkillsEnabled) && (
           <div ref={skillsRef} className="relative">

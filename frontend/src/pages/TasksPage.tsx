@@ -9,7 +9,7 @@ import { ChatView } from '../components/Chat/ChatView';
 import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
 import { resolveTagColor } from '../components/TagColors';
-import { ChevronLeft, ChevronRight, ChevronDown, Filter, PanelLeftClose, PanelLeftOpen, Search, X, Star, Archive, ArchiveRestore, Share2, Pin } from '../components/icons';
+import { ChevronLeft, ChevronRight, ChevronDown, Filter, PanelLeftClose, PanelLeftOpen, Search, X, Archive, ArchiveRestore, Share2, Pin } from '../components/icons';
 import { PluginsBadge, SubAgentsBadge, refreshCodexTaskSkillsCapability } from '../components/Tasks/TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../components/TagColors';
 import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
@@ -351,7 +351,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                 <span className={`w-3 h-3 rounded border flex items-center justify-center text-[8px] ${starredFilter ? 'bg-yellow-500 border-yellow-500 text-white' : 'border-gray-600'}`}>
                   {starredFilter && '✓'}
                 </span>
-                ★ Starred
+                <Pin size={12} /> Pinned
               </button>
               <button
                 onClick={() => setUnreadFilter(!unreadFilter)}
@@ -657,9 +657,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     <button
                       onClick={async () => { await api.starTask(t.id); refresh(); }}
                       className={`p-1 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
-                      title={t.starred ? 'Unstar' : 'Star'}
+                      title={t.starred ? 'Unpin session' : 'Pin session'}
+                      aria-pressed={t.starred}
                     >
-                      <Star size={13} fill={t.starred ? 'currentColor' : 'none'} />
+                      <Pin size={13} fill={t.starred ? 'currentColor' : 'none'} />
                     </button>
                     <button
                       onClick={() => window.dispatchEvent(new CustomEvent('ccm-share-task', { detail: { task: t } }))}

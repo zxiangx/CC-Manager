@@ -85,6 +85,33 @@ describe('TaskList', () => {
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();
   });
 
+  it('pins and unpins a session using the persistent top group', async () => {
+    const { rerender } = render(
+      <TaskList
+        tasks={[makeTask({ id: 23, starred: false })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    await userEvent.click(screen.getByTitle('Pin session'));
+    expect(api.starTask).toHaveBeenCalledWith(23);
+    expect(onRefresh).toHaveBeenCalled();
+
+    rerender(
+      <TaskList
+        tasks={[makeTask({ id: 23, starred: true })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+    expect(screen.getByTitle('Unpin session')).toHaveAttribute(
+      'aria-pressed', 'true',
+    );
+  });
+
   it('shows Fast only for Codex priority tasks', () => {
     const { rerender } = render(
       <TaskList

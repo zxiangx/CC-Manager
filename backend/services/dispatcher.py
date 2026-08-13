@@ -629,6 +629,11 @@ class GlobalDispatcher:
         # an idle slot; start() must either observe that spawned generation or
         # finish its stale-state snapshot before the turn can spawn.
         self._chat_launch_admission_lock = asyncio.Lock()
+        # A global Codex route change is published once, then every Task is
+        # migrated toward that account.  Serializing resolution with route
+        # changes prevents two exhausted turns from choosing different homes.
+        self._codex_global_route_lock = asyncio.Lock()
+        self._codex_global_convergence_task: asyncio.Task | None = None
         self._running = False
         self._shutting_down = False
         self._monitor_tasks: dict[int, asyncio.Task] = {}           # monitor_session_id -> asyncio task
@@ -3596,6 +3601,24 @@ class GlobalDispatcher:
         model: str | None = None,
         codex_service_tier: str = "default",
     ) -> str | None:
+        async with self._codex_global_route_lock:
+            return await self._resolve_codex_home_locked(
+                session_id,
+                task_id=task_id,
+                expected_generation=expected_generation,
+                model=model,
+                codex_service_tier=codex_service_tier,
+            )
+
+    async def _resolve_codex_home_locked(
+        self,
+        session_id: str | None,
+        *,
+        task_id: int | None,
+        expected_generation: _TaskRoutingGeneration | None = None,
+        model: str | None = None,
+        codex_service_tier: str = "default",
+    ) -> str | None:
         """Select/reuse a Codex account without losing the native thread.
 
         A migrated rollout deliberately remains in the source account as a
@@ -3616,7 +3639,7 @@ class GlobalDispatcher:
 
         preferred_owner_home: str | None = None
         preferred_home: str | None = None
-        preferred_id = pool.preferred_account_id
+        preferred_id = pool.global_account_id or pool.preferred_account_id
         if preferred_id:
             candidate_home = pool.home_for_account(preferred_id)
             if candidate_home:
@@ -3693,8 +3716,9 @@ class GlobalDispatcher:
             )
         )
 
+        route_is_locked = preferred_id is not None
         if resident_available and (
-            preferred_home is None or preferred_home == resident
+            (not route_is_locked) or preferred_home == resident
         ):
             account_id = pool.account_id_for_home(resident)
             await self._persist_codex_binding_for_route(
@@ -3979,6 +4003,164 @@ class GlobalDispatcher:
             "excluded": excluded,
         }
 
+    async def _select_and_publish_codex_global_account(
+        self,
+        *,
+        old_home: str | None = None,
+        model: str | None = None,
+        service_tier: str = "default",
+        force_reselect: bool = False,
+    ) -> str | None:
+        """Choose the highest-quota account and publish it process-wide."""
+
+        pool = self.codex_pool
+        if not (pool and pool.enabled):
+            return None
+        async with self._codex_global_route_lock:
+            old_account_id = (
+                pool.account_id_for_home(old_home) if old_home else None
+            )
+            current_id = pool.global_account_id
+            if current_id and current_id != old_account_id and not force_reselect:
+                current_home = pool.home_for_account(current_id)
+                if (
+                    current_home
+                    and pool.is_home_available(current_home)
+                    and pool.supports_model_for_home(
+                        current_home,
+                        model,
+                        service_tier=service_tier,
+                    )
+                ):
+                    return pool.canonical_home(current_home)
+
+            selected_home = await pool.select_highest_quota_account(
+                exclude={old_account_id} if old_account_id else None,
+                model=model,
+                service_tier=service_tier,
+            )
+            if not selected_home:
+                return None
+            account_id = pool.account_id_for_home(selected_home)
+            if not account_id or not pool.set_global_account(account_id):
+                return None
+            logger.warning(
+                "Codex global account changed from %s to %s",
+                old_account_id,
+                account_id,
+            )
+            return pool.canonical_home(selected_home)
+
+    async def publish_codex_global_account(self, account_id: str) -> bool:
+        """Atomically publish an explicit administrator-selected account."""
+
+        pool = self.codex_pool
+        if not (pool and pool.enabled):
+            return False
+        async with self._codex_global_route_lock:
+            return pool.set_global_account(account_id)
+
+    async def converge_codex_tasks_to_global_account(self) -> dict:
+        """Migrate every idle Codex Task to the durable global account."""
+
+        pool = self.codex_pool
+        if not (pool and pool.enabled and pool.global_account_id):
+            return {"global_account": None, "migrated": 0, "skipped_active": 0, "errors": []}
+        async with self._codex_global_route_lock:
+            target_id = pool.global_account_id
+            target_home = pool.home_for_account(target_id)
+            if not target_home or not pool.is_home_available(target_home):
+                raise CodexAccountRoutingError(
+                    f"Global Codex account {target_id} is unavailable"
+                )
+            target_home = pool.canonical_home(target_home)
+            async with self.db_factory() as db:
+                rows = list((await db.execute(
+                    select(Task).where(
+                        Task.provider == "codex",
+                        Task.session_id.is_not(None),
+                    )
+                )).scalars().all())
+
+            migrated = 0
+            already = 0
+            skipped_active = 0
+            errors: list[dict] = []
+            for task in rows:
+                if task.status in {"in_progress", "executing"}:
+                    skipped_active += 1
+                    continue
+                session_id = task.session_id
+                if not session_id:
+                    continue
+                bound_id = (task.metadata_ or {}).get("codex_account_id")
+                source_home = pool.home_for_account(bound_id) if bound_id else None
+                matches = pool.locate_session_homes(session_id)
+                if target_home in matches:
+                    await self._persist_codex_binding_for_route(
+                        task_id=task.id,
+                        account_id=target_id,
+                        expected_generation=None,
+                    )
+                    already += 1
+                    continue
+                if not source_home or pool.canonical_home(source_home) not in matches:
+                    if len(matches) == 1:
+                        source_home = matches[0]
+                    else:
+                        errors.append({
+                            "task_id": task.id,
+                            "error": "cannot identify one source rollout",
+                        })
+                        continue
+                try:
+                    await self._migrate_rebind_and_persist_codex_route(
+                        task_id=task.id,
+                        session_id=session_id,
+                        source_home=pool.canonical_home(source_home),
+                        target_home=target_home,
+                        account_id=target_id,
+                        expected_generation=None,
+                    )
+                    migrated += 1
+                except Exception as exc:
+                    logger.exception(
+                        "Could not converge Codex task %s to global account %s",
+                        task.id,
+                        target_id,
+                    )
+                    errors.append({"task_id": task.id, "error": str(exc)})
+            return {
+                "global_account": target_id,
+                "migrated": migrated,
+                "already": already,
+                "skipped_active": skipped_active,
+                "errors": errors,
+            }
+
+    def schedule_codex_global_convergence(self) -> None:
+        current = self._codex_global_convergence_task
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self.converge_codex_tasks_to_global_account(),
+            name="codex-global-account-convergence",
+        )
+        self._codex_global_convergence_task = task
+
+        def finished(done: asyncio.Task) -> None:
+            if self._codex_global_convergence_task is done:
+                self._codex_global_convergence_task = None
+            try:
+                result = done.result()
+                logger.info("Codex global account convergence: %s", result)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Codex global account convergence failed")
+
+        task.add_done_callback(finished)
+
     async def _check_codex_rate_limit_and_rotate(
         self,
         instance_id: int,
@@ -4055,8 +4237,8 @@ class GlobalDispatcher:
 
         old_account_id = pool.account_id_for_home(old_home)
         excluded = {old_account_id} if old_account_id else set()
-        new_home = pool.select(
-            exclude=excluded,
+        new_home = await self._select_and_publish_codex_global_account(
+            old_home=old_home,
             model=task_model,
             service_tier=task_service_tier,
         )
@@ -4158,6 +4340,7 @@ class GlobalDispatcher:
             "old_account": old_account_id,
             "new_account": new_account_id,
         })
+        self.schedule_codex_global_convergence()
         return {
             "config_dir": new_home,
             "session_id": session_id,

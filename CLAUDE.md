@@ -101,7 +101,7 @@ claude-manager/
 │       │   ├── Instances/              # InstanceGrid, InstanceLog
 │       │   ├── Tasks/                  # TaskForm、TaskList、独立 attention tag 编辑
 │       │   ├── Layout/AppShell.tsx     # App 壳 (桌面侧栏导航 + sticky 顶栏 + 移动端抽屉)
-│       │   ├── Layout/PrefsMenu.tsx    # 顶栏齿轮下拉 (时区/主题/PTY/压缩阈值/飞书/密码/退出)
+│       │   ├── Layout/PrefsMenu.tsx    # 顶栏齿轮下拉 (北京时间/主题/PTY/压缩阈值/飞书/密码/退出)
 │       │   ├── Layout/PoolDrawer.tsx   # Pool 额度抽屉 (顶栏 "Pro" 徽标 + 账号额度进度条)
 │       │   ├── PlanReview/PlanPanel.tsx # Plan 审批
 │       │   └── Voice/VoiceButton.tsx   # MediaRecorder → Whisper
@@ -411,3 +411,8 @@ uv run alembic history         # 查看历史
 
 - **Codex Goal lineage 闸门（覆盖旧的提前释放约定）**: active Goal 发现 native descendant 后必须立即以 `thread/goal/set paused` 阻止下一 root turn；旧 root identity 与 exact CCM owner 保留到全部 descendant 权威 idle，随后才释放 identity、恢复 Goal 并接住 Codex 原生 continuation。暂停/恢复 RPC 不可确认时持续持有 owner 重试，绝不能在 child 收尾时提前放行。
 - **注入消息编辑（覆盖旧的 inject 禁止约定）**: Fork/编辑允许真实人类 `source=inject` 消息。它不是原生 item 边界：新注入必须持久化 race-fenced `turn/steer` 回包的 exact turn id；旧注入取下一条普通用户消息前的首个可映射 native event 作为 containing turn，后续 Goal 自动 turn 不得造成假歧义。Fork 到 containing turn 的前一 completed turn，只回放映射到同一 containing turn 且位于注入前的用户输入；既无 exact id 又无安全后继事件时 409，禁止按消息序号或最后一个 Goal turn 猜测。Monitor/Sub-Agent/模型/tool/system 仍禁止编辑。
+
+## 2026-08-13 global Codex routing and display time
+
+- **Codex 全局账号不变式**: `accounts.json.global_account_id` 是持久事实源，`CodexPool.select()` 在全局模式不得回退到其他账号。手动切换或 usage-limit 轮换必须先原子发布全局指针，再安全复制 rollout、重绑 app-server owner 并持久化 Task binding；活跃回合不强杀，在停止后收敛。轮换实时刷新全部 quota，原生 OAuth 候选按最紧窗口剩余百分比取最高；全部耗尽时改用可用的 CloudRouter/ApexRouter API 号池。
+- **展示时区**: 后端继续以 UTC 存储，前端统一用 `Asia/Shanghai` 显示且不再接受浏览器/localStorage 时区覆盖。无 suffix 的 ISO 时间戳必须按 UTC 解析；只有末尾 `Z` 或 `±HH:MM`/`±HHMM` 才算已有时区，不得把日期中的连字号误判为 offset。

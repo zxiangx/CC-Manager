@@ -120,7 +120,7 @@ describe('PrefsMenu', () => {
   });
 
   describe('dropdown content', () => {
-    it('shows timezone selector', async () => {
+    it('shows the fixed Beijing timezone', async () => {
       const user = userEvent.setup();
       render(<PrefsMenu isAdmin={true} />);
 
@@ -128,6 +128,7 @@ describe('PrefsMenu', () => {
 
       await waitFor(() => {
         expect(screen.getByText('时区')).toBeInTheDocument();
+        expect(screen.getByText('北京时间 (UTC+8)')).toBeInTheDocument();
       });
     });
 

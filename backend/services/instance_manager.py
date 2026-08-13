@@ -7225,7 +7225,10 @@ class InstanceManager:
                 # account" by moving the same thread back to an API account.
                 # The normal next-turn resolver owns migration to the pinned
                 # account when the selection was made while a turn was busy.
-                if pool.preferred_account_id is not None:
+                if (
+                    pool.global_account_id is None
+                    and pool.preferred_account_id is not None
+                ):
                     logger.info(
                         "Codex quota switch skipped for task %d: account %s "
                         "is explicitly preferred",
@@ -7239,16 +7242,42 @@ class InstanceManager:
                 if not old_home:
                     return False
                 old_home = pool.canonical_home(old_home)
-                new_home = await pool.select_quota_alternative(
-                    old_home,
-                    model=task_model,
-                    service_tier=task_service_tier,
-                )
+                expected_global_id = pool.global_account_id
+                if expected_global_id is not None:
+                    global_home = pool.home_for_account(expected_global_id)
+                    if global_home and pool.canonical_home(global_home) != old_home:
+                        new_home = pool.canonical_home(global_home)
+                    else:
+                        new_home = await dispatcher._select_and_publish_codex_global_account(
+                            old_home=old_home,
+                            model=task_model,
+                            service_tier=task_service_tier,
+                        )
+                        expected_global_id = pool.global_account_id
+                else:
+                    new_home = await pool.select_quota_alternative(
+                        old_home,
+                        model=task_model,
+                        service_tier=task_service_tier,
+                    )
                 if not await generation_is_current(generation):
                     return False
                 # set_preferred() can race the asynchronous quota lookup.  A
                 # late pin must still win before any rollout/owner mutation.
-                if pool.preferred_account_id is not None:
+                if (
+                    expected_global_id is not None
+                    and pool.global_account_id != expected_global_id
+                ):
+                    logger.info(
+                        "Codex quota switch abandoned for task %d: global "
+                        "account changed during quota selection",
+                        task_id,
+                    )
+                    return False
+                if (
+                    expected_global_id is None
+                    and pool.preferred_account_id is not None
+                ):
                     logger.info(
                         "Codex quota switch abandoned for task %d: account %s "
                         "was explicitly preferred during quota selection",
@@ -7349,7 +7378,17 @@ class InstanceManager:
                             raise RuntimeError(
                                 "task generation changed after rollout copy"
                             )
-                        if pool.preferred_account_id is not None:
+                        if (
+                            expected_global_id is not None
+                            and pool.global_account_id != expected_global_id
+                        ):
+                            raise RuntimeError(
+                                "global Codex account changed during quota switch"
+                            )
+                        if (
+                            expected_global_id is None
+                            and pool.preferred_account_id is not None
+                        ):
                             raise RuntimeError(
                                 "explicit Codex account preference changed "
                                 "during quota switch"
@@ -7364,7 +7403,17 @@ class InstanceManager:
                             raise RuntimeError(
                                 "task generation changed after owner rebind"
                             )
-                        if pool.preferred_account_id is not None:
+                        if (
+                            expected_global_id is not None
+                            and pool.global_account_id != expected_global_id
+                        ):
+                            raise RuntimeError(
+                                "global Codex account changed after owner rebind"
+                            )
+                        if (
+                            expected_global_id is None
+                            and pool.preferred_account_id is not None
+                        ):
                             raise RuntimeError(
                                 "explicit Codex account preference changed "
                                 "after quota owner rebind"
@@ -7441,6 +7490,8 @@ class InstanceManager:
                     except BaseException:
                         break
                 switched = switch_operation.result()
+                if switched and pool.global_account_id is not None:
+                    dispatcher.schedule_codex_global_convergence()
                 if delayed_cancellation is not None:
                     raise delayed_cancellation
                 return switched

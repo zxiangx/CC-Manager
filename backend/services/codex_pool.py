@@ -17,6 +17,7 @@ import math
 import os
 import re
 import stat
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,6 +201,60 @@ def api_quota_at_or_above(
         if limit > 0 and (used / limit) * 100 >= threshold:
             return True
     return False
+
+
+def quota_remaining_percent(row: dict | None) -> float | None:
+    """Return the conservative remaining percentage for one account.
+
+    An account is only as useful as its tightest finite window.  Unknown
+    snapshots deliberately return ``None`` so they cannot outrank a candidate
+    whose live quota is known.
+    """
+
+    if not isinstance(row, dict):
+        return None
+    quota = row.get("quota")
+    if isinstance(quota, dict):
+        if quota.get("is_rate_limited") is True:
+            return 0.0
+        used: list[float] = []
+        for key in ("primary_used_percent", "secondary_used_percent"):
+            try:
+                value = quota.get(key)
+                if value is not None:
+                    used.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if used:
+            return max(0.0, min(100.0, 100.0 - max(used)))
+
+    snapshot = row.get("api_quota")
+    if not isinstance(snapshot, dict):
+        return None
+    if bool(snapshot.get("known")) and snapshot.get("available") is False:
+        return 0.0
+    windows: list[dict] = []
+    nested = snapshot.get("quota")
+    if isinstance(nested, dict):
+        windows.append(nested)
+    raw_windows = snapshot.get("windows")
+    if isinstance(raw_windows, list):
+        windows.extend(item for item in raw_windows if isinstance(item, dict))
+    remaining: list[float] = []
+    for window in windows:
+        if window.get("unlimited") is True:
+            remaining.append(100.0)
+            continue
+        try:
+            limit = float(window.get("limit"))
+            used = float(window.get("used"))
+        except (TypeError, ValueError):
+            continue
+        if limit > 0:
+            remaining.append(
+                max(0.0, min(100.0, (1.0 - used / limit) * 100.0))
+            )
+    return min(remaining) if remaining else None
 
 
 def quota_cooldown_seconds(
@@ -431,6 +486,9 @@ class CodexPool:
         self._cooldowns: dict[str, float] = {}
         self._terminal_failures: set[str] = set()
         self._preferred_account_id: str | None = None
+        # Durable process-wide route.  Unlike the legacy UI preference, this
+        # is a hard invariant: every Task must converge to this account.
+        self._global_account_id: str | None = None
         self._last_selected_id: str | None = None
         self._last_selected_at: float = 0.0
         # Round-robin proposals advance independently from the UI's
@@ -461,11 +519,12 @@ class CodexPool:
                     self._config_path,
                 )
         try:
-            data = (
+            persisted = (
                 json.loads(self._config_path.read_text(encoding="utf-8"))
-                if self._include_native and self._config_path.exists()
+                if self._config_path.exists()
                 else {"accounts": []}
             )
+            data = persisted if self._include_native else {"accounts": []}
             accounts = [CodexPoolAccount(a) for a in data.get("accounts", [])]
             if self._cloudrouter_store is not None:
                 known_ids = {account.id for account in accounts}
@@ -497,6 +556,16 @@ class CodexPool:
                     "Each Codex pool account must use a distinct CODEX_HOME"
                 )
             self._accounts = accounts
+            configured_global = persisted.get("global_account_id")
+            self._global_account_id = (
+                configured_global
+                if isinstance(configured_global, str)
+                and any(
+                    account.id == configured_global and not account.retired
+                    for account in accounts
+                )
+                else None
+            )
             logger.info("Codex pool loaded %d accounts from %s", len(self._accounts), self._config_path)
         except Exception:
             logger.exception("Failed to load codex pool config")
@@ -543,6 +612,8 @@ class CodexPool:
         self._terminal_failures.intersection_update(valid_ids)
         if self._preferred_account_id not in valid_ids:
             self._preferred_account_id = None
+        if self._global_account_id not in valid_ids:
+            self._global_account_id = None
         if self._last_selected_id not in valid_ids:
             self._last_selected_id = None
             self._last_selected_at = 0.0
@@ -786,7 +857,10 @@ class CodexPool:
             "available": sum(1 for a in accounts if a["available"]),
             "cooldown": sum(1 for a in accounts if not a["available"] and a["enabled"]),
             "disabled": sum(1 for a in accounts if not a["enabled"]),
-            "preferred": self._preferred_account_id,
+            # Keep the legacy response field so existing clients render the
+            # global route as the selected account.
+            "preferred": self._global_account_id or self._preferred_account_id,
+            "global_account": self._global_account_id,
             "last_selected": self._last_selected_id,
             "last_selected_at": self._last_selected_at or None,
             "accounts": accounts,
@@ -795,6 +869,57 @@ class CodexPool:
     @property
     def preferred_account_id(self) -> str | None:
         return self._preferred_account_id
+
+    @property
+    def global_account_id(self) -> str | None:
+        return self._global_account_id
+
+    def _persist_global_account(self, account_id: str | None) -> None:
+        """Atomically persist the process-wide account pointer."""
+
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        data = (
+            json.loads(self._config_path.read_text(encoding="utf-8"))
+            if self._config_path.exists()
+            else {"accounts": []}
+        )
+        if not isinstance(data, dict):
+            raise ValueError("Codex pool config must be an object")
+        if account_id is None:
+            data.pop("global_account_id", None)
+        else:
+            data["global_account_id"] = account_id
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{self._config_path.name}.",
+            suffix=".tmp",
+            dir=self._config_path.parent,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), 0o600)
+            os.replace(temporary, self._config_path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def set_global_account(self, account_id: str | None) -> bool:
+        if account_id is not None and not any(
+            account.id == account_id and account.enabled and not account.retired
+            for account in self._accounts
+        ):
+            return False
+        self._persist_global_account(account_id)
+        self._global_account_id = account_id
+        return True
 
     def set_preferred(self, account_id: str | None) -> bool:
         if account_id is None:
@@ -834,6 +959,20 @@ class CodexPool:
                 candidates.append(account)
         if not candidates:
             return None
+
+        # Global mode never falls through to a different account.  The
+        # rotation coordinator must first select and durably publish the new
+        # global account, then every Task converges to it.
+        if self._global_account_id:
+            global_account = next(
+                (a for a in candidates if a.id == self._global_account_id),
+                None,
+            )
+            return (
+                self._record_selection(global_account, now)
+                if global_account is not None
+                else None
+            )
 
         # Prefer the pinned account if available
         if self._preferred_account_id:
@@ -1318,6 +1457,75 @@ class CodexPool:
             model=model,
             service_tier=service_tier,
         )
+
+    async def select_highest_quota_account(
+        self,
+        *,
+        exclude: set[str] | None = None,
+        model: str | None = None,
+        service_tier: str = "default",
+    ) -> str | None:
+        """Return the compatible live account with the most quota remaining."""
+
+        excluded = exclude or set()
+        requested_tier = _normalize_service_tier(service_tier)
+        rows = {
+            row["id"]: row
+            for row in await self.fetch_quota(force=True, live=True)
+        }
+        now = time.time()
+        ranked_native: list[tuple[float, int, CodexPoolAccount]] = []
+        ranked_api: list[tuple[float, int, CodexPoolAccount]] = []
+        unknown_native: list[CodexPoolAccount] = []
+        usable_api: list[CodexPoolAccount] = []
+        for index, account in enumerate(self._accounts):
+            if (
+                not account.enabled
+                or account.retired
+                or account.id in excluded
+                or now < self._cooldowns.get(account.id, 0)
+                or not account.supports_service_tier(model, requested_tier)
+            ):
+                continue
+            is_api = _is_api_auth_kind(account.auth_kind)
+            row = rows.get(account.id)
+            api_snapshot = row.get("api_quota") if isinstance(row, dict) else None
+            api_explicitly_unavailable = bool(
+                isinstance(api_snapshot, dict)
+                and api_snapshot.get("known")
+                and api_snapshot.get("available") is False
+            )
+            if is_api and not api_explicitly_unavailable:
+                usable_api.append(account)
+            if not isinstance(row, dict) or row.get("error"):
+                if not is_api:
+                    unknown_native.append(account)
+                continue
+            remaining = quota_remaining_percent(row)
+            if remaining is None or remaining <= 0:
+                if remaining is None and not is_api:
+                    unknown_native.append(account)
+                continue
+            target = ranked_api if is_api else ranked_native
+            target.append((remaining, -index, account))
+
+        # Normal OAuth accounts remain the primary choice.  The connected API
+        # account pool is the explicit safety net once every known native
+        # account is exhausted; an API pool without a finite quota snapshot is
+        # still usable and intentionally outranks an unknown native account.
+        if ranked_native:
+            selected = max(ranked_native, key=lambda item: (item[0], item[1]))[2]
+        elif ranked_api:
+            selected = max(ranked_api, key=lambda item: (item[0], item[1]))[2]
+        elif usable_api:
+            selected = usable_api[0]
+        elif unknown_native:
+            # A native app-server may be restarting. Fall back only when no API
+            # pool exists, so rotation remains live without bypassing the pool.
+            selected = unknown_native[0]
+        else:
+            return None
+        return selected.codex_home
 
     def cached_quota_for_home(self, codex_home: str) -> dict | None:
         """Return the latest selection snapshot for one account home."""

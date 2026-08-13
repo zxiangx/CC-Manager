@@ -771,7 +771,7 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
         )}
         {isPreferred && (
           <span className="px-1.5 py-0.5 rounded bg-green-600/30 text-green-300 text-[10px] font-semibold">
-            优先账号
+            全局账号
           </span>
         )}
         {isLastSelected && (
@@ -790,15 +790,15 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
               <button
                 onClick={() => onSetPreferred(null)}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-foreground hover:border-gray-400"
-                title="取消全局优先；新会话优先兼容且可用的 API，已有对话继续使用绑定账号"
+                title="刷新所有候选账号额度，并将所有 Codex 会话统一到剩余额度最高的账号"
               >
-                恢复自动
+                重选最优
               </button>
             ) : (
               <button
                 onClick={() => onSetPreferred(account.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20"
-                title="后续任务及当前对话下一轮优先切换；不可用或迁移失败时安全回退"
+                title="将所有 Codex 会话统一切换到此账号；正在输出的回合会在停止后收敛"
               >
                 切换到此账号
               </button>

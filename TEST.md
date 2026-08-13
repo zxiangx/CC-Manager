@@ -918,13 +918,22 @@ python -m pytest \
 | 测试用例 | 说明 |
 |---------|------|
 | `treats naive timestamp (no Z) as UTC` | 无 Z 后缀的时间戳按 UTC 解析 |
-| `naive timestamp converts correctly to non-UTC timezone` | 无 Z 后缀正确转换到用户时区 |
+| `naive timestamp converts correctly to non-UTC timezone` | 无 Z 后缀按 UTC 解析后正确转换到北京时间 |
 | `naive timestamp with microseconds is handled` | 含微秒的无 Z 后缀时间戳正常处理 |
 | `timestamp with positive/negative offset is preserved` | 已有偏移量的时间戳不被二次转换 |
 | `formatDateTime always includes date even for today` | 通用格式化始终包含日期 |
 | `formatDateTime shows YYYY prefix for different year` | 不同年份显示完整年月日 |
 | `formatDateTime treats naive timestamp as UTC` | formatDateTime 同样按 UTC 解析 |
-| `formatDateTime converts UTC to user timezone` | 正确将 UTC 转为用户选定时区 |
+| `formatDateTime converts UTC to user timezone` | 正确将 UTC 统一转为北京时间 |
+| `getTimezone / resolveTimezone always use Beijing time` | 忽略旧 localStorage 选项，所有设备固定 `Asia/Shanghai` |
+
+#### Codex 全局账号路由 (`test_codex_pool.py` / `test_resume_config_dir.py`)
+
+| 测试用例 | 说明 |
+|---------|------|
+| `test_global_account_is_durable_and_never_falls_back` | 全局指针重启后保留，不可用时不偷偷切到其他账号 |
+| `test_selects_the_compatible_account_with_most_live_quota` | 实时额度按最紧窗口剩余百分比取最高 |
+| `test_highest_quota_falls_back_to_api_pool_when_native_is_exhausted` | 原生账号全耗尽时切到 API 号池 |
 
 #### Claude Pool (`test_claude_pool.py`)
 

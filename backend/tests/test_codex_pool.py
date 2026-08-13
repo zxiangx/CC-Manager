@@ -19,6 +19,7 @@ from backend.services.codex_pool import (
     is_pool_rotatable,
     is_rate_limited,
     is_transient,
+    quota_remaining_percent,
     quota_at_or_above,
     quota_cooldown_seconds,
 )
@@ -189,6 +190,58 @@ class TestSelection:
         pool.set_preferred("codex-2")
         pool.mark_rate_limited(str(tmp_path / "codex-2"))
         assert pool.select() == str((tmp_path / "codex-1").resolve())
+
+    def test_global_account_is_durable_and_never_falls_back(
+        self, pool_config: Path, tmp_path: Path
+    ):
+        pool = CodexPool(config_path=pool_config, cooldown_seconds=60)
+        assert pool.set_global_account("codex-2")
+
+        reloaded = CodexPool(config_path=pool_config, cooldown_seconds=60)
+        expected = str((tmp_path / "codex-2").resolve())
+        assert reloaded.global_account_id == "codex-2"
+        assert reloaded.select() == expected
+
+        reloaded.mark_rate_limited(expected)
+        assert reloaded.select() is None
+
+
+class TestQuotaRanking:
+    def test_native_remaining_uses_the_tightest_window(self):
+        assert quota_remaining_percent({
+            "quota": {
+                "primary_used_percent": 25,
+                "secondary_used_percent": 80,
+            }
+        }) == 20
+
+    def test_api_remaining_uses_the_tightest_finite_window(self):
+        assert quota_remaining_percent({
+            "api_quota": {
+                "known": True,
+                "available": True,
+                "windows": [
+                    {"used": 20, "limit": 100},
+                    {"used": 9, "limit": 10},
+                ],
+            }
+        }) == pytest.approx(10)
+
+    @pytest.mark.asyncio
+    async def test_selects_the_compatible_account_with_most_live_quota(
+        self, pool: CodexPool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        async def quotas(*, force: bool = False, live: bool = False):
+            assert force and live
+            return [
+                {"id": "codex-1", "quota": {"primary_used_percent": 75}},
+                {"id": "codex-2", "quota": {"primary_used_percent": 20}},
+            ]
+
+        monkeypatch.setattr(pool, "fetch_quota", quotas)
+        assert await pool.select_highest_quota_account() == str(
+            (tmp_path / "codex-2").resolve()
+        )
 
     def test_returns_none_when_every_enabled_account_is_unavailable(
         self, pool: CodexPool, tmp_path: Path
@@ -1180,6 +1233,32 @@ class _FakeCloudRouterCodexStore:
     async def fetch_usage(self, _account_id, force=False):
         return dict(self.snapshot)
 
+
+@pytest.mark.asyncio
+async def test_highest_quota_falls_back_to_api_pool_when_native_is_exhausted(
+    pool_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    api_account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-api")
+    pool = CodexPool(
+        config_path=pool_config,
+        cloudrouter_store=_FakeCloudRouterCodexStore(api_account),
+    )
+
+    async def quotas(*, force: bool = False, live: bool = False):
+        assert force and live
+        return [
+            {"id": "codex-1", "quota": {"primary_used_percent": 100}},
+            {"id": "codex-2", "quota": {"primary_used_percent": 100}},
+            {
+                "id": api_account.id,
+                "api_quota": {"known": True, "available": True, "windows": []},
+            },
+        ]
+
+    monkeypatch.setattr(pool, "fetch_quota", quotas)
+    assert await pool.select_highest_quota_account(model="gpt-5.5") == str(
+        Path(api_account.codex_home).resolve()
+    )
 
 class TestCloudRouterCodexProjection:
     @staticmethod

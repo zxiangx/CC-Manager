@@ -1624,7 +1624,7 @@ describe('PoolDrawer', () => {
       });
     });
 
-    it('marks the preferred account and can restore automatic selection', async () => {
+    it('marks the global account and can reselect the highest-quota account', async () => {
       enableCodexPool({
         enabled: true,
         total: 1,
@@ -1634,18 +1634,18 @@ describe('PoolDrawer', () => {
         preferred: 'codex-2',
         accounts: [codexAccount],
       });
-      vi.mocked(api.setCodexPoolPreferred).mockResolvedValue({ ok: true, preferred: null });
+      vi.mocked(api.setCodexPoolPreferred).mockResolvedValue({ ok: true, preferred: 'codex-2' });
       const user = userEvent.setup();
 
       await openCodexTab(user);
 
-      expect(screen.getByText('优先账号')).toBeInTheDocument();
-      const restoreButton = screen.getByRole('button', { name: '恢复自动' });
-      expect(restoreButton).toHaveAttribute(
+      expect(screen.getByText('全局账号')).toBeInTheDocument();
+      const reselectButton = screen.getByRole('button', { name: '重选最优' });
+      expect(reselectButton).toHaveAttribute(
         'title',
-        '取消全局优先；新会话优先兼容且可用的 API，已有对话继续使用绑定账号',
+        '刷新所有候选账号额度，并将所有 Codex 会话统一到剩余额度最高的账号',
       );
-      await user.click(restoreButton);
+      await user.click(reselectButton);
       await waitFor(() => {
         expect(api.setCodexPoolPreferred).toHaveBeenCalledWith(null);
       });

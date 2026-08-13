@@ -2406,16 +2406,40 @@ async def codex_delete_account(request: Request, account_id: str):
 
 @router.post("/preferred")
 async def codex_set_preferred(request: Request, body: dict):
-    """Pin a Codex route, or clear it to restore automatic selection.
+    """Set the one durable account used by every Codex session.
 
-    A compatible available pin takes effect on the next turn. Existing native
-    rollout context is copied and the app-server thread is rebound before the
-    Task binding changes; a failed migration keeps the intact resident route.
-    Without a pin, resident threads stay sticky and fresh routes prefer API.
+    The legacy null/"automatic" action now selects the live account with the
+    most remaining quota instead of returning to per-session routing.
     """
     require_admin(request)
     pool = _get_pool()
+    dispatcher = _get_dispatcher()
     account_id = body.get("account_id")
-    if not pool.set_preferred(account_id):
+    if account_id is None:
+        selected_home = await dispatcher._select_and_publish_codex_global_account(
+            force_reselect=True,
+        )
+        account_id = pool.account_id_for_home(selected_home) if selected_home else None
+        if account_id is None:
+            raise HTTPException(status_code=503, detail="No Codex account has usable live quota")
+    elif not await dispatcher.publish_codex_global_account(account_id):
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    return {"ok": True, "preferred": pool.preferred_account_id}
+    dispatcher.schedule_codex_global_convergence()
+    return {"ok": True, "preferred": pool.global_account_id}
+
+
+@router.post("/global/select-best")
+async def codex_select_best_global_account(request: Request):
+    """Refresh all quotas and globally select the account with most left."""
+
+    require_admin(request)
+    pool = _get_pool()
+    dispatcher = _get_dispatcher()
+    selected_home = await dispatcher._select_and_publish_codex_global_account(
+        force_reselect=True,
+    )
+    account_id = pool.account_id_for_home(selected_home) if selected_home else None
+    if account_id is None:
+        raise HTTPException(status_code=503, detail="No Codex account has usable live quota")
+    result = await dispatcher.converge_codex_tasks_to_global_account()
+    return {"ok": True, "preferred": account_id, "convergence": result}

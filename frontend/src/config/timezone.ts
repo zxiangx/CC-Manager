@@ -1,43 +1,18 @@
-const STORAGE_KEY = 'cc_timezone';
-
-/** Common timezones grouped by region */
-export const TIMEZONE_OPTIONS: { label: string; value: string }[] = [
-  { label: 'Auto', value: 'auto' },
-  { label: 'UTC', value: 'UTC' },
-  { label: 'Pacific', value: 'America/Los_Angeles' },
-  { label: 'Mountain', value: 'America/Denver' },
-  { label: 'Central', value: 'America/Chicago' },
-  { label: 'Eastern', value: 'America/New_York' },
-  { label: 'São Paulo', value: 'America/Sao_Paulo' },
-  { label: 'London', value: 'Europe/London' },
-  { label: 'Paris', value: 'Europe/Paris' },
-  { label: 'Moscow', value: 'Europe/Moscow' },
-  { label: 'Dubai', value: 'Asia/Dubai' },
-  { label: 'Kolkata', value: 'Asia/Kolkata' },
-  { label: 'Bangkok', value: 'Asia/Bangkok' },
-  { label: 'Singapore', value: 'Asia/Singapore' },
-  { label: 'Shanghai', value: 'Asia/Shanghai' },
-  { label: 'Seoul', value: 'Asia/Seoul' },
-  { label: 'Tokyo', value: 'Asia/Tokyo' },
-  { label: 'Sydney', value: 'Australia/Sydney' },
-  { label: 'Auckland', value: 'Pacific/Auckland' },
-];
+export const BEIJING_TIMEZONE = 'Asia/Shanghai';
 
 export function getTimezone(): string {
-  return localStorage.getItem(STORAGE_KEY) || 'auto';
+  return BEIJING_TIMEZONE;
 }
 
 export function setTimezone(tz: string) {
-  localStorage.setItem(STORAGE_KEY, tz);
+  // Kept as a compatibility no-op for older callers. CCM intentionally uses
+  // one display timezone on every device so timestamps never drift by client.
+  void tz;
 }
 
 /** Resolve the effective IANA timezone string */
 export function resolveTimezone(): string {
-  const tz = getTimezone();
-  if (tz === 'auto') {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone;
-  }
-  return tz;
+  return BEIJING_TIMEZONE;
 }
 
 function getDateParts(date: Date, tz: string): { year: number; month: number; day: number } {
@@ -57,7 +32,7 @@ function getDateParts(date: Date, tz: string): { year: number; month: number; da
 /** Normalize an ISO timestamp to ensure UTC interpretation.
  *  Backend sends naive datetimes (no Z suffix) that are actually UTC. */
 function ensureUtc(iso: string): string {
-  if (/[Z+\-]\d/.test(iso) || iso.endsWith('Z')) return iso;
+  if (/Z$/i.test(iso) || /[+-]\d{2}:?\d{2}$/.test(iso)) return iso;
   return iso + 'Z';
 }
 

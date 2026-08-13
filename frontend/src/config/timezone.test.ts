@@ -18,26 +18,20 @@ afterEach(() => {
 const TIME_RE = /\d{1,2}:\d{2}(\s*[AP]M)?/i;
 
 describe('getTimezone / setTimezone', () => {
-  it('defaults to "auto"', () => {
-    expect(getTimezone()).toBe('auto');
+  it('always uses Beijing time', () => {
+    expect(getTimezone()).toBe('Asia/Shanghai');
   });
 
-  it('round-trips a value', () => {
-    setTimezone('Asia/Shanghai');
+  it('ignores legacy timezone changes', () => {
+    setTimezone('Europe/London');
     expect(getTimezone()).toBe('Asia/Shanghai');
   });
 });
 
 describe('resolveTimezone', () => {
-  it('returns browser timezone for "auto"', () => {
-    const tz = resolveTimezone();
-    expect(typeof tz).toBe('string');
-    expect(tz.length).toBeGreaterThan(0);
-  });
-
-  it('returns explicit timezone when set', () => {
+  it('always returns Beijing time', () => {
     setTimezone('Europe/London');
-    expect(resolveTimezone()).toBe('Europe/London');
+    expect(resolveTimezone()).toBe('Asia/Shanghai');
   });
 });
 
@@ -83,9 +77,7 @@ describe('formatMessageTime', () => {
   });
 
   it('handles timezone boundary — message appears today in user tz despite different UTC date', () => {
-    setTimezone('America/New_York');
-    // May 16 05:00 UTC = May 16 01:00 ET (today in ET)
-    // May 16 04:30 UTC = May 16 00:30 ET (same day)
+    // Both are May 16 in Beijing time.
     const now = new Date('2026-05-16T05:00:00Z');
     const msg = '2026-05-16T04:30:00Z';
     const result = formatMessageTime(msg, now);
@@ -101,12 +93,12 @@ describe('formatMessageTime', () => {
     expect(result).toMatch(/^01\/05\s+/);
   });
 
-  it('works with UTC timezone', () => {
+  it('ignores a legacy UTC timezone setting', () => {
     setTimezone('UTC');
     const now = new Date('2026-05-16T12:00:00Z');
     const msg = '2026-05-16T09:05:00Z';
     const result = formatMessageTime(msg, now);
-    // Same day in UTC → only time
+    // Same day in Beijing time → only time
     expect(result).toMatch(TIME_RE);
     expect(result).not.toMatch(/\//);
   });
@@ -165,7 +157,9 @@ describe('formatMessageTime', () => {
     const now = new Date('2026-05-16T12:00:00-04:00');
     const result = formatMessageTime('2026-05-16T10:00:00-04:00', now);
     expect(result).toMatch(TIME_RE);
-    expect(result).not.toMatch(/\//);
+    // Beijing has crossed midnight at `now`, while the message is still on
+    // May 16 there, so the date must be shown.
+    expect(result).toMatch(/^05\/16\s+/);
   });
 });
 

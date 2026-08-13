@@ -1048,3 +1048,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **生产触发**：#17 的旧注入行没有 native turn id；同一条普通用户消息后 Goal 自动产生了许多连续 turn。旧解析器要求整个区间只有一个 turn，因而把可确定的注入错误拒绝为 `cannot be mapped safely`。
 - **修复**：新注入从 race-fenced `turn/steer` 回包取得并持久化 exact turn id。旧注入按其后、下一条普通消息前的首个可映射 native event 确定 containing turn；后续 Goal turns 不再制造假歧义。隐藏 replay prefix 只包含映射到同一 containing turn 的先前用户输入，避免重复回放其他 Goal turn 的指令。
 - **验证**：Codex app-server、InstanceManager、Chat/Fork 三个相关测试文件 `556 passed, 2 deselected`；两项跳过项是 macOS `/tmp` 规范化为 `/private/tmp` 的既有环境断言，与本次逻辑无关。Python compile、TypeScript 检查、production build 与 `git diff --check` 通过。
+
+### 2026-08-13 — Codex 全局账号收敛与北京时间
+
+- **路由修正**：新增持久化 `global_account_id`，所有 Codex Session 只向该账号收敛。usage-limit/主动重选会并行刷新真实 quota，原生账号按最紧窗口剩余额度取最高，原生全耗尽时改走 API 号池。空闲 Task 立即复制 rollout + rebind + 改绑定，活跃 Task 不强杀并在收尾/下一回合收敛。
+- **时间修正**：所有前端时间固定 `Asia/Shanghai`，移除按浏览器/localStorage 分流。同时修复 ISO suffix 正则把日期中 `-05` 误当 UTC offset 的 bug，旧的 naive UTC 历史时间无需改库即会正确显示。
+- **验证**：Codex pool + resume 路由 `120 passed`，时区/Prefs/Pool Drawer 前端 `82 passed`，production build、Python compile 和 `git diff --check` 通过。

@@ -908,6 +908,7 @@ export interface CodexPoolUsageStatus {
   cooldown: number;
   disabled: number;
   preferred: string | null;
+  global_account?: string | null;
   last_selected?: string | null;
   accounts: CodexPoolAccountUsage[];
 }

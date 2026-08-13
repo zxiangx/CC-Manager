@@ -5,7 +5,6 @@ import type { RuntimeSettings } from '../../api/client';
 import { getTheme, setTheme as persistTheme, THEME_OPTIONS, type Theme } from '../../config/theme';
 import { getCustomColors, setCustomColors, hasBgImage, getBgVisible, setBgVisible } from '../../config/customTheme';
 import { importBgImage, clearBgImage } from '../../config/customBg';
-import { getTimezone, setTimezone, TIMEZONE_OPTIONS } from '../../config/timezone';
 
 /** 顶栏齿轮下拉：时区 / 主题 / PTY / 访问置顶 / 压缩阈值 / 飞书 / 密码 / 退出。
  * 低频设置集中收纳，保持顶栏精简。 */
@@ -16,7 +15,6 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
   const [bgBusy, setBgBusy] = useState(false);
   const [bgVisible, setBgVisibleState] = useState(getBgVisible());
   const bgInputRef = useRef<HTMLInputElement>(null);
-  const [tz, setTz] = useState(getTimezone());
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -218,15 +216,7 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
           )}
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs text-gray-400 flex items-center gap-1.5"><Globe size={13} /> 时区</span>
-            <select
-              value={tz}
-              onChange={(e) => { setTimezone(e.target.value); setTz(e.target.value); }}
-              className={selectCls}
-            >
-              {TIMEZONE_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
+            <span className="text-xs text-gray-300">北京时间 (UTC+8)</span>
           </div>
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs text-gray-400 flex items-center gap-1.5"><Palette size={13} /> 主题</span>

@@ -1037,6 +1037,12 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **排序修复**：默认自动模式不再按打开时间或遗留 `sort_order` 排序，而是在标星分组内按最后一条非空 user/assistant message 倒序；同一 Session 的所有隐藏编辑分支聚合到 canonical Task。关闭自动模式后仍保留手动拖拽排序。生产 2GB SQLite 数据只读实测采用 task-id 索引的查询约 95ms，避免按 event type 扫描整库。
 - **验证**：排序相关后端完整矩阵 `211 passed`；前端全量 `42 files / 568 tests`（TZ=UTC）、production build及改动文件 ESLint通过，`git diff --check` 通过。
 
+### 2026-08-13 — Codex 健康账号被逐回合轮换与假 thinking（commit 7d8e28b3）
+
+- **根因**：成功 turn 收尾总会调用主动额度切换；当 Task 已位于当前全局账号时，分支直接调用“排除当前账号后选最高额度”的全局 selector，没有先检查当前账号是否达到 90%，于是每个成功回合都会切换全局账号。随后其他 Session 被迫复制 rollout、重绑 owner；目标 home 有活跃 turn 和旧 thread 缓存时只能每 5 秒重排队，而 ChatView 又把本地 `sending`/Task 状态直接显示成 `Codex is thinking`。
+- **修复**：当前 home 已是全局账号时强制实时读取其 quota，只有确定达到阈值才允许 selector 改全局指针；额度未知/读取失败也保持当前账号。`inject-capabilities` 现同时返回 Dispatcher 的精确启动队列事实，前端只有原生 `root_turn_active=true` 才显示 thinking，路由/准入等待改为明确的“已排队，turn 尚未开始执行”。
+- **预防与验证**：新增健康全局账号不得轮换、能力接口暴露 queue、ChatView 不显示假 thinking 三项回归。相关后端 376 项通过（macOS `/tmp`→`/private/tmp` 的 2 项既有平台断言除外），ChatView 118 项与 production build 通过。
+
 ### 2026-08-13 — Goal 空闲门控与注入消息编辑（commit cd3c014a）
 
 - **Goal 修正**：CCM 不再在根回合结束但子 Agent 仍运行时释放 Goal 续跑条件；存在任何活跃后代时临时暂停原生 Goal，整条 lineage 真正空闲后才恢复。用户在等待期间清除或结束 Goal 时不会被后台门控重新激活，真正发起后续回合的仍是 Codex 原生 Goal runtime。

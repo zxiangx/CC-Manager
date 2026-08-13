@@ -251,6 +251,37 @@ async def test_inject_codex_message_forwards_native_attachment_inputs():
 
 
 @pytest.mark.asyncio
+async def test_codex_parent_followup_facades_preserve_native_state():
+    registry = MagicMock()
+    registry.thread_execution_state = AsyncMock(return_value={
+        "root_turn_active": False,
+        "descendants_active": True,
+        "descendant_count": 1,
+        "parent_followup_supported": True,
+    })
+    registry.start_parent_followup_with_id = AsyncMock(
+        return_value="turn-parent-followup"
+    )
+    manager = InstanceManager(MagicMock(), MagicMock())
+    manager._codex_app_server = registry
+
+    state = await manager.codex_thread_execution_state("thread-1")
+    turn_id = await manager.start_codex_parent_followup(
+        "thread-1",
+        "answer while the child runs",
+    )
+
+    assert state["descendants_active"] is True
+    assert turn_id == "turn-parent-followup"
+    registry.thread_execution_state.assert_awaited_once_with("thread-1")
+    registry.start_parent_followup_with_id.assert_awaited_once_with(
+        "thread-1",
+        "answer while the child runs",
+        input_items=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_inject_pty_attachment_rejects_container_before_inject():
     session = types.SimpleNamespace(
         session_id="claude-session-1",

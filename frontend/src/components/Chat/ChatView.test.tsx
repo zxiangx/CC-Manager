@@ -43,6 +43,11 @@ vi.mock('../../api/client', () => ({
     getInjectCapabilities: vi.fn().mockResolvedValue({
       attachment_protocol: 1,
       codex_native_inputs: true,
+      adapter_active: true,
+      root_turn_active: true,
+      descendants_active: false,
+      descendant_count: 0,
+      parent_followup_supported: false,
     }),
     injectTaskMessage: vi.fn().mockResolvedValue({ ok: true, injected: true }),
     listQuickPhrases: vi.fn().mockResolvedValue([]),
@@ -178,6 +183,11 @@ describe('ChatView', () => {
     (api.getInjectCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue({
       attachment_protocol: 1,
       codex_native_inputs: true,
+      adapter_active: true,
+      root_turn_active: true,
+      descendants_active: false,
+      descendant_count: 0,
+      parent_followup_supported: false,
     });
     (api.injectTaskMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
@@ -662,7 +672,7 @@ describe('ChatView', () => {
       ['codex', 'in_progress', 'Codex'],
     ] as const)(
       'restores the %s thinking indicator when an already-running task is opened',
-      (provider, status, label) => {
+      async (provider, status, label) => {
         render(
           <ChatView
             task={makeTask({ id: provider === 'claude' ? 301 : 302, provider, status })}
@@ -671,7 +681,9 @@ describe('ChatView', () => {
           />,
         );
 
-        expect(screen.getByText(`${label} is thinking...`)).toBeInTheDocument();
+        expect(
+          await screen.findByText(`${label} is thinking...`),
+        ).toBeInTheDocument();
         expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
       },
     );
@@ -1219,6 +1231,58 @@ describe('ChatView', () => {
       expect(api.sendTaskChat).not.toHaveBeenCalled();
     });
 
+    it('labels descendant-only work and starts a new parent turn', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.getInjectCapabilities).mockResolvedValue({
+        attachment_protocol: 1,
+        codex_native_inputs: true,
+        adapter_active: true,
+        root_turn_active: false,
+        descendants_active: true,
+        descendant_count: 2,
+        parent_followup_supported: true,
+      });
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+        delivery: 'parent_turn',
+        turn_id: 'turn-parent-followup',
+      });
+
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await screen.findByText('2 个子 Agent 正在运行，父 Agent 当前空闲');
+      expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+      await userEvent.type(screen.getByRole('textbox'), 'parent status please');
+      await userEvent.click(screen.getByTitle('启动父 Agent 新 turn (Enter)'));
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'parent status please',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
     it('uploads images and files and injects their exact server metadata into the active turn', async () => {
       const task = makeTask({
         provider: 'codex',
@@ -1429,7 +1493,7 @@ describe('ChatView', () => {
       await userEvent.type(screen.getByRole('textbox'), '请结合附件继续');
       await userEvent.click(screen.getByTitle('发送到运行中的 turn (Enter)'));
 
-      expect(await screen.findByText(/服务器没有确认消息已注入/)).toHaveTextContent(
+      expect(await screen.findByText(/服务器没有确认消息已送达/)).toHaveTextContent(
         '消息和附件已保留',
       );
       expect(screen.getByRole('textbox')).toHaveValue('请结合附件继续');

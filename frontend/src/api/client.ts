@@ -841,6 +841,11 @@ export interface InjectTaskAttachments {
 export interface InjectTaskCapabilities {
   attachment_protocol?: number;
   codex_native_inputs?: boolean;
+  adapter_active?: boolean;
+  root_turn_active?: boolean;
+  descendants_active?: boolean;
+  descendant_count?: number;
+  parent_followup_supported?: boolean;
 }
 
 export interface PoolAccountUsage extends CloudRouterAccountProjection {
@@ -1434,7 +1439,7 @@ export const api = {
     expectedRouting?: TaskRoutingExpectation,
     uploads?: InjectTaskAttachments,
   ) =>
-    request<{ ok: boolean; injected: boolean; attachment_count?: number }>(`/api/tasks/${taskId}/inject`, {
+    request<{ ok: boolean; injected: boolean; delivery?: 'steer' | 'parent_turn'; turn_id?: string | null; attachment_count?: number }>(`/api/tasks/${taskId}/inject`, {
       method: 'POST',
       body: JSON.stringify({
         message,

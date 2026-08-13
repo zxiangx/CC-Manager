@@ -3370,6 +3370,136 @@ async def test_goal_continuation_waits_until_descendant_is_idle():
 
 
 @pytest.mark.asyncio
+async def test_descendant_only_state_starts_a_new_parent_turn():
+    """A completed root with a live child is not a steerable root turn."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    turn_starts: list[dict] = []
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-parent-followup",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            turn_starts.append(params)
+            turn_id = (
+                "turn-parent-initial"
+                if len(turn_starts) == 1
+                else "turn-parent-followup"
+            )
+            return {"turn": {"id": turn_id}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="delegate work",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=310,
+    )
+    server._handle_notification("turn/started", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-parent-initial", "status": "inProgress"},
+    })
+    server._handle_notification("thread/started", {
+        "thread": {
+            "id": "thread-parent-child",
+            "parentThreadId": thread_id,
+            "status": {"type": "active"},
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-parent-initial",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    state = server.thread_execution_state(thread_id)
+    assert state == {
+        "adapter_active": True,
+        "root_turn_active": False,
+        "descendants_active": True,
+        "descendant_count": 1,
+        "parent_followup_supported": True,
+    }
+
+    followup_turn_id = await server.start_parent_followup_with_id(
+        thread_id,
+        "give me a status update",
+    )
+
+    assert followup_turn_id == "turn-parent-followup"
+    assert turn_starts[1]["threadId"] == thread_id
+    assert turn_starts[1]["input"] == [
+        {"type": "text", "text": "give me a status update"},
+    ]
+    assert server.thread_execution_state(thread_id)["root_turn_active"] is True
+    context = server._contexts_by_thread[thread_id]
+    assert context.deferred_terminal_notification is None
+    assert context.active_descendant_thread_ids == {"thread-parent-child"}
+    assert process.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_parent_followup_refuses_to_overlap_an_active_root_turn():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-active-root",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-active-root"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    _, thread_id = await server.start_turn(
+        prompt="keep working",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=311,
+    )
+    server._handle_notification("turn/started", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-active-root", "status": "inProgress"},
+    })
+    server._handle_notification("thread/started", {
+        "thread": {
+            "id": "thread-active-child",
+            "parentThreadId": thread_id,
+            "status": {"type": "active"},
+        },
+    })
+
+    assert await server.start_parent_followup_with_id(
+        thread_id,
+        "must steer instead",
+    ) is None
+    assert server._request.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_descendant_gate_does_not_resurrect_a_cleared_goal():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)

@@ -3284,14 +3284,28 @@ async def test_inject_capabilities_advertise_attachment_protocol(
         provider="codex",
     )
 
-    response = await client.get(
-        f"/api/tasks/{task_id}/inject-capabilities",
-    )
+    mock_im = MagicMock()
+    mock_im.codex_thread_execution_state = AsyncMock(return_value={
+        "adapter_active": True,
+        "root_turn_active": False,
+        "descendants_active": True,
+        "descendant_count": 2,
+        "parent_followup_supported": True,
+    })
+    with patch("backend.main.instance_manager", mock_im):
+        response = await client.get(
+            f"/api/tasks/{task_id}/inject-capabilities",
+        )
 
     assert response.status_code == 200
     assert response.json() == {
         "attachment_protocol": 1,
         "codex_native_inputs": True,
+        "adapter_active": True,
+        "root_turn_active": False,
+        "descendants_active": True,
+        "descendant_count": 2,
+        "parent_followup_supported": True,
     }
 
 
@@ -3504,6 +3518,10 @@ async def test_codex_inject_steers_without_pty_mode(
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = False
+    mock_im.codex_thread_execution_state = AsyncMock(return_value={
+        "root_turn_active": True,
+        "parent_followup_supported": False,
+    })
     mock_im.inject_codex_message = AsyncMock(return_value="turn-steered")
     mock_broadcaster = MagicMock(broadcast=AsyncMock())
 
@@ -3539,6 +3557,56 @@ async def test_codex_inject_steers_without_pty_mode(
 
 
 @pytest.mark.asyncio
+async def test_codex_live_message_starts_parent_turn_when_only_child_runs(
+    client, session_factory, monkeypatch
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    task_id = await _create_task_with_session(
+        client, session_factory, provider="codex"
+    )
+    mock_im = MagicMock()
+    mock_im.codex_thread_execution_state = AsyncMock(return_value={
+        "root_turn_active": False,
+        "descendants_active": True,
+        "parent_followup_supported": True,
+    })
+    mock_im.start_codex_parent_followup = AsyncMock(
+        return_value="turn-parent-followup"
+    )
+    mock_im.inject_codex_message = AsyncMock()
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), \
+         patch("backend.main.broadcaster", mock_broadcaster):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "parent, answer me now"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["delivery"] == "parent_turn"
+    assert response.json()["turn_id"] == "turn-parent-followup"
+    mock_im.start_codex_parent_followup.assert_awaited_once_with(
+        "test-session-123",
+        "parent, answer me now",
+        input_items=None,
+    )
+    mock_im.inject_codex_message.assert_not_awaited()
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    assert json.loads(stored.raw_json)["turn_id"] == "turn-parent-followup"
+
+
+@pytest.mark.asyncio
 async def test_codex_inject_uses_native_image_and_file_inputs(
     client,
     session_factory,
@@ -3561,6 +3629,10 @@ async def test_codex_inject_uses_native_image_and_file_inputs(
         provider="codex",
     )
     mock_im = MagicMock()
+    mock_im.codex_thread_execution_state = AsyncMock(return_value={
+        "root_turn_active": True,
+        "parent_followup_supported": False,
+    })
     mock_im.inject_codex_message = AsyncMock(return_value=True)
     mock_broadcaster = MagicMock(broadcast=AsyncMock())
 
@@ -3762,6 +3834,10 @@ async def test_codex_inject_without_live_app_server_turn_returns_409(
         client, session_factory, provider="codex"
     )
     mock_im = MagicMock()
+    mock_im.codex_thread_execution_state = AsyncMock(return_value={
+        "root_turn_active": False,
+        "parent_followup_supported": False,
+    })
     mock_im.inject_codex_message = AsyncMock(return_value=False)
 
     with patch("backend.main.instance_manager", mock_im), \
@@ -3771,7 +3847,7 @@ async def test_codex_inject_without_live_app_server_turn_returns_409(
         )
 
     assert resp.status_code == 409
-    assert "exec fallback" in resp.json()["detail"]
+    assert "未确认处于可启动父 turn" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio

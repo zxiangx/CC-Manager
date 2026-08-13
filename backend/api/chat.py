@@ -2514,10 +2514,24 @@ async def inject_capabilities(
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
-    return {
+    capabilities: dict[str, Any] = {
         "attachment_protocol": 1,
         "codex_native_inputs": True,
+        "adapter_active": False,
+        "root_turn_active": False,
+        "descendants_active": False,
+        "descendant_count": 0,
+        "parent_followup_supported": False,
     }
+    if (task.provider or "claude").lower() == "codex" and task.session_id:
+        from backend.main import instance_manager
+
+        capabilities.update(
+            await instance_manager.codex_thread_execution_state(
+                task.session_id,
+            )
+        )
+    return capabilities
 
 
 @router.post("/{task_id}/inject")
@@ -2584,6 +2598,7 @@ async def inject_message(
 
         provider = (task.provider or "claude").lower()
         native_turn_id: str | None = None
+        delivery = "steer"
         transport_content = _inject_transport_content(
             body.message,
             uploads,
@@ -2596,20 +2611,37 @@ async def inject_message(
                     400,
                     "Codex app-server 未开启，当前 exec 链路不支持执行中注入",
                 )
-            if uploads:
-                steer_result = await instance_manager.inject_codex_message(
+            input_items = (
+                _codex_inject_input_items(transport_content, uploads)
+                if uploads
+                else None
+            )
+            execution_state = (
+                await instance_manager.codex_thread_execution_state(
+                    task.session_id,
+                )
+            )
+            if execution_state.get("root_turn_active"):
+                if input_items is not None:
+                    steer_result = await instance_manager.inject_codex_message(
+                        task.session_id,
+                        transport_content,
+                        input_items=input_items,
+                    )
+                else:
+                    steer_result = await instance_manager.inject_codex_message(
+                        task.session_id,
+                        transport_content,
+                    )
+            elif execution_state.get("parent_followup_supported"):
+                delivery = "parent_turn"
+                steer_result = await instance_manager.start_codex_parent_followup(
                     task.session_id,
                     transport_content,
-                    input_items=_codex_inject_input_items(
-                        transport_content,
-                        uploads,
-                    ),
+                    input_items=input_items,
                 )
             else:
-                steer_result = await instance_manager.inject_codex_message(
-                    task.session_id,
-                    transport_content,
-                )
+                steer_result = None
             ok = bool(steer_result)
             # Real InstanceManager calls return the exact id.  Keep bool
             # compatibility for rolling deploys and test doubles, but never
@@ -2617,9 +2649,8 @@ async def inject_message(
             if isinstance(steer_result, str):
                 native_turn_id = steer_result
             unavailable_detail = (
-                "注入失败：当前 Codex turn 已结束、暂不可 steer、附件输入被 "
-                "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"
-                "模式直接发普通消息"
+                "消息发送失败：当前父 Codex turn 不可 steer，且未确认处于"
+                "可启动父 turn 的子 Agent 独立运行状态；消息和附件未发送"
             )
         elif provider == "claude":
             if not instance_manager.has_pty_session(task.session_id):
@@ -2691,6 +2722,8 @@ async def inject_message(
         return {
             "ok": True,
             "injected": True,
+            "delivery": delivery,
+            "turn_id": native_turn_id,
             "attachment_count": len(uploads),
         }
 

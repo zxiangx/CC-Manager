@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry, MessageBranchState } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, InjectTaskCapabilities, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry, MessageBranchState } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Pin, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
@@ -465,6 +465,7 @@ function ChatRuntimeView({
   const [codexMonitorEnabled, setCodexMonitorEnabled] = useState<boolean | null>(null);
   const [injecting, setInjecting] = useState(false);
   const injectingRef = useRef(false);
+  const [codexExecutionState, setCodexExecutionState] = useState<InjectTaskCapabilities | null>(null);
   const canInject = task.worker_id == null && task.shared_from_id == null && (
     task.provider === 'codex' ? codexAppServerEnabled : ptyMode
   );
@@ -516,15 +517,33 @@ function ChatRuntimeView({
     return () => document.removeEventListener('mousedown', handle);
   }, [showModelMenu, modelOptions.length, task.provider]);
 
-  const handleInject = async (text: string, uploadResults: UploadResult[]) => {
+  const handleInject = async (
+    text: string,
+    uploadResults: UploadResult[],
+    preflightCapabilities?: InjectTaskCapabilities,
+  ) => {
     if ((!text && uploadResults.length === 0) || injectingRef.current) return;
     injectingRef.current = true;
     setInjecting(true);
     setError(null);
     try {
+      let capabilities = preflightCapabilities;
+      if (task.provider === 'codex' || uploadResults.length > 0) {
+        capabilities = capabilities || await api.getInjectCapabilities(task.id);
+        if (task.provider === 'codex') {
+          setCodexExecutionState(capabilities);
+          if (
+            !capabilities.root_turn_active
+            && !capabilities.parent_followup_supported
+          ) {
+            throw new Error(
+              '服务器未确认父 turn 正在运行，也未确认当前可启动新的父 turn',
+            );
+          }
+        }
+      }
       if (uploadResults.length > 0) {
-        const capabilities = await api.getInjectCapabilities(task.id);
-        if (capabilities.attachment_protocol !== 1) {
+        if (!capabilities || capabilities.attachment_protocol !== 1) {
           throw new Error(
             '当前服务器未确认附件注入协议，已在发送前停止；消息和附件未发送',
           );
@@ -541,7 +560,7 @@ function ChatRuntimeView({
         uploadResults.length > 0 ? injectAttachments(uploadResults) : undefined,
       );
       if (!result.ok || !result.injected) {
-        throw new Error('服务器没有确认消息已注入，输入和附件已保留');
+        throw new Error('服务器没有确认消息已送达，输入和附件已保留');
       }
       if (
         uploadResults.length > 0
@@ -559,9 +578,17 @@ function ChatRuntimeView({
       ));
       fileUpload.clear();
       consumeForkSeedUploads();
+      if (task.provider === 'codex' && result.delivery === 'parent_turn') {
+        setCodexExecutionState((current) => ({
+          ...(current || {}),
+          adapter_active: true,
+          root_turn_active: true,
+          parent_followup_supported: false,
+        }));
+      }
     } catch (e) {
       setError(
-        `未收到注入成功确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
+        `未收到消息送达确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
           e instanceof Error ? e.message : String(e)
         }`,
       );
@@ -618,6 +645,50 @@ function ChatRuntimeView({
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  const codexRootTurnActive = task.provider === 'codex'
+    && codexExecutionState?.root_turn_active === true;
+  const codexDescendantsOnly = task.provider === 'codex'
+    && !sending
+    && codexExecutionState?.descendants_active === true
+    && !codexRootTurnActive;
+  const codexParentFollowupAvailable = codexDescendantsOnly
+    && codexExecutionState?.parent_followup_supported === true;
+  const liveMessageAvailable = canInject && (
+    task.provider !== 'codex'
+    || codexRootTurnActive
+    || codexParentFollowupAvailable
+    || codexExecutionState === null
+  );
+
+  useEffect(() => {
+    if (
+      task.provider !== 'codex'
+      || !codexAppServerEnabled
+      || !task.session_id
+      || !isProcessing
+    ) {
+      setCodexExecutionState(null);
+      return;
+    }
+    let active = true;
+    const refresh = () => {
+      api.getInjectCapabilities(task.id).then((capabilities) => {
+        if (active) setCodexExecutionState(capabilities);
+      }).catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [
+    codexAppServerEnabled,
+    isProcessing,
+    task.id,
+    task.provider,
+    task.session_id,
+  ]);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const historyCursorRef = useRef<{
@@ -1968,11 +2039,36 @@ function ChatRuntimeView({
     // immediately; an idle Task starts a normal follow-up turn. Unsupported
     // remote/shared transports keep the existing explicit queue behavior.
     if (isProcessing && canInject && !fromQueue) {
-      await handleInject(
-        text,
-        uploadedResultsForTurn,
-      );
-      return;
+      if (task.provider === 'codex') {
+        try {
+          const capabilities = await api.getInjectCapabilities(task.id);
+          setCodexExecutionState(capabilities);
+          if (
+            capabilities.root_turn_active
+            || capabilities.parent_followup_supported
+          ) {
+            await handleInject(
+              text,
+              uploadedResultsForTurn,
+              capabilities,
+            );
+            return;
+          }
+        } catch (e) {
+          setError(
+            `无法确认 Codex 父 turn 状态，消息和附件已保留：${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+          return;
+        }
+      } else {
+        await handleInject(
+          text,
+          uploadedResultsForTurn,
+        );
+        return;
+      }
     }
 
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
@@ -2682,10 +2778,22 @@ function ChatRuntimeView({
             />
           )
         )}
-        {isProcessing && (
+        {codexDescendantsOnly && (
+          <div className="flex gap-2 items-center text-amber-300/90 text-sm px-3">
+            <GitBranch size={14} />
+            <span>
+              {codexExecutionState?.descendant_count || 1} 个子 Agent 正在运行，父 Agent 当前空闲
+            </span>
+          </div>
+        )}
+        {isProcessing && !codexDescendantsOnly && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
-            <span>{providerLabel} is thinking...</span>
+            <span>
+              {task.provider === 'codex' && !sending && !codexRootTurnActive
+                ? '正在确认 Codex 父 turn 状态...'
+                : `${providerLabel} is thinking...`}
+            </span>
           </div>
         )}
           <div ref={bottomRef} className="h-4" />
@@ -3037,10 +3145,16 @@ function ChatRuntimeView({
             </div>
           </div>
           {/* Row 2: full-width input */}
-          {isProcessing && canInject && (
-            <div className="text-[10px] leading-relaxed text-teal-300/80">
-              正在运行：发送会通过 {injectTransport} 直接补充当前 turn；服务器确认成功后才会清空输入和附件。
-            </div>
+          {isProcessing && liveMessageAvailable && (
+            codexParentFollowupAvailable ? (
+              <div className="text-[10px] leading-relaxed text-amber-300/85">
+                仅子 Agent 正在运行：发送会在同一 session 启动父 Agent 的新 turn，不会注入已经结束的父 turn。
+              </div>
+            ) : (
+              <div className="text-[10px] leading-relaxed text-teal-300/80">
+                正在运行：发送会通过 {injectTransport} 直接补充当前 turn；服务器确认成功后才会清空输入和附件。
+              </div>
+            )
           )}
           <div className="flex gap-2 items-end">
             <textarea
@@ -3051,8 +3165,10 @@ function ChatRuntimeView({
               placeholder={
                 !task.session_id && !task.shared_from_id
                   ? 'Run the task first to start a session...'
-                  : isProcessing && canInject
-                    ? '直接给正在运行的 Agent 补充消息...'
+                  : isProcessing && codexParentFollowupAvailable
+                    ? '给父 Agent 发送一条新消息...'
+                    : isProcessing && liveMessageAvailable
+                      ? '直接给正在运行的 Agent 补充消息...'
                     : isProcessing
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
@@ -3067,15 +3183,22 @@ function ChatRuntimeView({
               disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
-                : isProcessing && canInject
+                : isProcessing && codexParentFollowupAvailable
+                ? '启动父 Agent 新 turn (Enter)'
+                : isProcessing && liveMessageAvailable
                 ? '发送到运行中的 turn (Enter)'
                 : isProcessing ? 'Add to queue (Enter)' : 'Send (Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
-                isProcessing && canInject ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
+                isProcessing && codexParentFollowupAvailable ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
+                : isProcessing && liveMessageAvailable ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {isProcessing && canInject ? <Syringe size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+              {isProcessing && codexParentFollowupAvailable
+                ? <Send size={18} />
+                : isProcessing && liveMessageAvailable
+                  ? <Syringe size={18} />
+                  : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
             </button>
           </div>
           </div>

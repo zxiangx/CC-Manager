@@ -609,6 +609,9 @@ class _TurnContext:
     goal_terminal_generation: int = 0
     goal_guard_tasks: set[asyncio.Task] = field(default_factory=set)
     goal_started_future: asyncio.Future | None = None
+    parent_followup_lock: asyncio.Lock | None = None
+    parent_followup_in_flight: bool = False
+    turn_start_template: dict[str, Any] | None = None
     non_retry_error: dict[str, Any] | None = None
     tools_disabled: bool = False
     tool_policy_violation: str | None = None
@@ -714,6 +717,53 @@ class CodexAppServer:
     def has_active_thread(self, thread_id: str) -> bool:
         context = self._contexts_by_thread.get(thread_id)
         return bool(context and context.process.returncode is None)
+
+    def thread_execution_state(self, thread_id: str) -> dict[str, Any]:
+        """Return root-turn and descendant facts without collapsing them.
+
+        ``Task.status`` stays executing while a retained process owns live
+        descendants, so it cannot answer whether ``turn/steer`` is legal.
+        This snapshot is derived from the exact app-server context instead.
+        """
+
+        context = self._contexts_by_thread.get(thread_id)
+        if context is None or not self._context_is_current(context):
+            return {
+                "adapter_active": False,
+                "root_turn_active": False,
+                "descendants_active": False,
+                "descendant_count": 0,
+                "parent_followup_supported": False,
+            }
+        runtime = self._thread_runtime.get(thread_id)
+        root_turn_active = bool(
+            context.parent_followup_in_flight
+            or (
+                runtime is not None
+                and runtime.active_turn_ids
+            )
+            or (
+                context.admitted_turn_id is not None
+                and context.deferred_terminal_notification is None
+                and context.pending_goal_terminal_notification is None
+            )
+        )
+        descendant_count = len(context.active_descendant_thread_ids)
+        descendants_active = descendant_count > 0
+        return {
+            "adapter_active": True,
+            "root_turn_active": root_turn_active,
+            "descendants_active": descendants_active,
+            "descendant_count": descendant_count,
+            "parent_followup_supported": bool(
+                descendants_active
+                and not root_turn_active
+                and context.deferred_terminal_notification is not None
+                and context.turn_start_template is not None
+                and context.turn_start_template.get("serviceTier") is None
+                and not context.tools_disabled
+            ),
+        }
 
     def owns_live_turn_process(self, process: CodexTurnProcess) -> bool:
         """Return whether this server owns the exact live adapter generation."""
@@ -1206,6 +1256,9 @@ class CodexAppServer:
     ) -> None:
         runtime = self._runtime_state_for(thread_id)
         if method == "turn/started":
+            root_context = self._contexts_by_thread.get(thread_id)
+            if root_context is not None:
+                root_context.parent_followup_in_flight = False
             if turn_id:
                 runtime.active_turn_ids.add(turn_id)
             runtime.status_type = "active"
@@ -3111,6 +3164,15 @@ class CodexAppServer:
                 "excludeTmpdirEnvVar": False,
                 "excludeSlashTmp": False,
             }
+        # A root turn can complete while native descendants keep this exact
+        # process consumer alive. Preserve the schema-backed turn overrides so
+        # a later user message can begin a normal parent turn on the same
+        # thread instead of being misrouted through turn/steer.
+        context.turn_start_template = {
+            key: value
+            for key, value in turn_params.items()
+            if key != "input"
+        }
         if adopt_active_goal:
             self._mark_following_native_goal(context)
             adoption = asyncio.create_task(
@@ -4112,6 +4174,153 @@ class CodexAppServer:
             is not None
         )
 
+    @staticmethod
+    def _normalize_turn_input(
+        content: str,
+        input_items: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        if input_items is None:
+            return [{"type": "text", "text": content}]
+        normalized: list[dict[str, Any]] = []
+        for item in input_items:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid Codex steer input item")
+            item_type = item.get("type")
+            if (
+                item_type == "text"
+                and set(item) == {"type", "text"}
+                and isinstance(item.get("text"), str)
+                and item["text"]
+            ):
+                normalized.append({
+                    "type": "text",
+                    "text": item["text"],
+                })
+            elif (
+                item_type == "localImage"
+                and set(item) == {"type", "path"}
+                and isinstance(item.get("path"), str)
+                and os.path.isabs(item["path"])
+            ):
+                normalized.append({
+                    "type": "localImage",
+                    "path": item["path"],
+                })
+            elif (
+                item_type == "mention"
+                and set(item) == {"type", "name", "path"}
+                and isinstance(item.get("name"), str)
+                and item["name"]
+                and isinstance(item.get("path"), str)
+                and os.path.isabs(item["path"])
+            ):
+                normalized.append({
+                    "type": "mention",
+                    "name": item["name"],
+                    "path": item["path"],
+                })
+            else:
+                raise ValueError("Invalid Codex steer input item")
+        return normalized
+
+    async def start_parent_followup_with_id(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Start a normal root turn while retained descendants still run.
+
+        The completed root adapter deliberately stays alive to collect child
+        lifecycle events. Reuse that same consumer and native thread, but only
+        across the strong boundary represented by its deferred terminal
+        notification. This must never overlap a live root turn.
+        """
+
+        if not self.is_alive or not thread_id or (not content and not input_items):
+            return None
+        turn_input = self._normalize_turn_input(content, input_items)
+        context = self._contexts_by_thread.get(thread_id)
+        if context is None or not self._context_is_current(context):
+            return None
+        lock = context.parent_followup_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            context.parent_followup_lock = lock
+        async with lock:
+            state = self.thread_execution_state(thread_id)
+            if not state["parent_followup_supported"]:
+                return None
+            template = context.turn_start_template
+            if template is None:
+                return None
+
+            previous_terminal = context.deferred_terminal_notification
+            context.parent_followup_in_flight = True
+            context.deferred_terminal_notification = None
+            context.pending_goal_terminal_notification = None
+            context.goal_terminal_generation += 1
+            guard = context.descendant_guard_task
+            context.descendant_guard_task = None
+            if guard is not None and not guard.done():
+                guard.cancel()
+            changed = context.descendant_state_changed
+            if changed is not None:
+                changed.set()
+            self._reset_goal_turn_identity(context)
+            context.usage = None
+            context.first_input_seen = False
+            context.first_output_seen = False
+            context.non_retry_error = None
+
+            params = dict(template)
+            params["input"] = turn_input
+            try:
+                response = await self._request("turn/start", params)
+            except CodexAppServerRequestError:
+                # A JSON-RPC rejection proves no native turn was admitted, so
+                # the completed-root fence can safely be restored.
+                context.parent_followup_in_flight = False
+                if self._context_is_current(context):
+                    context.deferred_terminal_notification = previous_terminal
+                    if context.active_descendant_thread_ids:
+                        context.descendant_guard_task = asyncio.create_task(
+                            self._guard_deferred_terminal(context),
+                        )
+                raise
+            except BaseException:
+                # Timeout/cancellation after the request reached the wire has
+                # indeterminate admission state. Keep the root marked active;
+                # a later turn notification resolves its exact identity.
+                raise
+
+            turn = response.get("turn") if isinstance(response, dict) else None
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not turn_id:
+                context.parent_followup_in_flight = False
+                context.deferred_terminal_notification = previous_terminal
+                if context.active_descendant_thread_ids:
+                    context.descendant_guard_task = asyncio.create_task(
+                        self._guard_deferred_terminal(context),
+                    )
+                raise CodexAppServerError(
+                    "parent follow-up turn/start returned no turn id"
+                )
+            turn_id = str(turn_id)
+            context.parent_followup_in_flight = False
+            context.admitted_turn_id = turn_id
+            if context.observed_turn_id is None:
+                self._bind_turn_context(context, turn_id, observed=False)
+            else:
+                self._alias_turn_context(context, turn_id)
+            self._record_thread_turn_lifecycle(
+                "turn/started",
+                thread_id,
+                turn_id,
+            )
+            return turn_id
+
     async def steer_turn_with_id(
         self,
         thread_id: str,
@@ -4128,53 +4337,9 @@ class CodexAppServer:
         """
         if not self.is_alive or not thread_id or (not content and not input_items):
             return None
-        if input_items is None:
-            steer_input: list[dict[str, Any]] = [
-                {"type": "text", "text": content},
-            ]
-        else:
-            steer_input = []
-            for item in input_items:
-                if not isinstance(item, dict):
-                    raise ValueError("Invalid Codex steer input item")
-                item_type = item.get("type")
-                if (
-                    item_type == "text"
-                    and set(item) == {"type", "text"}
-                    and isinstance(item.get("text"), str)
-                    and item["text"]
-                ):
-                    steer_input.append({
-                        "type": "text",
-                        "text": item["text"],
-                    })
-                elif (
-                    item_type == "localImage"
-                    and set(item) == {"type", "path"}
-                    and isinstance(item.get("path"), str)
-                    and os.path.isabs(item["path"])
-                ):
-                    steer_input.append({
-                        "type": "localImage",
-                        "path": item["path"],
-                    })
-                elif (
-                    item_type == "mention"
-                    and set(item) == {"type", "name", "path"}
-                    and isinstance(item.get("name"), str)
-                    and item["name"]
-                    and isinstance(item.get("path"), str)
-                    and os.path.isabs(item["path"])
-                ):
-                    steer_input.append({
-                        "type": "mention",
-                        "name": item["name"],
-                        "path": item["path"],
-                    })
-                else:
-                    raise ValueError("Invalid Codex steer input item")
-            if not steer_input:
-                raise ValueError("Codex steer input cannot be empty")
+        steer_input = self._normalize_turn_input(content, input_items)
+        if not steer_input:
+            raise ValueError("Codex steer input cannot be empty")
         context = self._contexts_by_thread.get(thread_id)
         if (
             context is None
@@ -6258,6 +6423,71 @@ class CodexAppServerRegistry:
                     self._decrement_starting_locked(home)
 
             await _settle_registry_cleanup(_release_steer_reservation())
+
+    async def thread_execution_state(
+        self,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Read one owned thread's root/descendant execution snapshot."""
+
+        async with self._lock:
+            home = self._thread_owners.get(thread_id)
+            server = self._servers.get(home) if home else None
+        if server is None:
+            return {
+                "adapter_active": False,
+                "root_turn_active": False,
+                "descendants_active": False,
+                "descendant_count": 0,
+                "parent_followup_supported": False,
+            }
+        return server.thread_execution_state(thread_id)
+
+    async def start_parent_followup_with_id(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Start a root follow-up on a retained descendant-owning adapter."""
+
+        home: str | None = None
+        async with self._lock:
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
+            home = self._thread_owners.get(thread_id)
+            if home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is draining: {home}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is being rebound"
+                )
+            server = self._servers.get(home) if home else None
+            if server is not None and home is not None:
+                self._starting[home] = self._starting.get(home, 0) + 1
+        if server is None:
+            return None
+        try:
+            return await server.start_parent_followup_with_id(
+                thread_id,
+                content,
+                input_items=input_items,
+            )
+        finally:
+            assert home is not None
+
+            async def _release_parent_followup_reservation() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+
+            await _settle_registry_cleanup(
+                _release_parent_followup_reservation()
+            )
 
     async def read_rate_limits(
         self, codex_home: str | os.PathLike[str] | None,

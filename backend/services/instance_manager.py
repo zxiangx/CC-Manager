@@ -536,6 +536,50 @@ class InstanceManager:
             logger.exception("Codex inject failed for thread %s", thread_id)
             return None
 
+    async def codex_thread_execution_state(
+        self,
+        thread_id: str,
+    ) -> dict[str, object]:
+        """Expose native root/descendant facts for composer routing."""
+
+        if self._codex_app_server is None or not thread_id:
+            return {
+                "adapter_active": False,
+                "root_turn_active": False,
+                "descendants_active": False,
+                "descendant_count": 0,
+                "parent_followup_supported": False,
+            }
+        return await self._codex_app_server.thread_execution_state(thread_id)
+
+    async def start_codex_parent_followup(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict] | None = None,
+    ) -> str | None:
+        """Start a new root turn while native descendants remain active."""
+
+        if (
+            self._codex_app_server is None
+            or not thread_id
+            or (not content and not input_items)
+        ):
+            return None
+        try:
+            return await self._codex_app_server.start_parent_followup_with_id(
+                thread_id,
+                content,
+                input_items=input_items,
+            )
+        except Exception:
+            logger.exception(
+                "Codex parent follow-up failed for thread %s",
+                thread_id,
+            )
+            return None
+
     async def release_pty_session(self, session_id: str) -> None:
         """Return a PTY session to nothing — stop it and remove from the pool.
         Used when a workload (e.g. a loop task) is finished with its session.

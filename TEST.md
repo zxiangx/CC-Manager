@@ -934,6 +934,9 @@ python -m pytest \
 | `test_global_account_is_durable_and_never_falls_back` | 全局指针重启后保留，不可用时不偷偷切到其他账号 |
 | `test_selects_the_compatible_account_with_most_live_quota` | 实时额度按最紧窗口剩余百分比取最高 |
 | `test_highest_quota_falls_back_to_api_pool_when_native_is_exhausted` | 原生账号全耗尽时切到 API 号池 |
+| `test_codex_global_account_below_threshold_does_not_rotate_after_turn` | 健康的当前全局账号完成回合后不得无条件切到另一个账号 |
+| `test_inject_capabilities_advertise_attachment_protocol` | 运行能力接口同时返回真实父/子 turn 与启动前排队状态 |
+| `ChatView: shows pre-launch queue state instead of fake Codex thinking` | 启动前队列显示明确排队提示，不冒充模型正在思考 |
 
 #### Claude Pool (`test_claude_pool.py`)
 

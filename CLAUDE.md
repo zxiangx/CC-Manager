@@ -414,5 +414,5 @@ uv run alembic history         # 查看历史
 
 ## 2026-08-13 global Codex routing and display time
 
-- **Codex 全局账号不变式**: `accounts.json.global_account_id` 是持久事实源，`CodexPool.select()` 在全局模式不得回退到其他账号。手动切换或 usage-limit 轮换必须先原子发布全局指针，再安全复制 rollout、重绑 app-server owner 并持久化 Task binding；活跃回合不强杀，在停止后收敛。轮换实时刷新全部 quota，原生 OAuth 候选按最紧窗口剩余百分比取最高；全部耗尽时改用可用的 CloudRouter/ApexRouter API 号池。
+- **Codex 全局账号不变式**: `accounts.json.global_account_id` 是持久事实源，`CodexPool.select()` 在全局模式不得回退到其他账号。成功 turn 收尾只能在当前全局账号实时 quota 达到阈值后发起主动轮换，禁止仅因 selector 排除 current home 就逐回合切号；手动切换或 usage-limit 轮换必须先原子发布全局指针，再安全复制 rollout、重绑 app-server owner 并持久化 Task binding；活跃回合不强杀，在停止后收敛。轮换实时刷新全部 quota，原生 OAuth 候选按最紧窗口剩余百分比取最高；全部耗尽时改用可用的 CloudRouter/ApexRouter API 号池。聊天 UI 只有 `root_turn_active=true` 才可显示 Codex thinking，`Dispatcher.has_task_queue_work()` 为真但父/子 turn 均空闲时必须显示启动前排队，不能把路由迁移/准入等待冒充模型执行。
 - **展示时区**: 后端继续以 UTC 存储，前端统一用 `Asia/Shanghai` 显示且不再接受浏览器/localStorage 时区覆盖。无 suffix 的 ISO 时间戳必须按 UTC 解析；只有末尾 `Z` 或 `±HH:MM`/`±HHMM` 才算已有时区，不得把日期中的连字号误判为 offset。

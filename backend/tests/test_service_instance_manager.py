@@ -3964,6 +3964,65 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
 
 
 @pytest.mark.asyncio
+async def test_codex_global_account_below_threshold_does_not_rotate_after_turn(
+    db_factory, tmp_path,
+):
+    source = tmp_path / "codex-global-current"
+    target = tmp_path / "codex-global-other"
+    config = tmp_path / "codex-global-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "codex-current", "codex_home": str(source), "enabled": True},
+        {"id": "codex-other", "codex_home": str(target), "enabled": True},
+    ]}))
+    pool = CodexPool(config_path=config)
+    assert pool.set_global_account("codex-current") is True
+    pool.fetch_quota = AsyncMock(return_value=[
+        {
+            "id": "codex-current",
+            "quota": {
+                "primary_used_percent": 31,
+                "secondary_used_percent": 3,
+            },
+        },
+        {
+            "id": "codex-other",
+            "quota": {
+                "primary_used_percent": 0,
+                "secondary_used_percent": 0,
+            },
+        },
+    ])
+
+    async with db_factory() as db:
+        task = Task(
+            title="keep healthy global account",
+            provider="codex",
+            status="executing",
+            session_id="thread-global-healthy",
+            metadata_={"codex_account_id": "codex-current"},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._config_dirs[7] = str(source.resolve())
+    im.rebind_codex_thread = AsyncMock()
+    dispatcher = MagicMock(pool=None, codex_pool=pool)
+    dispatcher._select_and_publish_codex_global_account = AsyncMock(
+        return_value=str(target.resolve())
+    )
+
+    with patch("backend.main.dispatcher", dispatcher):
+        switched = await im._try_proactive_pool_switch(7, task.id)
+
+    assert switched is False
+    dispatcher._select_and_publish_codex_global_account.assert_not_awaited()
+    im.rebind_codex_thread.assert_not_awaited()
+    assert pool.global_account_id == "codex-current"
+
+
+@pytest.mark.asyncio
 async def test_codex_soft_quota_switch_does_not_override_explicit_preference(
     db_factory, tmp_path,
 ):

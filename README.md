@@ -47,7 +47,8 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **语音输入** — 通过 OpenAI Whisper API 语音转文字创建任务
 
 ### 可靠性
-- **Claude / Codex 统一账号路由** — Codex 使用持久化的「全局账号」，所有 Session 收敛到同一账号。当前账号额度耗尽时实时刷新候选额度，先选剩余额度最高的原生账号；原生账号全部耗尽后自动切到 CloudRouter/ApexRouter API 号池。迁移保留原 rollout 恢复副本，正在输出的回合在停止后收敛。
+- **Claude / Codex 统一账号路由** — Codex 使用持久化的「全局账号」，所有 Session 收敛到同一账号。成功回合不会触发无条件轮换；只有当前全局账号达到额度阈值或明确撞限时，才实时刷新候选额度并先选剩余额度最高的原生账号，原生账号全部耗尽后自动切到 CloudRouter/ApexRouter API 号池。迁移保留原 rollout 恢复副本，正在输出的回合在停止后收敛。
+- **真实 Codex 运行状态** — 聊天页只有在 app-server 明确报告父 turn 正在运行时才显示 `Codex is thinking`；消息尚在账号路由/启动准入队列时会明确显示“已排队，Codex turn 尚未开始执行”。
 - **统一北京时间** — 聊天历史和 Task 时间在所有设备固定以 `Asia/Shanghai (UTC+8)` 显示，后端仍保持 UTC 存储；无后缀的旧时间戳也会正确按 UTC 解析。
 - **API 账号安全删除** — CloudRouter/ApexRouter 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级

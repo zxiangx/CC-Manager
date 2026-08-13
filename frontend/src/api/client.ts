@@ -846,6 +846,7 @@ export interface InjectTaskCapabilities {
   descendants_active?: boolean;
   descendant_count?: number;
   parent_followup_supported?: boolean;
+  launch_queued?: boolean;
 }
 
 export interface PoolAccountUsage extends CloudRouterAccountProjection {

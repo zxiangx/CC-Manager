@@ -7292,6 +7292,46 @@ class InstanceManager:
                     if global_home and pool.canonical_home(global_home) != old_home:
                         new_home = pool.canonical_home(global_home)
                     else:
+                        # A completed turn on the already-selected global
+                        # account is not, by itself, a reason to rotate.  The
+                        # global selector excludes ``old_home`` and therefore
+                        # always returns a different account; without this
+                        # quota gate every successful Codex turn caused a
+                        # process-wide account change even when the current
+                        # account was almost unused.
+                        from backend.services.codex_pool import (
+                            api_quota_at_or_above,
+                            quota_at_or_above,
+                        )
+
+                        quota_by_id = {
+                            row["id"]: row
+                            for row in await pool.fetch_quota(
+                                force=True,
+                                live=True,
+                            )
+                        }
+                        old_account_id = pool.account_id_for_home(old_home)
+                        current_quota = quota_by_id.get(old_account_id)
+                        if (
+                            not current_quota
+                            or current_quota.get("error")
+                            or not (
+                                quota_at_or_above(
+                                    current_quota.get("quota")
+                                )
+                                or api_quota_at_or_above(
+                                    current_quota.get("api_quota")
+                                )
+                            )
+                        ):
+                            logger.info(
+                                "Codex quota switch skipped for task %d: "
+                                "global account %s remains below threshold",
+                                task_id,
+                                old_account_id,
+                            )
+                            return False
                         new_home = await dispatcher._select_and_publish_codex_global_account(
                             old_home=old_home,
                             model=task_model,

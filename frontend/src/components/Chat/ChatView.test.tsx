@@ -688,6 +688,37 @@ describe('ChatView', () => {
       },
     );
 
+    it('shows pre-launch queue state instead of fake Codex thinking', async () => {
+      vi.mocked(api.getInjectCapabilities).mockResolvedValue({
+        attachment_protocol: 1,
+        codex_native_inputs: true,
+        adapter_active: true,
+        root_turn_active: false,
+        descendants_active: false,
+        descendant_count: 0,
+        parent_followup_supported: false,
+        launch_queued: true,
+      });
+      const task = makeTask({
+        id: 303,
+        provider: 'codex',
+        status: 'completed',
+        session_id: 'thread-prelaunch',
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(screen.getByRole('textbox'), 'queued request');
+      fireEvent.keyDown(screen.getByRole('textbox'), {
+        key: 'Enter',
+        code: 'Enter',
+      });
+
+      expect(
+        await screen.findByText('消息已排队，Codex turn 尚未开始执行'),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+    });
+
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);

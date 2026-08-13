@@ -2522,15 +2522,20 @@ async def inject_capabilities(
         "descendants_active": False,
         "descendant_count": 0,
         "parent_followup_supported": False,
+        "launch_queued": False,
     }
     if (task.provider or "claude").lower() == "codex" and task.session_id:
-        from backend.main import instance_manager
+        from backend.main import dispatcher, instance_manager
 
         capabilities.update(
             await instance_manager.codex_thread_execution_state(
                 task.session_id,
             )
         )
+        if dispatcher is not None:
+            capabilities["launch_queued"] = bool(
+                await dispatcher.has_task_queue_work(task.id)
+            )
     return capabilities
 
 

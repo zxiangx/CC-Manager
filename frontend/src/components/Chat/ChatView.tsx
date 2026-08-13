@@ -653,6 +653,10 @@ function ChatRuntimeView({
     && !codexRootTurnActive;
   const codexParentFollowupAvailable = codexDescendantsOnly
     && codexExecutionState?.parent_followup_supported === true;
+  const codexLaunchQueued = task.provider === 'codex'
+    && !codexRootTurnActive
+    && !codexDescendantsOnly
+    && codexExecutionState?.launch_queued === true;
   const liveMessageAvailable = canInject && (
     task.provider !== 'codex'
     || codexRootTurnActive
@@ -2786,12 +2790,18 @@ function ChatRuntimeView({
             </span>
           </div>
         )}
-        {isProcessing && !codexDescendantsOnly && (
+        {isProcessing && codexLaunchQueued && (
+          <div className="flex gap-2 items-center text-amber-300/90 text-sm px-3">
+            <ListPlus size={14} />
+            <span>消息已排队，Codex turn 尚未开始执行</span>
+          </div>
+        )}
+        {isProcessing && !codexDescendantsOnly && !codexLaunchQueued && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
             <span>
-              {task.provider === 'codex' && !sending && !codexRootTurnActive
-                ? '正在确认 Codex 父 turn 状态...'
+              {task.provider === 'codex' && !codexRootTurnActive
+                ? '正在核对 Codex 状态（尚未确认模型正在执行）...'
                 : `${providerLabel} is thinking...`}
             </span>
           </div>

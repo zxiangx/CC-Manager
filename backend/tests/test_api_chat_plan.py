@@ -3292,7 +3292,10 @@ async def test_inject_capabilities_advertise_attachment_protocol(
         "descendant_count": 2,
         "parent_followup_supported": True,
     })
-    with patch("backend.main.instance_manager", mock_im):
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.has_task_queue_work = AsyncMock(return_value=True)
+    with patch("backend.main.instance_manager", mock_im), \
+         patch("backend.main.dispatcher", mock_dispatcher):
         response = await client.get(
             f"/api/tasks/{task_id}/inject-capabilities",
         )
@@ -3306,7 +3309,9 @@ async def test_inject_capabilities_advertise_attachment_protocol(
         "descendants_active": True,
         "descendant_count": 2,
         "parent_followup_supported": True,
+        "launch_queued": True,
     }
+    mock_dispatcher.has_task_queue_work.assert_awaited_once_with(task_id)
 
 
 @pytest.mark.asyncio

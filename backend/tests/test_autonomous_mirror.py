@@ -4237,6 +4237,93 @@ class TestFullMirrorBackend:
         im._try_chat_transient_retry.assert_awaited_once()
         im._try_chat_pool_rotation.assert_awaited_once()
 
+    async def test_user_superseded_capacity_failure_releases_turn_cleanly(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        error_text = (
+            "Selected model is at capacity. Please try a different model."
+        )
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.provider = "codex"
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 780
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 780
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        im._try_chat_transient_retry = AsyncMock(return_value=False)
+        im._try_chat_pool_rotation = AsyncMock(return_value=False)
+        im._codex_capacity_retry_superseded.add((instance_id, task_id))
+
+        consumer = asyncio.current_task()
+        backend._consumers[instance_id] = consumer
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="codex",
+            task_id=task_id,
+            task_retry_count=0,
+            instance_started_at=started_at,
+        )
+        await im._process_event(
+            instance_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": error_text,
+                "is_error": True,
+                "raw_json": (
+                    '{"type":"error","error":{"code":"serverOverloaded"}}'
+                ),
+            },
+            consumer_record=record,
+        )
+        await backend.on_exit(
+            instance_id,
+            1,
+            session=session,
+            task_id=task_id,
+            chat_initiated=True,
+        )
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert task.error_message is None
+            assert inst.status == "idle"
+            assert inst.current_task_id is None
+        assert (instance_id, task_id) not in (
+            im._codex_capacity_retry_superseded
+        )
+        im._try_chat_transient_retry.assert_awaited_once()
+        im._try_chat_pool_rotation.assert_not_awaited()
+
     async def test_soft_quota_warning_keeps_successful_pty_turn_completed(
         self, db_factory
     ):

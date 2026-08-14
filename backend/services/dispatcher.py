@@ -10712,9 +10712,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             await q.put(msg)
             self._pending_task_starts.add(task_id)
             self._ensure_queue_worker(task_id)
+            capacity_superseded = False
+            if source == "user":
+                supersede = getattr(
+                    self.instance_manager,
+                    "supersede_codex_capacity_retry",
+                    None,
+                )
+                if callable(supersede):
+                    capacity_superseded = bool(supersede(task_id))
         logger.info(
             f"Enqueued message for task {task_id}: source={source} priority={priority} "
-            f"queue_depth={q.qsize()}"
+            f"queue_depth={q.qsize()} capacity_superseded={capacity_superseded}"
         )
 
     async def clear_task_queue(self, task_id: int) -> int:

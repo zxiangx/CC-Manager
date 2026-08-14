@@ -204,6 +204,17 @@ class _ConsumerRecoveryEvidence:
 
 
 @dataclass
+class _CodexCapacityRetryWait:
+    """One failed Codex chat turn sleeping before its next capacity retry."""
+
+    task_id: int
+    instance_id: int
+    attempt: int
+    delay: float
+    supersede: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
 class _PtyBackgroundState:
     """One exact autonomous PTY epoch keyed by Task and native session."""
 
@@ -322,6 +333,14 @@ class InstanceManager:
         # turn still reports exit_code 0.
         self._transient_seen: set[int] = set()
         self._codex_capacity_seen: set[int] = set()
+        # Task-scoped only while a failed Codex chat turn is sleeping before
+        # its next model-capacity retry. A newer user message may safely wake
+        # this boundary and supersede the retry; it must never interrupt a
+        # live root turn.
+        self._codex_capacity_retry_waits: dict[
+            int, _CodexCapacityRetryWait
+        ] = {}
+        self._codex_capacity_retry_superseded: set[tuple[int, int]] = set()
         # PTY rate-limit detection: instance_ids whose current turn saw an
         # actionable rate_limit_event. Turn-scoped: reset at launch(), checked
         # after _wait_process in the chat path so dispatcher can rotate.
@@ -551,6 +570,49 @@ class InstanceManager:
                 "parent_followup_supported": False,
             }
         return await self._codex_app_server.thread_execution_state(thread_id)
+
+    def codex_capacity_retry_state(self, task_id: int) -> dict[str, object]:
+        """Expose the exact provider-safe capacity backoff boundary."""
+
+        wait = self._codex_capacity_retry_waits.get(task_id)
+        if wait is None or wait.supersede.is_set():
+            return {
+                "capacity_retry_waiting": False,
+                "capacity_retry_attempt": None,
+                "capacity_retry_delay": None,
+            }
+        return {
+            "capacity_retry_waiting": True,
+            "capacity_retry_attempt": wait.attempt,
+            "capacity_retry_delay": round(wait.delay, 1),
+        }
+
+    def supersede_codex_capacity_retry(self, task_id: int) -> bool:
+        """Wake a capacity backoff after a newer user message is durable."""
+
+        wait = self._codex_capacity_retry_waits.get(task_id)
+        if wait is None or wait.supersede.is_set():
+            return False
+        wait.supersede.set()
+        logger.info(
+            "Codex capacity retry superseded by newer user message: "
+            "task=%s instance=%s attempt=%s",
+            task_id,
+            wait.instance_id,
+            wait.attempt,
+        )
+        return True
+
+    def _consume_codex_capacity_retry_superseded(
+        self,
+        instance_id: int,
+        task_id: int,
+    ) -> bool:
+        key = (instance_id, task_id)
+        if key not in self._codex_capacity_retry_superseded:
+            return False
+        self._codex_capacity_retry_superseded.discard(key)
+        return True
 
     async def start_codex_parent_followup(
         self,
@@ -4884,6 +4946,7 @@ class InstanceManager:
         background_generation: str | None = None,
         preserve_background_failure: bool = False,
         background_session_id: str | None = None,
+        superseded_capacity_retry: bool = False,
     ) -> str | None:
         """Finalize one exact PTY chat turn, or discard a stale exit callback.
 
@@ -4919,7 +4982,11 @@ class InstanceManager:
         lifecycle_lock = self._instance_lifecycle_lock(instance_id)
         ec = exit_code if exit_code is not None else 0
         interrupted = ec in (-2, 130)
-        final_status = "completed" if ec == 0 or interrupted else "failed"
+        final_status = (
+            "completed"
+            if ec == 0 or interrupted or superseded_capacity_retry
+            else "failed"
+        )
         completed_at = datetime.utcnow()
         provider_error = (record.fatal_provider_error or "").strip()
         failure_notice_data = None
@@ -5213,7 +5280,9 @@ class InstanceManager:
                         f"task:{task_id}",
                         {
                             "event_type": "process_exit",
-                            "exit_code": ec,
+                            "exit_code": (
+                                0 if superseded_capacity_retry else ec
+                            ),
                             "stderr": None,
                             "background_active": bool(
                                 background_generation
@@ -6098,6 +6167,7 @@ class InstanceManager:
                 ),
             )
 
+        capacity_retry_superseded = False
         if task_id and chat_initiated and exit_code not in (0, -2, 130):
             # Context overflow can be a plain CLI message or the app-server's
             # structured contextWindowExceeded code. Compact and continue.
@@ -6213,11 +6283,27 @@ class InstanceManager:
                         task_id,
                     )
             # Transient server-side 429/overload: wait + retry same account
-            elif await self._try_chat_transient_retry(instance_id, task_id, exit_code, failure_text):
-                return
-            # Pool rotation for chat-initiated rate limit failures
-            elif await self._try_chat_pool_rotation(instance_id, task_id, exit_code, failure_text):
-                return
+            else:
+                if await self._try_chat_transient_retry(
+                    instance_id, task_id, exit_code, failure_text
+                ):
+                    return
+                capacity_retry_superseded = (
+                    self._consume_codex_capacity_retry_superseded(
+                        instance_id, task_id
+                    )
+                )
+                # Pool rotation for chat-initiated rate limit failures. A
+                # user-superseded capacity wait is intentionally settled at
+                # this safe boundary so the already-durable next message can
+                # own the thread instead.
+                if (
+                    not capacity_retry_superseded
+                    and await self._try_chat_pool_rotation(
+                        instance_id, task_id, exit_code, failure_text
+                    )
+                ):
+                    return
         elif task_id and chat_initiated:
             # Clean turn — drop any transient-retry tally for this instance.
             self._transient_attempts.pop(instance_id, None)
@@ -6235,9 +6321,9 @@ class InstanceManager:
         # order. Cancellation/retry/delete use the same order; taking the
         # Instance write first here can deadlock those paths on PostgreSQL or
         # MySQL.
-        successful_terminal = self._chat_terminal_succeeded(
-            process,
-            exit_code,
+        successful_terminal = (
+            capacity_retry_superseded
+            or self._chat_terminal_succeeded(process, exit_code)
         )
         from backend.services.codex_recovery import (
             is_request_blocked,
@@ -6749,7 +6835,39 @@ class InstanceManager:
                 "unbounded": capacity_retry,
                 "delay": round(delay, 1),
             })
-            await asyncio.sleep(delay)
+            capacity_wait = None
+            if capacity_retry:
+                capacity_wait = _CodexCapacityRetryWait(
+                    task_id=task_id,
+                    instance_id=instance_id,
+                    attempt=attempt,
+                    delay=delay,
+                )
+                self._codex_capacity_retry_waits[task_id] = capacity_wait
+            try:
+                if capacity_wait is None:
+                    await asyncio.sleep(delay)
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            capacity_wait.supersede.wait(),
+                            timeout=delay,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    else:
+                        self._codex_capacity_retry_superseded.add(
+                            (instance_id, task_id)
+                        )
+                        self._transient_attempts.pop(instance_id, None)
+                        return False
+            finally:
+                if (
+                    capacity_wait is not None
+                    and self._codex_capacity_retry_waits.get(task_id)
+                    is capacity_wait
+                ):
+                    self._codex_capacity_retry_waits.pop(task_id, None)
 
             await self.launch(
                 instance_id=instance_id,

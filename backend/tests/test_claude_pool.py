@@ -1515,6 +1515,44 @@ class TestChatTransientRetryCodex:
         assert event["unbounded"] is True
 
     @pytest.mark.asyncio
+    async def test_new_user_message_supersedes_capacity_backoff(self, monkeypatch):
+        im = self._im(
+            "codex",
+            "Selected model is at capacity. Please try a different model.",
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            "backend.config.settings.codex_capacity_retry_delay", 30.0,
+        )
+
+        retry = asyncio.create_task(
+            im._try_chat_transient_retry(1, 42, 1, "")
+        )
+        for _ in range(100):
+            state = im.codex_capacity_retry_state(42)
+            if state["capacity_retry_waiting"]:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("capacity retry never entered its backoff state")
+
+        assert state == {
+            "capacity_retry_waiting": True,
+            "capacity_retry_attempt": 1,
+            "capacity_retry_delay": 30.0,
+        }
+        assert im.supersede_codex_capacity_retry(42) is True
+        assert await asyncio.wait_for(retry, timeout=1) is False
+        im.launch.assert_not_awaited()
+        assert im.codex_capacity_retry_state(42) == {
+            "capacity_retry_waiting": False,
+            "capacity_retry_attempt": None,
+            "capacity_retry_delay": None,
+        }
+        assert im._consume_codex_capacity_retry_superseded(1, 42) is True
+        assert im._consume_codex_capacity_retry_superseded(1, 42) is False
+
+    @pytest.mark.asyncio
     async def test_claude_wording_does_not_trigger_codex_retry(self, monkeypatch):
         # claude 的 transient 文案对 codex 任务不生效（provider 分流）
         im = self._im(

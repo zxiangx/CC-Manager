@@ -2523,6 +2523,9 @@ async def inject_capabilities(
         "descendant_count": 0,
         "parent_followup_supported": False,
         "launch_queued": False,
+        "capacity_retry_waiting": False,
+        "capacity_retry_attempt": None,
+        "capacity_retry_delay": None,
     }
     if (task.provider or "claude").lower() == "codex" and task.session_id:
         from backend.main import dispatcher, instance_manager
@@ -2532,6 +2535,13 @@ async def inject_capabilities(
                 task.session_id,
             )
         )
+        capacity_state = getattr(
+            instance_manager,
+            "codex_capacity_retry_state",
+            None,
+        )
+        if callable(capacity_state):
+            capabilities.update(capacity_state(task.id))
         if dispatcher is not None:
             capabilities["launch_queued"] = bool(
                 await dispatcher.has_task_queue_work(task.id)

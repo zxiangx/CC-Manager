@@ -847,6 +847,9 @@ export interface InjectTaskCapabilities {
   descendant_count?: number;
   parent_followup_supported?: boolean;
   launch_queued?: boolean;
+  capacity_retry_waiting?: boolean;
+  capacity_retry_attempt?: number | null;
+  capacity_retry_delay?: number | null;
 }
 
 export interface PoolAccountUsage extends CloudRouterAccountProjection {

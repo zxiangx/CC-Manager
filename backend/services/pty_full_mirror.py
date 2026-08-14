@@ -456,6 +456,7 @@ class FullMirrorCCMBackend(CCMBackend):
             # cannot override a failed API turn recorded in JSONL.
             ec = 1
 
+        capacity_retry_superseded = False
         if (
             chat_initiated
             and task_id
@@ -468,6 +469,12 @@ class FullMirrorCCMBackend(CCMBackend):
                     key, task_id, ec, provider_error
                 )
                 if not retried:
+                    capacity_retry_superseded = (
+                        self._im._consume_codex_capacity_retry_superseded(
+                            key, task_id
+                        )
+                    )
+                if not retried and not capacity_retry_superseded:
                     retried = await self._im._try_chat_pool_rotation(
                         key, task_id, ec, provider_error
                     )
@@ -576,6 +583,9 @@ class FullMirrorCCMBackend(CCMBackend):
                         record,
                         background_generation=None,
                         background_session_id=session_id,
+                        superseded_capacity_retry=(
+                            capacity_retry_superseded
+                        ),
                     )
                 )
                 if final_status == "background_armed":

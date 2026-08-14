@@ -653,9 +653,13 @@ function ChatRuntimeView({
     && !codexRootTurnActive;
   const codexParentFollowupAvailable = codexDescendantsOnly
     && codexExecutionState?.parent_followup_supported === true;
+  const codexCapacityRetryWaiting = task.provider === 'codex'
+    && !codexRootTurnActive
+    && codexExecutionState?.capacity_retry_waiting === true;
   const codexLaunchQueued = task.provider === 'codex'
     && !codexRootTurnActive
     && !codexDescendantsOnly
+    && !codexCapacityRetryWaiting
     && codexExecutionState?.launch_queued === true;
   const liveMessageAvailable = canInject && (
     task.provider !== 'codex'
@@ -1262,12 +1266,25 @@ function ChatRuntimeView({
       const attempt = (msg.data.attempt as number) || 1;
       const maxAttempts = (msg.data.max_attempts as number) || 0;
       const delay = (msg.data.delay as number) || 0;
+      const capacityRetry = msg.data.unbounded === true && task.provider === 'codex';
       setSending(true);
+      if (capacityRetry) {
+        setCodexExecutionState((current) => ({
+          ...(current || {}),
+          adapter_active: true,
+          root_turn_active: false,
+          capacity_retry_waiting: true,
+          capacity_retry_attempt: attempt,
+          capacity_retry_delay: delay,
+        }));
+      }
       const entry: ChatMessage = {
         id: Date.now() + Math.random(),
         role: 'system',
         event_type: 'transient_retry',
-        content: `服务端临时限流（非额度用尽）· 第 ${attempt}${maxAttempts ? `/${maxAttempts}` : ''} 次自动重试，约 ${delay}s 后继续…`,
+        content: capacityRetry
+          ? `所选模型暂时容量不足（非额度用尽）· 第 ${attempt} 次自动重试，约 ${delay}s 后继续；现在发送新消息会替代本次等待并启动新 turn。`
+          : `服务端临时限流（非额度用尽）· 第 ${attempt}${maxAttempts ? `/${maxAttempts}` : ''} 次自动重试，约 ${delay}s 后继续…`,
         tool_name: null,
         tool_input: null,
         tool_output: null,
@@ -2042,6 +2059,7 @@ function ChatRuntimeView({
     // One composer, automatic routing: a supported live turn is steered
     // immediately; an idle Task starts a normal follow-up turn. Unsupported
     // remote/shared transports keep the existing explicit queue behavior.
+    let supersedeCapacityRetry = false;
     if (isProcessing && canInject && !fromQueue) {
       if (task.provider === 'codex') {
         try {
@@ -2058,6 +2076,7 @@ function ChatRuntimeView({
             );
             return;
           }
+          supersedeCapacityRetry = capabilities.capacity_retry_waiting === true;
         } catch (e) {
           setError(
             `无法确认 Codex 父 turn 状态，消息和附件已保留：${
@@ -2076,7 +2095,7 @@ function ChatRuntimeView({
     }
 
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
-    if (isProcessing && !fromQueue) {
+    if (isProcessing && !fromQueue && !supersedeCapacityRetry) {
       if (text || sendableAttachmentCount > 0) {
         addToQueue(
           text,
@@ -2134,6 +2153,15 @@ function ChatRuntimeView({
           codex_service_tier: task.codex_service_tier,
         },
       );
+      if (supersedeCapacityRetry) {
+        setCodexExecutionState((current) => ({
+          ...(current || {}),
+          capacity_retry_waiting: false,
+          capacity_retry_attempt: null,
+          capacity_retry_delay: null,
+          launch_queued: true,
+        }));
+      }
       if (!fromQueue) {
         consumeForkSeedUploads();
       }
@@ -2796,7 +2824,16 @@ function ChatRuntimeView({
             <span>消息已排队，Codex turn 尚未开始执行</span>
           </div>
         )}
-        {isProcessing && !codexDescendantsOnly && !codexLaunchQueued && (
+        {isProcessing && codexCapacityRetryWaiting && (
+          <div className="flex gap-2 items-center text-amber-300/90 text-sm px-3">
+            <Loader2 size={14} className="animate-spin" />
+            <span>
+              所选模型容量不足，正在等待第 {codexExecutionState?.capacity_retry_attempt || 1} 次重试；
+              现在发送新消息会替代本次等待并启动新 turn
+            </span>
+          </div>
+        )}
+        {isProcessing && !codexDescendantsOnly && !codexLaunchQueued && !codexCapacityRetryWaiting && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
             <span>
@@ -3166,6 +3203,11 @@ function ChatRuntimeView({
               </div>
             )
           )}
+          {isProcessing && codexCapacityRetryWaiting && (
+            <div className="text-[10px] leading-relaxed text-amber-300/85">
+              模型容量重试正在等待：发送会立即保存到服务器，终止旧重试并以这条新指令启动下一 turn。
+            </div>
+          )}
           <div className="flex gap-2 items-end">
             <textarea
               ref={textareaRef}
@@ -3177,6 +3219,8 @@ function ChatRuntimeView({
                   ? 'Run the task first to start a session...'
                   : isProcessing && codexParentFollowupAvailable
                     ? '给父 Agent 发送一条新消息...'
+                    : isProcessing && codexCapacityRetryWaiting
+                      ? '发送新指令并替代当前容量重试...'
                     : isProcessing && liveMessageAvailable
                       ? '直接给正在运行的 Agent 补充消息...'
                     : isProcessing
@@ -3193,18 +3237,23 @@ function ChatRuntimeView({
               disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
+                : isProcessing && codexCapacityRetryWaiting
+                ? '替代当前容量重试并启动新 turn (Enter)'
                 : isProcessing && codexParentFollowupAvailable
                 ? '启动父 Agent 新 turn (Enter)'
                 : isProcessing && liveMessageAvailable
                 ? '发送到运行中的 turn (Enter)'
                 : isProcessing ? 'Add to queue (Enter)' : 'Send (Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
-                isProcessing && codexParentFollowupAvailable ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
+                isProcessing && codexCapacityRetryWaiting ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
+                : isProcessing && codexParentFollowupAvailable ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
                 : isProcessing && liveMessageAvailable ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {isProcessing && codexParentFollowupAvailable
+              {isProcessing && codexCapacityRetryWaiting
+                ? <Send size={18} />
+                : isProcessing && codexParentFollowupAvailable
                 ? <Send size={18} />
                 : isProcessing && liveMessageAvailable
                   ? <Syringe size={18} />

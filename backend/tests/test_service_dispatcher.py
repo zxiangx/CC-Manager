@@ -4571,6 +4571,55 @@ async def test_long_turn_does_not_respawn_consumer(db_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_user_queue_supersedes_capacity_only_after_durable_enqueue(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    observed: dict[str, object] = {}
+
+    def supersede(task_id: int) -> bool:
+        observed["task_id"] = task_id
+        observed["queue_depth"] = d._task_queues[task_id].qsize()
+        observed["pending"] = task_id in d._pending_task_starts
+        return True
+
+    d.instance_manager.supersede_codex_capacity_retry = MagicMock(
+        side_effect=supersede
+    )
+
+    await d.enqueue_message(71, "replace the blocked retry", source="user")
+
+    assert observed == {
+        "task_id": 71,
+        "queue_depth": 1,
+        "pending": True,
+    }
+    d.instance_manager.supersede_codex_capacity_retry.assert_called_once_with(71)
+    await d.clear_task_queue(71)
+    worker = d._task_queue_workers.get(71)
+    if worker is not None:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_monitor_queue_does_not_supersede_user_capacity_retry(db_factory):
+    d = _make_dispatcher(db_factory)
+    d.instance_manager.supersede_codex_capacity_retry = MagicMock(
+        return_value=True
+    )
+
+    await d.enqueue_message(72, "monitor wake", source="monitor:complete")
+
+    d.instance_manager.supersede_codex_capacity_retry.assert_not_called()
+    await d.clear_task_queue(72)
+    worker = d._task_queue_workers.get(72)
+    if worker is not None:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_watchdog_respawn_keeps_live_worker(db_factory, monkeypatch):
     """Watchdog replacement waits for and outlives old-consumer cleanup.
 

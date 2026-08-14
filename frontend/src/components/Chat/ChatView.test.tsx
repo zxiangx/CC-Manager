@@ -719,6 +719,46 @@ describe('ChatView', () => {
       expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
     });
 
+    it('persists a message server-side and supersedes a capacity backoff', async () => {
+      vi.mocked(api.getInjectCapabilities).mockResolvedValue({
+        attachment_protocol: 1,
+        codex_native_inputs: true,
+        adapter_active: true,
+        root_turn_active: false,
+        descendants_active: false,
+        descendant_count: 0,
+        parent_followup_supported: false,
+        launch_queued: true,
+        capacity_retry_waiting: true,
+        capacity_retry_attempt: 7,
+        capacity_retry_delay: 60,
+      });
+      const task = makeTask({
+        id: 304,
+        provider: 'codex',
+        status: 'executing',
+        session_id: 'thread-capacity-backoff',
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(await screen.findByText(/模型容量不足.*第 7 次重试/)).toBeInTheDocument();
+      await userEvent.type(screen.getByRole('textbox'), 'use this newer instruction');
+      await userEvent.click(screen.getByTitle('替代当前容量重试并启动新 turn (Enter)'));
+
+      await waitFor(() => {
+        expect(api.sendTaskChat).toHaveBeenCalledWith(
+          304,
+          'use this newer instruction',
+          undefined,
+          undefined,
+          null,
+          expect.objectContaining({ provider: 'codex' }),
+        );
+      });
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(screen.queryByText(/Queued messages/)).not.toBeInTheDocument();
+    });
+
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);

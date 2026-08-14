@@ -3292,6 +3292,11 @@ async def test_inject_capabilities_advertise_attachment_protocol(
         "descendant_count": 2,
         "parent_followup_supported": True,
     })
+    mock_im.codex_capacity_retry_state = MagicMock(return_value={
+        "capacity_retry_waiting": True,
+        "capacity_retry_attempt": 4,
+        "capacity_retry_delay": 60.0,
+    })
     mock_dispatcher = MagicMock()
     mock_dispatcher.has_task_queue_work = AsyncMock(return_value=True)
     with patch("backend.main.instance_manager", mock_im), \
@@ -3310,7 +3315,11 @@ async def test_inject_capabilities_advertise_attachment_protocol(
         "descendant_count": 2,
         "parent_followup_supported": True,
         "launch_queued": True,
+        "capacity_retry_waiting": True,
+        "capacity_retry_attempt": 4,
+        "capacity_retry_delay": 60.0,
     }
+    mock_im.codex_capacity_retry_state.assert_called_once_with(task_id)
     mock_dispatcher.has_task_queue_work.assert_awaited_once_with(task_id)
 
 

@@ -26,6 +26,7 @@ from backend.services.task_skill_overrides import (
 from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_POLICY_TAG,
 )
+from backend.services.codex_pool import CodexPool
 from backend.models.instance import Instance
 from backend.models.task import Task
 
@@ -4437,6 +4438,66 @@ async def test_codex_binding_merge_preserves_supersede_metadata(db_factory):
             "pr_review_superseded": True,
             "codex_account_id": "codex-4",
         }
+
+
+@pytest.mark.asyncio
+async def test_global_convergence_rebinds_existing_target_rollout_copy(
+    db_factory,
+    tmp_path,
+):
+    source = tmp_path / "codex-2"
+    target = tmp_path / "codex-3"
+    config = tmp_path / "codex-accounts.json"
+    config.write_text(
+        """{"accounts":[
+        {"id":"codex-2","codex_home":"%s","enabled":true},
+        {"id":"codex-3","codex_home":"%s","enabled":true}
+        ]}""" % (source, target)
+    )
+    thread_id = "thread-existing-target-copy"
+    relative = (
+        "sessions/2026/08/14/"
+        f"rollout-now-{thread_id}.jsonl"
+    )
+    for home in (source, target):
+        rollout = home / relative
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        rollout.write_text('{"type":"session_meta"}\n')
+
+    d = _make_dispatcher(db_factory)
+    d.codex_pool = CodexPool(config_path=config, cooldown_seconds=60)
+    assert d.codex_pool.set_global_account("codex-3")
+    d.instance_manager.rebind_codex_thread = AsyncMock()
+    async with db_factory() as db:
+        task = Task(
+            title="existing-target-copy",
+            description="d",
+            status="completed",
+            provider="codex",
+            session_id=thread_id,
+            metadata_={"codex_account_id": "codex-2"},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    result = await d.converge_codex_tasks_to_global_account()
+
+    assert result == {
+        "global_account": "codex-3",
+        "migrated": 1,
+        "already": 0,
+        "skipped_active": 0,
+        "errors": [],
+    }
+    d.instance_manager.rebind_codex_thread.assert_awaited_once_with(
+        thread_id,
+        source_codex_home=str(source.resolve()),
+        target_codex_home=str(target.resolve()),
+    )
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_id)
+        assert persisted.metadata_["codex_account_id"] == "codex-3"
 
 
 @pytest.mark.asyncio

@@ -4097,12 +4097,38 @@ class GlobalDispatcher:
                 source_home = pool.home_for_account(bound_id) if bound_id else None
                 matches = pool.locate_session_homes(session_id)
                 if target_home in matches:
-                    await self._persist_codex_binding_for_route(
-                        task_id=task.id,
-                        account_id=target_id,
-                        expected_generation=None,
+                    canonical_source = (
+                        pool.canonical_home(source_home)
+                        if source_home
+                        else None
                     )
-                    already += 1
+                    if (
+                        canonical_source
+                        and canonical_source != target_home
+                        and canonical_source in matches
+                    ):
+                        # A previous migration deliberately leaves a recovery
+                        # copy in the source home. Finding the rollout in the
+                        # target is therefore not proof that the live
+                        # app-server registry already owns it there. Move the
+                        # in-memory owner and durable binding atomically even
+                        # though no filesystem copy is needed.
+                        await self._rebind_and_persist_codex_route(
+                            task_id=task.id,
+                            session_id=session_id,
+                            source_home=canonical_source,
+                            target_home=target_home,
+                            account_id=target_id,
+                            expected_generation=None,
+                        )
+                        migrated += 1
+                    else:
+                        await self._persist_codex_binding_for_route(
+                            task_id=task.id,
+                            account_id=target_id,
+                            expected_generation=None,
+                        )
+                        already += 1
                     continue
                 if not source_home or pool.canonical_home(source_home) not in matches:
                     if len(matches) == 1:

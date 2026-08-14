@@ -76,6 +76,15 @@ from backend.services.ws_broadcaster import WebSocketBroadcaster
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def _optional_async_lock(lock: asyncio.Lock, enabled: bool):
+    if enabled:
+        async with lock:
+            yield
+    else:
+        yield
+
+
 class QueuedMessagePrelaunchError(RuntimeError):
     """A queued message launch failed before any managed turn could start."""
 
@@ -3244,6 +3253,42 @@ class GlobalDispatcher:
             "codex_account_id",
         )
 
+    async def _pending_codex_task_binding(
+        self, task_id: int | None,
+    ) -> str | None:
+        return await self._task_account_binding(
+            task_id,
+            "pending_codex_account_id",
+        )
+
+    async def _set_pending_codex_task_binding(
+        self, task_id: int, account_id: str,
+    ) -> bool:
+        return await self._set_task_account_binding(
+            task_id,
+            account_id,
+            "pending_codex_account_id",
+        )
+
+    async def _clear_pending_codex_task_binding(
+        self, task_id: int | None, account_id: str | None = None,
+    ) -> None:
+        if task_id is None:
+            return
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id, with_for_update=True)
+            if not task:
+                return
+            metadata = dict(task.metadata_ or {})
+            pending = metadata.get("pending_codex_account_id")
+            if pending is None or (
+                account_id is not None and pending != account_id
+            ):
+                return
+            metadata.pop("pending_codex_account_id", None)
+            task.metadata_ = metadata
+            await db.commit()
+
     async def _set_codex_task_binding(
         self,
         task_id: int | None,
@@ -3522,6 +3567,21 @@ class GlobalDispatcher:
         or the existing rebind compensation path.
         """
 
+        if isinstance(self.instance_manager.codex_shared_state_dir, str) and (
+            self.instance_manager.codex_shared_state_dir
+        ):
+            # Rollouts/Goals are canonical session state, not account state.
+            # Switching credentials only moves the live app-server owner and
+            # the Task binding; there is no account-to-account file copy.
+            return await self._rebind_and_persist_codex_route(
+                task_id=task_id,
+                session_id=session_id,
+                source_home=source_home,
+                target_home=target_home,
+                account_id=account_id,
+                expected_generation=expected_generation,
+            )
+
         from backend.services.codex_session_migration import (
             migrate_codex_rollout_session,
         )
@@ -3630,6 +3690,86 @@ class GlobalDispatcher:
         if not (pool and pool.enabled):
             return None
         await self._require_task_lifecycle_active(expected_generation)
+
+        if isinstance(self.instance_manager.codex_shared_state_dir, str) and (
+            self.instance_manager.codex_shared_state_dir
+        ):
+            bound_id = await self._codex_task_binding(task_id)
+            pending_id = await self._pending_codex_task_binding(task_id)
+            bound_home = pool.home_for_account(bound_id) if bound_id else None
+            resident = (
+                pool.canonical_home(bound_home) if bound_home else None
+            )
+            if (
+                not pending_id
+                and
+                resident
+                and pool.is_home_available(resident)
+                and pool.supports_model_for_home(
+                    resident,
+                    model,
+                    service_tier=codex_service_tier,
+                )
+            ):
+                pool.record_routed_account(resident)
+                return resident
+
+            excluded = {bound_id} if isinstance(bound_id, str) else set()
+            pending_home = (
+                pool.home_for_account(pending_id) if pending_id else None
+            )
+            if pending_id and (
+                not pending_home
+                or not pool.is_home_available(pending_home)
+                or not pool.supports_model_for_home(
+                    pending_home,
+                    model,
+                    service_tier=codex_service_tier,
+                )
+            ):
+                raise CodexAccountRoutingError(
+                    f"Pending Codex account {pending_id} for task {task_id} "
+                    "is unavailable or incompatible",
+                    permanent=True,
+                )
+            target = pending_home or pool.select_session(
+                exclude=excluded,
+                model=model,
+                service_tier=codex_service_tier,
+            )
+            if not target:
+                if not pool.has_retryable_compatible_account(
+                    model,
+                    service_tier=codex_service_tier,
+                ):
+                    raise CodexAccountRoutingError(
+                        f"All compatible Codex accounts for model {model!r} "
+                        "require quota or credential intervention",
+                        permanent=True,
+                    )
+                raise CodexAccountRoutingError(
+                    f"Codex pool has no available account for task {task_id}",
+                    retry_after=self._codex_pool_retry_after(),
+                )
+            target = pool.canonical_home(target)
+            account_id = pool.account_id_for_home(target)
+            if session_id and resident and resident != target:
+                await self._migrate_rebind_and_persist_codex_route(
+                    task_id=task_id,
+                    session_id=session_id,
+                    source_home=resident,
+                    target_home=target,
+                    account_id=account_id,
+                    expected_generation=expected_generation,
+                )
+            else:
+                await self._persist_codex_binding_for_route(
+                    task_id=task_id,
+                    account_id=account_id,
+                    expected_generation=expected_generation,
+                )
+            await self._clear_pending_codex_task_binding(task_id, account_id)
+            return target
 
         bound_id = await self._codex_task_binding(task_id)
         bound_home = pool.home_for_account(bound_id) if bound_id else None
@@ -4060,6 +4200,100 @@ class GlobalDispatcher:
         async with self._codex_global_route_lock:
             return pool.set_global_account(account_id)
 
+    async def switch_codex_task_account(
+        self,
+        task_id: int,
+        account_id: str,
+        *,
+        defer_active: bool = True,
+        _route_lock_held: bool = False,
+    ) -> dict:
+        """Bind one Task to credentials without moving its native context."""
+
+        pool = self.codex_pool
+        if not (pool and pool.enabled):
+            raise CodexAccountRoutingError("Codex pool is not enabled")
+        target_home = pool.home_for_account(account_id)
+        if (
+            not target_home
+            or not pool.is_home_available(target_home)
+        ):
+            raise CodexAccountRoutingError(
+                f"Codex account {account_id} is unavailable"
+            )
+        target_home = pool.canonical_home(target_home)
+
+        async with _optional_async_lock(
+            self._codex_global_route_lock,
+            not _route_lock_held,
+        ):
+            async with self.db_factory() as db:
+                task = await db.get(Task, task_id, with_for_update=True)
+                if not task:
+                    raise CodexAccountRoutingError(
+                        f"Codex task {task_id} does not exist",
+                        permanent=True,
+                    )
+                if (task.provider or "claude").lower() != "codex":
+                    raise CodexAccountRoutingError(
+                        f"Task {task_id} is not a Codex task",
+                        permanent=True,
+                    )
+                if not pool.supports_model_for_home(
+                    target_home,
+                    task.model,
+                    service_tier=task.codex_service_tier,
+                ):
+                    raise CodexAccountRoutingError(
+                        f"Codex account {account_id} does not support this "
+                        "task's model/service tier",
+                        permanent=True,
+                    )
+                metadata = dict(task.metadata_ or {})
+                source_id = metadata.get("codex_account_id")
+                session_id = task.session_id
+                active = task.status in {"in_progress", "executing"}
+                if active and defer_active:
+                    metadata["pending_codex_account_id"] = account_id
+                    task.metadata_ = metadata
+                    await db.commit()
+                    return {
+                        "task_id": task_id,
+                        "account_id": account_id,
+                        "previous_account_id": source_id,
+                        "deferred": True,
+                    }
+
+            source_home = (
+                pool.home_for_account(source_id)
+                if isinstance(source_id, str)
+                else None
+            )
+            if session_id and source_home and (
+                pool.canonical_home(source_home) != target_home
+            ):
+                await self._rebind_and_persist_codex_route(
+                    task_id=task_id,
+                    session_id=session_id,
+                    source_home=pool.canonical_home(source_home),
+                    target_home=target_home,
+                    account_id=account_id,
+                    expected_generation=None,
+                )
+            else:
+                await self._persist_codex_binding_for_route(
+                    task_id=task_id,
+                    account_id=account_id,
+                    expected_generation=None,
+                )
+            await self._clear_pending_codex_task_binding(task_id, account_id)
+            return {
+                "task_id": task_id,
+                "account_id": account_id,
+                "previous_account_id": source_id,
+                "deferred": False,
+            }
+
     async def converge_codex_tasks_to_global_account(self) -> dict:
         """Migrate every idle Codex Task to the durable global account."""
 
@@ -4088,7 +4322,32 @@ class GlobalDispatcher:
             errors: list[dict] = []
             for task in rows:
                 if task.status in {"in_progress", "executing"}:
+                    await self._set_pending_codex_task_binding(
+                        task.id, target_id,
+                    )
                     skipped_active += 1
+                    continue
+                if isinstance(
+                    self.instance_manager.codex_shared_state_dir, str,
+                ) and self.instance_manager.codex_shared_state_dir:
+                    try:
+                        result = await self.switch_codex_task_account(
+                            task.id,
+                            target_id,
+                            defer_active=True,
+                            _route_lock_held=True,
+                        )
+                        if result["previous_account_id"] == target_id:
+                            already += 1
+                        else:
+                            migrated += 1
+                    except Exception as exc:
+                        logger.exception(
+                            "Could not switch Codex task %s globally to %s",
+                            task.id,
+                            target_id,
+                        )
+                        errors.append({"task_id": task.id, "error": str(exc)})
                     continue
                 session_id = task.session_id
                 if not session_id:
@@ -5235,6 +5494,8 @@ class GlobalDispatcher:
 
         provider = (task.provider or "claude").lower()
         current_attempt = attempt
+        capacity_tried_accounts: set[str] = set()
+        capacity_delay_override: float | None = None
         combined = await self._collect_failure_output(instance_id, task.id)
 
         while True:
@@ -5243,7 +5504,9 @@ class GlobalDispatcher:
                 and self.instance_manager.codex_capacity_error_seen(instance_id)
             )
             delay = (
-                max(1.0, settings.codex_capacity_retry_delay)
+                capacity_delay_override
+                if capacity_retry and capacity_delay_override is not None
+                else max(1.0, settings.codex_capacity_retry_delay)
                 if capacity_retry
                 else transient_retry_delay(
                     current_attempt,
@@ -5251,6 +5514,7 @@ class GlobalDispatcher:
                     settings.transient_retry_max_delay,
                 )
             )
+            capacity_delay_override = None
             retry_limit = 0 if capacity_retry else settings.transient_retry_max
             logger.info(
                 "Task %d transient 429/overload — waiting %.0fs before "
@@ -5343,6 +5607,66 @@ class GlobalDispatcher:
                     or current_attempt < settings.transient_retry_max
                 )
             ):
+                if (
+                    still_capacity
+                    and current_attempt
+                    >= max(1, settings.codex_capacity_switch_attempts)
+                    and self.codex_pool
+                    and config_dir
+                ):
+                    old_account_id = self.codex_pool.account_id_for_home(
+                        config_dir
+                    )
+                    if old_account_id:
+                        capacity_tried_accounts.add(old_account_id)
+                    new_home = await (
+                        self.codex_pool.select_random_native_capacity_alternative(
+                            config_dir,
+                            exclude=capacity_tried_accounts,
+                            model=task.model,
+                            service_tier=task.codex_service_tier,
+                        )
+                    )
+                    if not new_home and old_account_id:
+                        capacity_tried_accounts = {old_account_id}
+                        new_home = await (
+                            self.codex_pool.select_random_native_capacity_alternative(
+                                config_dir,
+                                exclude=capacity_tried_accounts,
+                                model=task.model,
+                                service_tier=task.codex_service_tier,
+                            )
+                        )
+                    new_account_id = (
+                        self.codex_pool.account_id_for_home(new_home)
+                        if new_home
+                        else None
+                    )
+                    if new_home and new_account_id:
+                        await self.switch_codex_task_account(
+                            task.id,
+                            new_account_id,
+                            defer_active=False,
+                        )
+                        self.instance_manager._config_dirs[instance_id] = new_home
+                        logger.warning(
+                            "Codex capacity recovery switched mode task %d "
+                            "from %s to %s after %d retries",
+                            task.id,
+                            old_account_id,
+                            new_account_id,
+                            current_attempt,
+                        )
+                        await self.broadcaster.broadcast(f"task:{task.id}", {
+                            "event_type": "pool_rotation",
+                            "provider": "codex",
+                            "old_account": old_account_id,
+                            "new_account": new_account_id,
+                            "reason": "model_capacity",
+                        })
+                        current_attempt = 1
+                        capacity_delay_override = 0.0
+                        continue
                 current_attempt += 1
                 continue
             break

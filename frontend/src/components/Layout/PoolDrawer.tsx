@@ -711,19 +711,20 @@ function CodexOtpPrompt({ state, onSubmit }: {
   );
 }
 
-function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, deleting, onRetryUsage, reloginState }: {
+function CodexAccountCard({ account, globalAccount, currentAccount, pendingAccount, canSwitchTask, lastSelected, apiKeyHint, onClearCooldown, onSwitchTask, onSwitchGlobal, onDelete, deleting, onRetryUsage }: {
   account: CodexPoolAccountUsage;
-  preferred: string | null;
+  globalAccount: string | null;
+  currentAccount: string | null;
+  pendingAccount: string | null;
+  canSwitchTask: boolean;
   lastSelected: string | null;
   apiKeyHint?: string;
   onClearCooldown: (id: string) => void;
-  onSetPreferred: (id: string | null) => void;
-  onRelogin: (id: string) => void;
-  onSubmitOtp: (state: CodexLoginStatus, code: string) => Promise<void>;
+  onSwitchTask: (id: string) => void;
+  onSwitchGlobal: (id: string) => void;
   onDelete?: () => void;
   deleting?: boolean;
   onRetryUsage: () => void;
-  reloginState?: CodexLoginStatus;
 }) {
   const isApi = isApiAuthKind(account.auth_kind);
   const cleanupPending = isApi && account.cleanup_pending === true;
@@ -737,12 +738,14 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
       : { cls: 'bg-yellow-500', label: '冷却中' };
 
   const q = isApi ? null : account.quota;
-  const isPreferred = !cleanupPending && preferred === account.id;
+  const isGlobal = !cleanupPending && globalAccount === account.id;
+  const isCurrent = !cleanupPending && currentAccount === account.id;
+  const isPending = !cleanupPending && pendingAccount === account.id;
   const isLastSelected = !cleanupPending && lastSelected === account.id;
 
   return (
     <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${
-      cleanupPending ? 'border-amber-500/60' : isPreferred ? 'border-emerald-500' : 'border-gray-700'
+      cleanupPending ? 'border-amber-500/60' : isCurrent ? 'border-cyan-500' : isGlobal ? 'border-emerald-500' : 'border-gray-700'
     }`}>
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot.cls}`} title={statusDot.label} />
@@ -769,9 +772,19 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
             Credits
           </span>
         )}
-        {isPreferred && (
+        {isCurrent && (
+          <span className="px-1.5 py-0.5 rounded bg-cyan-600/30 text-cyan-300 text-[10px] font-semibold">
+            当前会话
+          </span>
+        )}
+        {isPending && (
+          <span className="px-1.5 py-0.5 rounded bg-amber-600/30 text-amber-300 text-[10px] font-semibold">
+            下回合切换
+          </span>
+        )}
+        {isGlobal && (
           <span className="px-1.5 py-0.5 rounded bg-green-600/30 text-green-300 text-[10px] font-semibold">
-            全局账号
+            全局默认
           </span>
         )}
         {isLastSelected && (
@@ -786,32 +799,24 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
             </button>
           )}
           {account.enabled && (
-            isPreferred ? (
+            <>
               <button
-                onClick={() => onSetPreferred(null)}
-                className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-foreground hover:border-gray-400"
-                title="刷新所有候选账号额度，并将所有 Codex 会话统一到剩余额度最高的账号"
+                onClick={() => onSwitchTask(account.id)}
+                disabled={!canSwitchTask || isCurrent || isPending}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-cyan-500/50 text-cyan-300 hover:bg-cyan-600/20 disabled:opacity-40"
+                title={canSwitchTask ? '只切换当前会话' : '打开一个 Codex 会话后可切换'}
               >
-                重选最优
+                {isCurrent ? '已切换' : isPending ? '待切换' : '切换'}
               </button>
-            ) : (
               <button
-                onClick={() => onSetPreferred(account.id)}
-                className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20"
-                title="将所有 Codex 会话统一切换到此账号；正在输出的回合会在停止后收敛"
+                onClick={() => onSwitchGlobal(account.id)}
+                disabled={isGlobal}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20 disabled:opacity-40"
+                title="设为新会话默认账号，并同步切换所有已有 Codex 会话"
               >
-                切换到此账号
+                {isGlobal ? '全局默认' : '全局切换'}
               </button>
-            )
-          )}
-          {!isApi && (
-            <button
-              onClick={() => onRelogin(account.id)}
-              disabled={Boolean(reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status))}
-              className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20 disabled:opacity-50"
-            >
-              {reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status) ? '登录中…' : '重新登录'}
-            </button>
+            </>
           )}
           {onDelete && (
             <button
@@ -905,27 +910,6 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
             </button>
           </div>
         </div>
-      )}
-      {!isApi && reloginState?.status === 'running' && (
-        <div className="text-xs text-blue-400">自动登录中…</div>
-      )}
-      {!isApi && reloginState?.status === 'awaiting_otp' && (
-        <CodexOtpPrompt state={reloginState} onSubmit={(code) => onSubmitOtp(reloginState, code)} />
-      )}
-      {!isApi && reloginState?.status === 'verifying_otp' && (
-        <div className="text-xs text-blue-400">验证码已提交，正在继续登录…</div>
-      )}
-      {!isApi && reloginState?.status === 'finalizing' && (
-        <div className="text-xs text-blue-400">登录已完成，正在安全提交登录结果…</div>
-      )}
-      {!isApi && reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status) && reloginState.detail && (
-        <div className="text-[10px] text-amber-400 break-all">{reloginState.detail}</div>
-      )}
-      {!isApi && (reloginState?.status === 'failed' || reloginState?.status === 'expired') && (
-        <div className="text-xs text-red-400 break-all">{reloginState.detail || '登录失败'}</div>
-      )}
-      {!isApi && reloginState?.status === 'success' && (
-        <div className="text-xs text-green-400">登录成功</div>
       )}
     </div>
   );
@@ -1356,7 +1340,9 @@ function CcSettingsModal({ onClose }: { onClose: () => void }) {
 
 type PoolTab = 'claude' | 'codex';
 
-export function PoolDrawer() {
+export function PoolDrawer({ currentTaskId = null }: {
+  currentTaskId?: number | null;
+}) {
   const [claudeEnabled, setClaudeEnabled] = useState(false);
   const [codexEnabled, setCodexEnabled] = useState(false);
   const [apiAccountsAvailable, setApiAccountsAvailable] = useState(false);
@@ -1373,6 +1359,8 @@ export function PoolDrawer() {
   const [codexStatus, setCodexStatus] = useState<CodexPoolUsageStatus | null>(null);
   const [codexLoading, setCodexLoading] = useState(false);
   const [codexError, setCodexError] = useState<string | null>(null);
+  const [currentCodexAccount, setCurrentCodexAccount] = useState<string | null>(null);
+  const [pendingCodexAccount, setPendingCodexAccount] = useState<string | null>(null);
   const codexUsageRequestSeq = useRef(0);
 
   const loadApiAccountCatalog = useCallback(async () => {
@@ -1499,90 +1487,52 @@ export function PoolDrawer() {
     try { await api.clearCodexPoolCooldown(accountId); await loadCodexUsage(); } catch { /* Keep current drawer state on request failure. */ }
   }, [loadCodexUsage]);
 
-  const handleCodexSetPreferred = useCallback(async (accountId: string | null) => {
-    try { await api.setCodexPoolPreferred(accountId); await loadCodexUsage(); } catch { /* Keep current drawer state on request failure. */ }
-  }, [loadCodexUsage]);
+  const loadCurrentCodexAccount = useCallback(async () => {
+    if (!currentTaskId) {
+      setCurrentCodexAccount(null);
+      setPendingCodexAccount(null);
+      return;
+    }
+    try {
+      const state = await api.getCodexTaskAccount(currentTaskId);
+      setCurrentCodexAccount(state.account_id);
+      setPendingCodexAccount(state.pending_account_id);
+    } catch {
+      setCurrentCodexAccount(null);
+      setPendingCodexAccount(null);
+    }
+  }, [currentTaskId]);
 
-  const [codexRelogin, setCodexRelogin] = useState<Record<string, CodexLoginStatus>>({});
-  const codexReloginAlive = useRef(true);
-  const codexReloginTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const handleCodexSwitchTask = useCallback(async (accountId: string) => {
+    if (!currentTaskId) return;
+    try {
+      const result = await api.switchCodexTaskAccount(currentTaskId, accountId);
+      if (result.deferred) {
+        setPendingCodexAccount(accountId);
+      } else {
+        setCurrentCodexAccount(accountId);
+        setPendingCodexAccount(null);
+      }
+      await loadCodexUsage(false);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '切换当前会话账号失败');
+    }
+  }, [currentTaskId, loadCodexUsage]);
+
+  const handleCodexSwitchGlobal = useCallback(async (accountId: string) => {
+    try {
+      await api.switchCodexGlobalAccount(accountId);
+      await Promise.all([loadCodexUsage(false), loadCurrentCodexAccount()]);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '全局切换账号失败');
+    }
+  }, [loadCodexUsage, loadCurrentCodexAccount]);
 
   useEffect(() => {
-    // React StrictMode runs an extra setup/cleanup cycle in development, so
-    // restore the live flag on every setup rather than only initializing it.
-    codexReloginAlive.current = true;
-    const timers = codexReloginTimers.current;
-    return () => {
-      codexReloginAlive.current = false;
-      for (const timer of timers.values()) clearTimeout(timer);
-      timers.clear();
-    };
-  }, []);
-
-  const handleCodexRelogin = useCallback(async (accountId: string) => {
-    setCodexRelogin((m) => ({ ...m, [accountId]: { status: 'running' } }));
-    try {
-      const started = await api.codexPoolRelogin(accountId);
-      setCodexRelogin((m) => ({ ...m, [accountId]: {
-        status: started.status,
-        attempt_id: started.attempt_id,
-      } }));
-
-      const schedulePoll = (delay: number) => {
-        const previous = codexReloginTimers.current.get(accountId);
-        if (previous) clearTimeout(previous);
-        const timer = setTimeout(poll, delay);
-        codexReloginTimers.current.set(accountId, timer);
-      };
-      const poll = async () => {
-        if (!codexReloginAlive.current) return;
-        try {
-          const s = await api.codexPoolReloginStatus(accountId);
-          if (!codexReloginAlive.current) return;
-          setCodexRelogin((m) => ({ ...m, [accountId]: s }));
-          if (ACTIVE_CODEX_LOGIN_STATUSES.has(s.status)) {
-            schedulePoll(2000);
-            return;
-          }
-          codexReloginTimers.current.delete(accountId);
-          if (s.status === 'success') await loadCodexUsage();
-        } catch (e) {
-          if (!codexReloginAlive.current) return;
-          setCodexRelogin((current) => ({
-            ...current,
-            [accountId]: {
-              ...(current[accountId] || { status: 'running' }),
-              detail: e instanceof Error
-                ? `状态查询暂时失败，正在重试：${e.message}`
-                : '状态查询暂时失败，正在重试',
-            },
-          }));
-          schedulePoll(2000);
-        }
-      };
-      schedulePoll(1000);
-    } catch (e) {
-      setCodexRelogin((m) => ({ ...m, [accountId]: {
-        status: 'failed',
-        detail: e instanceof Error ? e.message : '重新登录失败',
-      } }));
+    if (open && tab === 'codex' && codexEnabled) {
+      void loadCurrentCodexAccount();
     }
-  }, [loadCodexUsage]);
-
-  const handleCodexSubmitOtp = useCallback(async (
-    accountId: string,
-    state: CodexLoginStatus,
-    code: string,
-  ) => {
-    if (!state.attempt_id || !state.challenge_id) {
-      throw new Error('验证码挑战信息缺失，请重新登录');
-    }
-    await api.codexPoolSubmitOtp(state.attempt_id, state.challenge_id, code);
-    setCodexRelogin((current) => ({
-      ...current,
-      [accountId]: { ...state, status: 'verifying_otp' },
-    }));
-  }, []);
+  }, [open, tab, codexEnabled, loadCurrentCodexAccount]);
 
   const refreshBothPools = useCallback(async () => {
     // create/refresh already performs the live API-provider requests. Read the
@@ -1854,13 +1804,15 @@ export function PoolDrawer() {
                     <CodexAccountCard
                       key={`${a.id}:${a.codex_home}`}
                       account={a}
-                      preferred={codexStatus.preferred ?? null}
+                      globalAccount={codexStatus.global_account ?? null}
+                      currentAccount={currentCodexAccount}
+                      pendingAccount={pendingCodexAccount}
+                      canSwitchTask={currentTaskId != null}
                       lastSelected={codexStatus.last_selected ?? null}
                       apiKeyHint={a.api_account_id ? apiAccountHints[a.api_account_id] : undefined}
                       onClearCooldown={handleCodexClearCooldown}
-                      onSetPreferred={handleCodexSetPreferred}
-                      onRelogin={handleCodexRelogin}
-                      onSubmitOtp={(state, code) => handleCodexSubmitOtp(a.id, state, code)}
+                      onSwitchTask={(accountId) => { void handleCodexSwitchTask(accountId); }}
+                      onSwitchGlobal={(accountId) => { void handleCodexSwitchGlobal(accountId); }}
                       onDelete={isApiAuthKind(a.auth_kind)
                         ? () => {
                             void handleApiDelete(
@@ -1883,7 +1835,6 @@ export function PoolDrawer() {
                           void loadCodexUsage(true);
                         }
                       }}
-                      reloginState={codexRelogin[a.id]}
                     />
                   ))}
                 </>

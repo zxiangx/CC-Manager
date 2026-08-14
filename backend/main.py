@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -59,6 +60,7 @@ from backend.services.deployment_start_guard import (
 )
 from backend.services.sub_agent_watcher import SubAgentWatcher
 from backend.services.cloudrouter_accounts import CloudRouterAccountStore
+from backend.models.task import Task
 
 # Logging: surface INFO from our services AND claude_pty in the server log.
 # Without this, PTY delivery/turn diagnostics are invisible (learned the
@@ -73,6 +75,10 @@ logger = logging.getLogger(__name__)
 broadcaster = WebSocketBroadcaster()
 broadcaster.db_factory = async_session
 instance_manager = InstanceManager(db_factory=async_session, broadcaster=broadcaster)
+if settings.codex_shared_state_enabled:
+    instance_manager.codex_shared_state_dir = str(
+        Path(settings.codex_shared_state_dir).expanduser()
+    )
 cloudrouter_store = CloudRouterAccountStore(settings.cloudrouter_accounts_dir)
 instance_manager.cloudrouter_store = cloudrouter_store
 
@@ -136,6 +142,10 @@ if settings.codex_pool_enabled or _has_cloudrouter_codex_accounts:
             include_native=settings.codex_pool_enabled,
         )
         dispatcher.codex_pool = codex_pool
+        instance_manager.codex_pool = codex_pool
+        instance_manager.codex_task_account_switcher = (
+            dispatcher.switch_codex_task_account
+        )
         logger.info("Codex pool enabled with %d accounts", len(codex_pool._accounts))
     except Exception:
         logger.exception("Codex pool init failed — codex pool disabled")
@@ -694,6 +704,61 @@ async def _runtime_lifespan(app: FastAPI):
 
     if not deployment_start.skip_mutations:
         await init_db()
+    if codex_pool is not None and settings.codex_shared_state_enabled:
+        from backend.services.codex_shared_state import (
+            converge_codex_shared_state,
+        )
+
+        # No Codex process is admitted before this point.  Converge all legacy
+        # account-local copies first, using the durable Task binding to resolve
+        # genuinely divergent rollouts without discarding any backup evidence.
+        async with async_session() as db:
+            codex_tasks = list((await db.execute(
+                select(Task).where(
+                    Task.provider == "codex",
+                    Task.session_id.is_not(None),
+                ).order_by(Task.id)
+            )).scalars())
+        task_bindings: dict[str, str] = {}
+        for task in codex_tasks:
+            account_id = (task.metadata_ or {}).get("codex_account_id")
+            account_home = (
+                codex_pool.home_for_account(account_id)
+                if isinstance(account_id, str)
+                else None
+            )
+            if account_home and task.session_id:
+                task_bindings[task.session_id] = account_home
+        goal_bindings: dict[str, str] = {}
+        goal_override_path = Path(
+            settings.codex_goal_migration_overrides_path
+        ).expanduser()
+        if goal_override_path.is_file():
+            raw_goal_overrides = json.loads(goal_override_path.read_text())
+            if not isinstance(raw_goal_overrides, dict):
+                raise RuntimeError(
+                    "Codex Goal migration overrides must be a JSON object"
+                )
+            for thread_id, account_id in raw_goal_overrides.items():
+                account_home = (
+                    codex_pool.home_for_account(account_id)
+                    if isinstance(account_id, str)
+                    else None
+                )
+                if not isinstance(thread_id, str) or not account_home:
+                    raise RuntimeError(
+                        "Codex Goal migration override references an unknown "
+                        f"thread/account: {thread_id!r} -> {account_id!r}"
+                    )
+                goal_bindings[thread_id] = account_home
+        migration = await asyncio.to_thread(
+            converge_codex_shared_state,
+            settings.codex_shared_state_dir,
+            [account.codex_home for account in codex_pool._accounts],
+            task_bindings=task_bindings,
+            goal_bindings=goal_bindings,
+        )
+        logger.info("Codex shared state ready: %s", migration)
     # Do not seed a shared/default administrator credential.  The registration
     # endpoint promotes the first real user to super_admin, while AUTH_TOKEN
     # remains the bootstrap administrator path for single-token deployments.

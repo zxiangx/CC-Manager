@@ -636,6 +636,7 @@ class CodexAppServer:
         request_timeout: float = 30.0,
         *,
         codex_home: str | os.PathLike[str] | None = None,
+        sqlite_home: str | os.PathLike[str] | None = None,
         env_remove: set[str] | None = None,
         actual_tier_proxy_route: CodexTierProxyRoute | None = None,
         require_actual_tier_proof: bool = False,
@@ -643,6 +644,11 @@ class CodexAppServer:
         self.binary = binary
         self.request_timeout = request_timeout
         self.codex_home = normalize_codex_home(codex_home)
+        self.sqlite_home = (
+            str(Path(sqlite_home).expanduser().resolve(strict=False))
+            if sqlite_home is not None
+            else None
+        )
         self._env_remove = {
             str(key).upper() for key in (env_remove or set())
         }
@@ -2443,6 +2449,11 @@ class CodexAppServer:
             )
         }
         env["CODEX_HOME"] = self.codex_home
+        if self.sqlite_home is not None:
+            sqlite_home = Path(self.sqlite_home)
+            sqlite_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(sqlite_home, 0o700)
+            env["CODEX_SQLITE_HOME"] = self.sqlite_home
         started = time.perf_counter()
         spawn_kwargs: dict[str, Any] = {
             "stdin": asyncio.subprocess.PIPE,
@@ -2458,6 +2469,14 @@ class CodexAppServer:
             "--enable",
             "fast_mode",
         ]
+        if self.sqlite_home is not None:
+            # A per-account config.toml may contain sqlite_home and takes
+            # precedence over the environment.  The explicit CLI override is
+            # the authoritative shared-state projection.
+            app_server_args.extend([
+                "-c",
+                f'sqlite_home="{self.sqlite_home}"',
+            ])
         if self._actual_tier_proxy_route is not None:
             proxy = CodexActualTierProxy(
                 self._actual_tier_proxy_route,
@@ -2484,17 +2503,31 @@ class CodexAppServer:
         self._reader_task = asyncio.create_task(self._read_loop(process))
         self._stderr_task = asyncio.create_task(self._stderr_loop(process))
         try:
-            await self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "claude_code_manager",
-                        "title": "Claude Code Manager",
-                        "version": "0.1.0",
-                    },
-                    "capabilities": {"experimentalApi": True},
+            initialize_request: dict[str, Any] = {
+                "clientInfo": {
+                    "name": "claude_code_manager",
+                    "title": "Claude Code Manager",
+                    "version": "0.1.0",
                 },
-            )
+                "capabilities": {"experimentalApi": True},
+            }
+            if self.sqlite_home is not None:
+                # A fresh shared SQLite home indexes every legacy rollout once.
+                # Multi-GB histories legitimately exceed the ordinary 30s RPC
+                # timeout. Killing the owning process leaves backfill_state at
+                # `running`, after which every replacement process only waits
+                # for the dead owner. Keep the first initializer alive until
+                # that one-time backfill reaches a durable terminal state.
+                await self._request(
+                    "initialize",
+                    initialize_request,
+                    timeout=max(self.request_timeout, 900.0),
+                )
+            else:
+                await self._request(
+                    "initialize",
+                    initialize_request,
+                )
             await self._notify("initialized", {})
         except BaseException:
             # ``_start`` runs under the lifecycle lock, so use the locked
@@ -4402,7 +4435,11 @@ class CodexAppServer:
         )
 
     async def _request(
-        self, method: str, params: dict[str, Any] | None,
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         if not self.is_alive or not self._process or not self._process.stdin:
             raise CodexAppServerError("app-server is not running")
@@ -4415,7 +4452,10 @@ class CodexAppServer:
             if params is not None:
                 message["params"] = params
             await self._write(message)
-            response = await asyncio.wait_for(future, timeout=self.request_timeout)
+            response = await asyncio.wait_for(
+                future,
+                timeout=self.request_timeout if timeout is None else timeout,
+            )
         finally:
             # Cancellation can happen while waiting for the shared write lock
             # or draining stdin, before the response wait is entered. Never
@@ -5363,6 +5403,7 @@ class CodexAppServerRegistry:
         binary: str,
         request_timeout: float = 30.0,
         *,
+        shared_state_home: str | os.PathLike[str] | None = None,
         env_remove_resolver: Callable[[str], set[str]] | None = None,
         actual_tier_route_resolver: (
             Callable[[str], CodexTierProxyRoute | None] | None
@@ -5371,6 +5412,11 @@ class CodexAppServerRegistry:
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
+        self.shared_state_home = (
+            str(Path(shared_state_home).expanduser().resolve(strict=False))
+            if shared_state_home is not None
+            else None
+        )
         self._env_remove_resolver = env_remove_resolver
         self._actual_tier_route_resolver = actual_tier_route_resolver
         self._require_actual_tier_proof = bool(require_actual_tier_proof)
@@ -5400,6 +5446,12 @@ class CodexAppServerRegistry:
         self._abort_locks: dict[str, asyncio.Lock] = {}
 
     def _new_server(self, home: str) -> CodexAppServer:
+        if self.shared_state_home is not None:
+            from backend.services.codex_shared_state import (
+                prepare_codex_account_projection,
+            )
+
+            prepare_codex_account_projection(self.shared_state_home, home)
         server_kwargs: dict[str, Any] = {}
         if self._env_remove_resolver is not None:
             server_kwargs["env_remove"] = self._env_remove_resolver(home)
@@ -5409,6 +5461,8 @@ class CodexAppServerRegistry:
             )
         if self._require_actual_tier_proof:
             server_kwargs["require_actual_tier_proof"] = True
+        if self.shared_state_home is not None:
+            server_kwargs["sqlite_home"] = self.shared_state_home
         return CodexAppServer(
             self.binary,
             request_timeout=self.request_timeout,
@@ -6540,12 +6594,12 @@ class CodexAppServerRegistry:
         source_codex_home: str | os.PathLike[str] | None,
         target_codex_home: str | os.PathLike[str],
     ) -> None:
-        """Move registry ownership after the rollout was safely copied.
+        """Move live ownership after shared session state is ready.
 
         App-server keeps completed threads in memory.  If the target server has
         loaded this thread before (the B -> A leg of a round trip), an idle
         target process is restarted so its next ``thread/resume`` reads the
-        newly copied rollout.  Active target turns are never killed; callers
+        canonical shared rollout.  Active target turns are never killed; callers
         receive a retryable busy error instead.
         """
 

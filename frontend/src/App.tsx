@@ -162,7 +162,7 @@ function App() {
 
   return (
     <ErrorBoundary>
-      <AppShell currentPage={page} onNavigate={handleNavigate} wide={page === 'tasks' && !!chatTaskId}>
+      <AppShell currentPage={page} currentTaskId={chatTaskId} onNavigate={handleNavigate} wide={page === 'tasks' && !!chatTaskId}>
         {page === 'dashboard' && <Dashboard />}
         {page === 'tasks' && <TasksPage chatTaskId={chatTaskId} onChatTaskChange={setChatTaskId} />}
         {page === 'projects' && <ProjectsPage />}

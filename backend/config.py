@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     codex_pool_enabled: bool = True
     codex_pool_config_path: str = "~/.codex-pool/accounts.json"
     codex_pool_cooldown_seconds: int = 300
+    # Credentials remain isolated in each account's CODEX_HOME, while native
+    # thread rollouts and SQLite-backed runtime state live in one canonical
+    # session-owned root.  Account switches therefore only change auth.
+    codex_shared_state_enabled: bool = True
+    codex_shared_state_dir: str = "~/.ccm/codex-state"
+    codex_goal_migration_overrides_path: str = (
+        "~/.ccm/codex-goal-migration-overrides.json"
+    )
 
     # --- CloudRouter API accounts ---
     # Each API identity owns one private root with separate Claude/Codex native
@@ -124,7 +132,8 @@ class Settings(BaseSettings):
     transient_retry_max: int = 5            # 最多自动重试次数
     transient_retry_base_delay: float = 10.0  # 首次退避秒数（指数递增）
     transient_retry_max_delay: float = 120.0  # 退避上限秒数
-    codex_capacity_retry_delay: float = 60.0  # 模型容量不足固定等待，且不设次数上限
+    codex_capacity_retry_delay: float = 180.0  # 同一账号 capacity 重试间隔
+    codex_capacity_switch_attempts: int = 3   # 连续多少次后换另一个原生账号
 
     # --- ask_user：拦截内置 AskUserQuestion，转前端卡片 ---
     ask_user_enabled: bool = True       # 关闭则不注入 hook，AskUserQuestion 回到原生行为

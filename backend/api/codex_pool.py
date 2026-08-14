@@ -32,6 +32,7 @@ from backend.services.process_safety import (
     UnsafeProcessGroupError,
     require_safe_process_group_id,
 )
+from backend.models.task import Task
 
 router = APIRouter(prefix="/api/codex-pool", tags=["codex-pool"])
 logger = logging.getLogger(__name__)
@@ -2403,6 +2404,76 @@ async def codex_delete_account(request: Request, account_id: str):
 # ---------------------------------------------------------------------------
 # Preferred account
 # ---------------------------------------------------------------------------
+
+
+@router.get("/tasks/{task_id}/account")
+async def codex_task_account(request: Request, task_id: int):
+    """Return one Task's current and deferred credential binding."""
+
+    require_admin(request)
+    dispatcher = _get_dispatcher()
+    async with dispatcher.db_factory() as db:
+        task = await db.get(Task, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if (task.provider or "claude").lower() != "codex":
+            raise HTTPException(status_code=409, detail="Task is not a Codex task")
+        metadata = task.metadata_ or {}
+        return {
+            "task_id": task.id,
+            "account_id": metadata.get("codex_account_id"),
+            "pending_account_id": metadata.get("pending_codex_account_id"),
+        }
+
+
+@router.post("/tasks/{task_id}/account")
+async def codex_switch_task_account(
+    request: Request,
+    task_id: int,
+    body: dict,
+):
+    """Switch only one Task; an active root turn changes at its next boundary."""
+
+    require_admin(request)
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        raise HTTPException(status_code=422, detail="account_id is required")
+    dispatcher = _get_dispatcher()
+    try:
+        return {
+            "ok": True,
+            **await dispatcher.switch_codex_task_account(task_id, account_id),
+        }
+    except CodexAppServerBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        from backend.services.dispatcher import CodexAccountRoutingError
+
+        if isinstance(exc, CodexAccountRoutingError):
+            raise HTTPException(
+                status_code=422 if exc.permanent else 409,
+                detail=str(exc),
+            ) from exc
+        raise
+
+
+@router.post("/global/account")
+async def codex_switch_global_account(request: Request, body: dict):
+    """Set the default and synchronize all existing Codex Tasks."""
+
+    require_admin(request)
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        raise HTTPException(status_code=422, detail="account_id is required")
+    dispatcher = _get_dispatcher()
+    if not await dispatcher.publish_codex_global_account(account_id):
+        raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+    convergence = await dispatcher.converge_codex_tasks_to_global_account()
+    return {
+        "ok": True,
+        "global_account": account_id,
+        "convergence": convergence,
+    }
 
 @router.post("/preferred")
 async def codex_set_preferred(request: Request, body: dict):

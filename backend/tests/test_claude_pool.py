@@ -1470,6 +1470,9 @@ class TestChatTransientRetryCodex:
         task.session_id = "thread-1"
         task.last_cwd = "/repo"
         task.target_repo = None
+        task.metadata_ = {}
+        task.model = "gpt-5.6-sol"
+        task.codex_service_tier = "default"
 
         broadcaster = MagicMock()
         broadcaster.broadcast = AsyncMock()
@@ -1551,6 +1554,42 @@ class TestChatTransientRetryCodex:
         }
         assert im._consume_codex_capacity_retry_superseded(1, 42) is True
         assert im._consume_codex_capacity_retry_superseded(1, 42) is False
+
+    @pytest.mark.asyncio
+    async def test_third_capacity_observation_rotates_native_account_immediately(
+        self, monkeypatch,
+    ):
+        im = self._im(
+            "codex",
+            "Selected model is at capacity. Please try a different model.",
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            "backend.config.settings.codex_capacity_switch_attempts", 3,
+        )
+        im._config_dirs[1] = "/accounts/codex-2"
+        im._codex_capacity_attempts[(42, "codex-2")] = 2
+        im.codex_pool = MagicMock()
+        im.codex_pool.account_id_for_home.side_effect = (
+            lambda home: "codex-7" if home == "/accounts/codex-7" else "codex-2"
+        )
+        im.codex_pool.select_random_native_capacity_alternative = AsyncMock(
+            return_value="/accounts/codex-7"
+        )
+        im.codex_task_account_switcher = AsyncMock(return_value={
+            "deferred": False,
+        })
+
+        assert await im._try_chat_transient_retry(1, 42, 1, "") is True
+
+        im.codex_pool.select_random_native_capacity_alternative.assert_awaited_once()
+        im.codex_task_account_switcher.assert_awaited_once_with(
+            42,
+            "codex-7",
+            defer_active=False,
+        )
+        assert im.launch.await_args.kwargs["config_dir"] == "/accounts/codex-7"
+        assert im.codex_capacity_retry_state(42)["capacity_retry_waiting"] is False
 
     @pytest.mark.asyncio
     async def test_claude_wording_does_not_trigger_codex_retry(self, monkeypatch):

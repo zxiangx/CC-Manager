@@ -205,6 +205,44 @@ class TestSelection:
         reloaded.mark_rate_limited(expected)
         assert reloaded.select() is None
 
+    @pytest.mark.asyncio
+    async def test_capacity_alternative_excludes_api_and_known_exhausted_accounts(
+        self, pool: CodexPool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        pool._accounts[2].enabled = True
+        pool._accounts[2].auth_kind = "cloudrouter_api"
+
+        async def quotas(*, force: bool = False, live: bool = False):
+            assert force and live
+            return [
+                {"id": "codex-1", "quota": {"primary_used_percent": 10}},
+                {"id": "codex-2", "quota": {"primary_used_percent": 100}},
+                {"id": "codex-3", "quota": {"primary_used_percent": 0}},
+            ]
+
+        monkeypatch.setattr(pool, "fetch_quota", quotas)
+
+        assert await pool.select_random_native_capacity_alternative(
+            str(tmp_path / "codex-1")
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_capacity_alternative_uses_unknown_native_when_live_quota_fails(
+        self, pool: CodexPool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        async def quotas(*, force: bool = False, live: bool = False):
+            assert force and live
+            return [
+                {"id": "codex-1", "quota": {"primary_used_percent": 10}},
+                {"id": "codex-2", "error": "quota probe unavailable"},
+            ]
+
+        monkeypatch.setattr(pool, "fetch_quota", quotas)
+
+        assert await pool.select_random_native_capacity_alternative(
+            str(tmp_path / "codex-1")
+        ) == str((tmp_path / "codex-2").resolve())
+
 
 class TestQuotaRanking:
     def test_native_remaining_uses_the_tightest_window(self):

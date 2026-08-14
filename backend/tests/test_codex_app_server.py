@@ -5732,6 +5732,53 @@ async def test_app_server_spawn_uses_independent_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_app_server_projects_shared_sqlite_home(tmp_path):
+    shared = tmp_path / "shared-state"
+    server = CodexAppServer(
+        "codex",
+        codex_home=tmp_path / "account",
+        sqlite_home=shared,
+    )
+    spawn = AsyncMock(side_effect=RuntimeError("synthetic spawn failure"))
+
+    with patch(
+        "backend.services.codex_app_server.asyncio.create_subprocess_exec",
+        spawn,
+    ):
+        with pytest.raises(RuntimeError, match="synthetic spawn failure"):
+            await server._start()
+
+    assert spawn.await_args.kwargs["env"]["CODEX_SQLITE_HOME"] == str(
+        shared.resolve()
+    )
+    assert spawn.await_args.args == (
+        "codex",
+        "app-server",
+        "--enable",
+        "fast_mode",
+        "-c",
+        f'sqlite_home="{shared.resolve()}"',
+        "--stdio",
+    )
+
+
+def test_registry_projects_account_rollouts_into_shared_state(tmp_path):
+    shared = tmp_path / "shared-state"
+    account = tmp_path / "account"
+    account.mkdir()
+    registry = CodexAppServerRegistry(
+        "codex",
+        shared_state_home=shared,
+    )
+
+    server = registry._new_server(str(account))
+
+    assert server.sqlite_home == str(shared.resolve())
+    assert (account / "sessions").is_symlink()
+    assert (account / "sessions").resolve() == (shared / "sessions").resolve()
+
+
+@pytest.mark.asyncio
 async def test_app_server_removes_account_specific_inherited_auth_env(tmp_path):
     server = CodexAppServer(
         "codex",

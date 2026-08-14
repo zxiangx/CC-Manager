@@ -4501,6 +4501,94 @@ async def test_global_convergence_rebinds_existing_target_rollout_copy(
 
 
 @pytest.mark.asyncio
+async def test_shared_state_switch_changes_credentials_without_rollout_copy(
+    db_factory,
+    tmp_path,
+):
+    source = tmp_path / "codex-2"
+    target = tmp_path / "codex-7"
+    source.mkdir()
+    target.mkdir()
+    config = tmp_path / "codex-accounts.json"
+    config.write_text(
+        '{"accounts":['
+        f'{{"id":"codex-2","codex_home":"{source}","enabled":true}},'
+        f'{{"id":"codex-7","codex_home":"{target}","enabled":true}}'
+        ']}'
+    )
+    d = _make_dispatcher(db_factory)
+    d.codex_pool = CodexPool(config_path=config, cooldown_seconds=60)
+    d.instance_manager.codex_shared_state_dir = str(tmp_path / "shared")
+    d.instance_manager.rebind_codex_thread = AsyncMock()
+    async with db_factory() as db:
+        task = Task(
+            title="shared-switch",
+            status="completed",
+            provider="codex",
+            session_id="thread-shared-switch",
+            metadata_={"codex_account_id": "codex-2"},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    result = await d.switch_codex_task_account(task_id, "codex-7")
+
+    assert result["deferred"] is False
+    d.instance_manager.rebind_codex_thread.assert_awaited_once_with(
+        "thread-shared-switch",
+        source_codex_home=str(source.resolve()),
+        target_codex_home=str(target.resolve()),
+    )
+    assert not (target / "sessions").exists()
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_id)
+        assert persisted.metadata_["codex_account_id"] == "codex-7"
+
+
+@pytest.mark.asyncio
+async def test_active_shared_state_switch_is_deferred_to_next_boundary(
+    db_factory,
+    tmp_path,
+):
+    source = tmp_path / "codex-2"
+    target = tmp_path / "codex-7"
+    config = tmp_path / "codex-accounts.json"
+    config.write_text(
+        '{"accounts":['
+        f'{{"id":"codex-2","codex_home":"{source}","enabled":true}},'
+        f'{{"id":"codex-7","codex_home":"{target}","enabled":true}}'
+        ']}'
+    )
+    d = _make_dispatcher(db_factory)
+    d.codex_pool = CodexPool(config_path=config, cooldown_seconds=60)
+    d.instance_manager.codex_shared_state_dir = str(tmp_path / "shared")
+    d.instance_manager.rebind_codex_thread = AsyncMock()
+    async with db_factory() as db:
+        task = Task(
+            title="active-switch",
+            status="executing",
+            provider="codex",
+            session_id="thread-active-switch",
+            metadata_={"codex_account_id": "codex-2"},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    result = await d.switch_codex_task_account(task_id, "codex-7")
+
+    assert result["deferred"] is True
+    d.instance_manager.rebind_codex_thread.assert_not_awaited()
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_id)
+        assert persisted.metadata_ == {
+            "codex_account_id": "codex-2",
+            "pending_codex_account_id": "codex-7",
+        }
+
+
+@pytest.mark.asyncio
 async def test_stale_codex_binding_cas_cannot_write_reclaimed_generation(
     db_factory,
 ):
@@ -8563,6 +8651,83 @@ async def test_codex_capacity_retry_is_iterative_and_unbounded(
     assert all(event["max_attempts"] == 0 for event in events)
     assert all(event["unbounded"] is True for event in events)
     dispatcher._complete_owned_task.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_mode_capacity_rotates_native_account_after_three_retries(
+    db_factory,
+    monkeypatch,
+):
+    dispatcher = _make_dispatcher(db_factory)
+    task = Task(
+        id=914,
+        title="capacity rotate",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+        session_id="thread-capacity-rotate",
+    )
+    generation = MagicMock()
+    dispatcher._task_claim_is_active = AsyncMock(return_value=True)
+    dispatcher._read_owned_lifecycle_task = AsyncMock(return_value=task)
+    dispatcher._collect_failure_output = AsyncMock(return_value=(
+        "Selected model is at capacity. Please try a different model."
+    ))
+    dispatcher._relaunch_and_wait = AsyncMock(side_effect=[1, 1, 1, 0])
+    dispatcher._complete_owned_task = AsyncMock(return_value=True)
+    dispatcher.instance_manager._config_dirs = {3: "/accounts/codex-2"}
+    dispatcher.instance_manager.get_config_dir = MagicMock(
+        side_effect=lambda _instance_id: (
+            dispatcher.instance_manager._config_dirs[3]
+        )
+    )
+    dispatcher.instance_manager.transient_error_seen = MagicMock(
+        side_effect=[True, True, True, False],
+    )
+    dispatcher.instance_manager.codex_capacity_error_seen = MagicMock(
+        return_value=True,
+    )
+    dispatcher.codex_pool = MagicMock()
+    dispatcher.codex_pool.account_id_for_home.side_effect = (
+        lambda home: "codex-7" if home == "/accounts/codex-7" else "codex-2"
+    )
+    dispatcher.codex_pool.select_random_native_capacity_alternative = AsyncMock(
+        return_value="/accounts/codex-7"
+    )
+    dispatcher.switch_codex_task_account = AsyncMock(return_value={
+        "deferred": False,
+    })
+    monkeypatch.setattr(
+        "backend.config.settings.codex_capacity_retry_delay", 180.0,
+    )
+    monkeypatch.setattr(
+        "backend.config.settings.codex_capacity_switch_attempts", 3,
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("backend.services.dispatcher.asyncio.sleep", sleep)
+
+    await dispatcher._run_transient_retry(
+        3,
+        task,
+        generation,
+        "/tmp/repo",
+        None,
+    )
+
+    dispatcher.switch_codex_task_account.assert_awaited_once_with(
+        task.id,
+        "codex-7",
+        defer_active=False,
+    )
+    assert [call.args for call in sleep.await_args_list] == [
+        (180.0,),
+        (180.0,),
+        (180.0,),
+        (0.0,),
+    ]
+    assert dispatcher._relaunch_and_wait.await_args_list[-1].args[5] == (
+        "/accounts/codex-7"
+    )
 
 
 @pytest.mark.asyncio

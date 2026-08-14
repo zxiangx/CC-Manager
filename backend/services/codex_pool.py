@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import stat
 import tempfile
 import time
@@ -960,9 +961,9 @@ class CodexPool:
         if not candidates:
             return None
 
-        # Global mode never falls through to a different account.  The
-        # rotation coordinator must first select and durably publish the new
-        # global account, then every Task converges to it.
+        # Global mode never falls through to a different account. Legacy
+        # callers use this as a hard process-wide route; session-owned routing
+        # uses ``select_session`` below instead.
         if self._global_account_id:
             global_account = next(
                 (a for a in candidates if a.id == self._global_account_id),
@@ -980,10 +981,7 @@ class CodexPool:
             if preferred:
                 return self._record_selection(preferred, now)
 
-        # Fresh launches prefer a compatible API account.  True
-        # round-robin is preserved within the API and native groups; if every
-        # API projection is unavailable/unsupported, the native group follows
-        # exactly the former config-order rotation.
+        # Legacy fresh launches prefer a compatible API account.
         api_candidates = [
             account
             for account in candidates
@@ -996,6 +994,69 @@ class CodexPool:
         ]
         for group in (api_candidates, native_candidates):
             chosen = self._round_robin_candidate(group)
+            if chosen is not None:
+                return self._record_selection(chosen, now)
+        return None
+
+    def select_session(
+        self,
+        exclude: set[str] | None = None,
+        *,
+        model: str | None = None,
+        service_tier: str = "default",
+        native_only: bool = False,
+        randomize: bool = False,
+    ) -> str | None:
+        """Choose credentials for one independently bound Task.
+
+        Native OAuth accounts are preferred. API/号池 projections are only a
+        fallback for ordinary admission and are completely excluded when
+        ``native_only`` is requested by capacity recovery.
+        """
+
+        now = time.time()
+        excluded = exclude or set()
+        requested_tier = _normalize_service_tier(service_tier)
+        candidates = []
+        for account in self._accounts:
+            quota_decision = self._api_quota_decision(account)
+            if (
+                account.enabled
+                and not account.retired
+                and account.id not in excluded
+                and now >= self._cooldowns.get(account.id, 0)
+                and account.supports_service_tier(model, requested_tier)
+                and not (
+                    bool(quota_decision.get("known"))
+                    and quota_decision.get("available") is False
+                )
+            ):
+                candidates.append(account)
+        native = [
+            account for account in candidates
+            if not _is_api_auth_kind(account.auth_kind)
+        ]
+        api = [
+            account for account in candidates
+            if _is_api_auth_kind(account.auth_kind)
+        ]
+        groups = (native,) if native_only else (native, api)
+        for group in groups:
+            if not group:
+                continue
+            global_account = next(
+                (
+                    account for account in group
+                    if account.id == self._global_account_id
+                ),
+                None,
+            )
+            if global_account is not None and not randomize:
+                return self._record_selection(global_account, now)
+            if randomize:
+                chosen = secrets.choice(group)
+            else:
+                chosen = self._round_robin_candidate(group)
             if chosen is not None:
                 return self._record_selection(chosen, now)
         return None
@@ -1457,6 +1518,65 @@ class CodexPool:
             model=model,
             service_tier=service_tier,
         )
+
+    async def select_random_native_capacity_alternative(
+        self,
+        current_home: str,
+        *,
+        exclude: set[str] | None = None,
+        model: str | None = None,
+        service_tier: str = "default",
+    ) -> str | None:
+        """Randomly choose another native OAuth account with usable quota.
+
+        API/号池 identities are deliberately excluded. Live quota is
+        preferred; if all live reads fail temporarily, enabled native accounts
+        remain eligible so the quota inspector cannot deadlock recovery.
+        """
+
+        current_id = self.account_id_for_home(current_home)
+        excluded = set(exclude or set())
+        if current_id:
+            excluded.add(current_id)
+        quota_by_id = {
+            row["id"]: row
+            for row in await self.fetch_quota(force=True, live=True)
+        }
+        now = time.time()
+        known_usable: list[CodexPoolAccount] = []
+        quota_unknown: list[CodexPoolAccount] = []
+        for account in self._accounts:
+            if (
+                account.id in excluded
+                or not account.enabled
+                or account.retired
+                or _is_api_auth_kind(account.auth_kind)
+                or now < self._cooldowns.get(account.id, 0)
+                or not account.supports_service_tier(model, service_tier)
+            ):
+                continue
+            row = quota_by_id.get(account.id) or {}
+            quota = row.get("quota") or {}
+            percentages = [
+                quota.get("primary_used_percent"),
+                quota.get("secondary_used_percent"),
+            ]
+            if (
+                not row.get("error")
+                and quota
+                and quota.get("is_rate_limited") is not True
+                and all(
+                    value is None or float(value) < 100
+                    for value in percentages
+                )
+            ):
+                known_usable.append(account)
+            elif row.get("error") or not quota:
+                quota_unknown.append(account)
+        eligible = known_usable or quota_unknown
+        if not eligible:
+            return None
+        return self._record_selection(secrets.choice(eligible), now)
 
     async def select_highest_quota_account(
         self,

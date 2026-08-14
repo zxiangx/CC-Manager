@@ -1753,6 +1753,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/codex-pool/accounts/${accountId}/clear-cooldown`, { method: 'POST' }),
   setCodexPoolPreferred: (accountId: string | null) =>
     request<{ ok: boolean; preferred: string | null }>('/api/codex-pool/preferred', { method: 'POST', body: JSON.stringify({ account_id: accountId }) }),
+  getCodexTaskAccount: (taskId: number) =>
+    request<{ task_id: number; account_id: string | null; pending_account_id: string | null }>(`/api/codex-pool/tasks/${taskId}/account`),
+  switchCodexTaskAccount: (taskId: number, accountId: string) =>
+    request<{ ok: boolean; task_id: number; account_id: string; previous_account_id: string | null; deferred: boolean }>(`/api/codex-pool/tasks/${taskId}/account`, { method: 'POST', body: JSON.stringify({ account_id: accountId }) }),
+  switchCodexGlobalAccount: (accountId: string) =>
+    request<{ ok: boolean; global_account: string; convergence: { migrated: number; skipped_active: number; errors: unknown[] } }>('/api/codex-pool/global/account', { method: 'POST', body: JSON.stringify({ account_id: accountId }) }),
   codexPoolDeleteAccount: (accountId: string) =>
     request<{ ok: boolean }>(`/api/codex-pool/accounts/${accountId}`, { method: 'DELETE' }),
   codexPoolVerify: (accountId: string) =>

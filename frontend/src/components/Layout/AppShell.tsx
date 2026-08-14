@@ -17,6 +17,7 @@ import { PrefsMenu } from './PrefsMenu';
 
 interface AppShellProps {
   currentPage: string;
+  currentTaskId?: number | null;
   onNavigate: (page: string) => void;
   /** 分屏聊天等需要更大内容宽度的页面 */
   wide?: boolean;
@@ -34,7 +35,7 @@ interface NavItem {
 /** App 壳：桌面端左侧固定侧栏，移动端顶栏 + 抽屉；顶栏收纳全局控件。
  * 页面主体走文档流滚动（sticky 顶栏），分屏视图的 100vh 计算依赖顶栏
  * 高度 = h-12 (3rem) + 底边框。 */
-export function AppShell({ currentPage, onNavigate, wide, children }: AppShellProps) {
+export function AppShell({ currentPage, currentTaskId, onNavigate, wide, children }: AppShellProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(
     () => localStorage.getItem('ccm-nav-collapsed') === 'true',
@@ -306,7 +307,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
                 <span className="text-xs text-gray-400 mr-1 hidden sm:inline">{ccUser.name}</span>
               )}
               {isAdmin && remoteUpdatesEnabled && <UpdateButton />}
-              {isAdmin && <PoolDrawer />}
+              {isAdmin && <PoolDrawer currentTaskId={currentTaskId} />}
               <PrefsMenu isAdmin={isAdmin} />
             </div>
           </div>

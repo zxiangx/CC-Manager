@@ -24,6 +24,9 @@ vi.mock('../../api/client', () => ({
     getCodexPoolUsage: vi.fn(),
     clearCodexPoolCooldown: vi.fn(),
     setCodexPoolPreferred: vi.fn(),
+    getCodexTaskAccount: vi.fn(),
+    switchCodexTaskAccount: vi.fn(),
+    switchCodexGlobalAccount: vi.fn(),
     codexPoolDeleteAccount: vi.fn(),
     codexPoolRelogin: vi.fn(),
     codexPoolReloginStatus: vi.fn(),
@@ -80,8 +83,8 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function renderAndWaitForPro() {
-  render(<PoolDrawer />);
+async function renderAndWaitForPro(currentTaskId?: number) {
+  render(<PoolDrawer currentTaskId={currentTaskId} />);
   await waitFor(() => {
     expect(screen.getByText('Pro')).toBeInTheDocument();
   });
@@ -724,8 +727,8 @@ describe('PoolDrawer', () => {
     it('renders the same API account in Codex without OAuth controls and refreshes its shared quota', async () => {
       enableCodexPool({
         enabled: true,
-        total: 1,
-        available: 1,
+        total: 2,
+        available: 2,
         cooldown: 0,
         disabled: 0,
         preferred: null,
@@ -1421,8 +1424,8 @@ describe('PoolDrawer', () => {
       quota_error: 'no_rollout_data',
     };
 
-    async function openCodexTab(user: ReturnType<typeof userEvent.setup>) {
-      await renderAndWaitForPro();
+    async function openCodexTab(user: ReturnType<typeof userEvent.setup>, currentTaskId?: number) {
+      await renderAndWaitForPro(currentTaskId);
       await openDrawer(user);
       await user.click(screen.getByRole('button', { name: 'Codex' }));
       await waitFor(() => expect(screen.getByText('Codex Pool')).toBeInTheDocument());
@@ -1602,7 +1605,7 @@ describe('PoolDrawer', () => {
       expect(screen.queryByText('codex-previous')).not.toBeInTheDocument();
     });
 
-    it('shows each account CODEX_HOME and can set it preferred', async () => {
+    it('shows each account CODEX_HOME and switches only the current task', async () => {
       enableCodexPool({
         enabled: true,
         total: 1,
@@ -1612,42 +1615,58 @@ describe('PoolDrawer', () => {
         preferred: null,
         accounts: [codexAccount],
       });
-      vi.mocked(api.setCodexPoolPreferred).mockResolvedValue({ ok: true, preferred: 'codex-2' });
+      vi.mocked(api.getCodexTaskAccount).mockResolvedValue({
+        task_id: 37,
+        account_id: 'codex-1',
+        pending_account_id: null,
+      });
+      vi.mocked(api.switchCodexTaskAccount).mockResolvedValue({
+        ok: true,
+        task_id: 37,
+        account_id: 'codex-2',
+        previous_account_id: 'codex-1',
+        deferred: false,
+      });
       const user = userEvent.setup();
 
-      await openCodexTab(user);
+      await openCodexTab(user, 37);
 
       expect(screen.getByText(`CODEX_HOME: ${codexAccount.codex_home}`)).toBeInTheDocument();
-      await user.click(screen.getByRole('button', { name: '切换到此账号' }));
+      await user.click(screen.getByRole('button', { name: '切换' }));
       await waitFor(() => {
-        expect(api.setCodexPoolPreferred).toHaveBeenCalledWith('codex-2');
+        expect(api.switchCodexTaskAccount).toHaveBeenCalledWith(37, 'codex-2');
+        expect(screen.getByText('当前会话')).toBeInTheDocument();
       });
     });
 
-    it('marks the global account and can reselect the highest-quota account', async () => {
+    it('marks the global default and can explicitly switch all tasks', async () => {
       enableCodexPool({
         enabled: true,
         total: 1,
         available: 1,
         cooldown: 0,
         disabled: 0,
-        preferred: 'codex-2',
-        accounts: [codexAccount],
+        preferred: 'codex-1',
+        global_account: 'codex-1',
+        accounts: [
+          { ...codexAccount, id: 'codex-1', codex_home: '/home/ubuntu/.codex-codex-1' },
+          codexAccount,
+        ],
       });
-      vi.mocked(api.setCodexPoolPreferred).mockResolvedValue({ ok: true, preferred: 'codex-2' });
+      vi.mocked(api.switchCodexGlobalAccount).mockResolvedValue({
+        ok: true,
+        global_account: 'codex-2',
+        convergence: { migrated: 1, skipped_active: 0, errors: [] },
+      });
       const user = userEvent.setup();
 
       await openCodexTab(user);
 
-      expect(screen.getByText('全局账号')).toBeInTheDocument();
-      const reselectButton = screen.getByRole('button', { name: '重选最优' });
-      expect(reselectButton).toHaveAttribute(
-        'title',
-        '刷新所有候选账号额度，并将所有 Codex 会话统一到剩余额度最高的账号',
-      );
-      await user.click(reselectButton);
+      expect(screen.getAllByText('全局默认')).toHaveLength(2);
+      expect(screen.getByRole('button', { name: '全局默认' })).toBeDisabled();
+      await user.click(screen.getByRole('button', { name: '全局切换' }));
       await waitFor(() => {
-        expect(api.setCodexPoolPreferred).toHaveBeenCalledWith(null);
+        expect(api.switchCodexGlobalAccount).toHaveBeenCalledWith('codex-2');
       });
     });
 
@@ -1678,7 +1697,7 @@ describe('PoolDrawer', () => {
       );
     });
 
-    it('retries a transient relogin status failure and still accepts the OTP', async () => {
+    it('does not expose the removed Codex relogin action', async () => {
       enableCodexPool({
         enabled: true,
         total: 1,
@@ -1688,87 +1707,10 @@ describe('PoolDrawer', () => {
         preferred: null,
         accounts: [codexAccount],
       });
-      vi.mocked(api.codexPoolRelogin).mockResolvedValue({
-        ok: true,
-        status: 'running',
-        attempt_id: 'relogin-attempt',
-      });
-      vi.mocked(api.codexPoolReloginStatus)
-        .mockRejectedValueOnce(new Error('temporary network error'))
-        .mockResolvedValue({
-          status: 'awaiting_otp',
-          attempt_id: 'relogin-attempt',
-          challenge_id: 'relogin-challenge',
-          expires_at: Math.floor(Date.now() / 1000) + 600,
-        });
-      vi.mocked(api.codexPoolSubmitOtp).mockResolvedValue({
-        ok: true,
-        status: 'verifying_otp',
-      });
       const user = userEvent.setup();
 
       await openCodexTab(user);
-      await user.click(screen.getByRole('button', { name: '重新登录' }));
-
-      await waitFor(() => {
-        expect(screen.getByText(/状态查询暂时失败，正在重试/)).toBeInTheDocument();
-      }, { timeout: 2500 });
-      const otpInput = await screen.findByLabelText(
-        'OpenAI 邮箱验证码',
-        {},
-        { timeout: 5000 },
-      );
-      expect(api.codexPoolReloginStatus).toHaveBeenCalledTimes(2);
-
-      await user.type(otpInput, '123456');
-      await user.click(screen.getByRole('button', { name: '继续登录' }));
-      await waitFor(() => {
-        expect(api.codexPoolSubmitOtp).toHaveBeenCalledWith(
-          'relogin-attempt',
-          'relogin-challenge',
-          '123456',
-        );
-      });
-    });
-
-    it('continues polling relogin through finalizing until committed success', async () => {
-      enableCodexPool({
-        enabled: true,
-        total: 1,
-        available: 1,
-        cooldown: 0,
-        disabled: 0,
-        preferred: null,
-        accounts: [codexAccount],
-      });
-      vi.mocked(api.codexPoolRelogin).mockResolvedValue({
-        ok: true,
-        status: 'running',
-        attempt_id: 'relogin-finalizing',
-      });
-      vi.mocked(api.codexPoolReloginStatus)
-        .mockResolvedValueOnce({
-          status: 'finalizing',
-          attempt_id: 'relogin-finalizing',
-        })
-        .mockResolvedValue({
-          status: 'success',
-          attempt_id: 'relogin-finalizing',
-        });
-      const user = userEvent.setup();
-
-      await openCodexTab(user);
-      await user.click(screen.getByRole('button', { name: '重新登录' }));
-
-      expect(await screen.findByText(
-        '登录已完成，正在安全提交登录结果…',
-        {},
-        { timeout: 3000 },
-      )).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: '登录中…' })).toBeDisabled();
-
-      expect(await screen.findByText('登录成功', {}, { timeout: 5000 })).toBeInTheDocument();
-      expect(api.codexPoolReloginStatus).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole('button', { name: '重新登录' })).not.toBeInTheDocument();
     });
   });
 });

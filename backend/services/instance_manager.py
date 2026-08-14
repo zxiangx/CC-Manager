@@ -268,6 +268,11 @@ class InstanceManager:
         # Injected by backend.main. Runtime lookup is path-only and never reads
         # or stores the API key in launch params, git env, or process argv.
         self.cloudrouter_store = None
+        self.codex_pool = None
+        self.codex_task_account_switcher = None
+        # Wired by backend.main.  Account CODEX_HOME directories retain only
+        # credential/config identity; all app-servers share this native state.
+        self.codex_shared_state_dir: str | None = None
         self.parser = StreamParser()
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self._tasks: dict[int, asyncio.Task] = {}  # instance_id -> consumer task
@@ -333,6 +338,10 @@ class InstanceManager:
         # turn still reports exit_code 0.
         self._transient_seen: set[int] = set()
         self._codex_capacity_seen: set[int] = set()
+        # Capacity is account-scoped in practice. Count observations by the
+        # durable Task/account pair and avoid ping-ponging within one cycle.
+        self._codex_capacity_attempts: dict[tuple[int, str], int] = {}
+        self._codex_capacity_tried_accounts: dict[int, set[str]] = {}
         # Task-scoped only while a failed Codex chat turn is sleeping before
         # its next model-capacity retry. A newer user message may safely wake
         # this boundary and supersede the retry; it must never interrupt a
@@ -613,6 +622,14 @@ class InstanceManager:
             return False
         self._codex_capacity_retry_superseded.discard(key)
         return True
+
+    def _clear_codex_capacity_tracking(self, task_id: int) -> None:
+        for key in [
+            key for key in self._codex_capacity_attempts
+            if key[0] == task_id
+        ]:
+            self._codex_capacity_attempts.pop(key, None)
+        self._codex_capacity_tried_accounts.pop(task_id, None)
 
     async def start_codex_parent_followup(
         self,
@@ -1693,6 +1710,7 @@ class InstanceManager:
             self._codex_app_server = CodexAppServerRegistry(
                 self._resolve_codex_binary(),
                 request_timeout=settings.codex_app_server_request_timeout,
+                shared_state_home=self.codex_shared_state_dir,
                 env_remove_resolver=self._codex_env_remove_for_home,
                 actual_tier_route_resolver=(
                     self._codex_actual_tier_route_for_home
@@ -6305,8 +6323,10 @@ class InstanceManager:
                 ):
                     return
         elif task_id and chat_initiated:
-            # Clean turn — drop any transient-retry tally for this instance.
+            # Clean turn — drop any transient/capacity retry tally.
             self._transient_attempts.pop(instance_id, None)
+            if provider == "codex":
+                self._clear_codex_capacity_tracking(task_id)
 
         if not owns_instance_turn():
             logger.info(
@@ -6783,6 +6803,8 @@ class InstanceManager:
                 # Non-transient failure — reset tally so the next genuine
                 # overload chain starts fresh.
                 self._transient_attempts.pop(instance_id, None)
+                if provider == "codex":
+                    self._clear_codex_capacity_tracking(task_id)
                 return False
 
             attempt = self._transient_attempts.get(instance_id, 0) + 1
@@ -6803,10 +6825,107 @@ class InstanceManager:
                     return False
                 session_id = task.session_id
                 cwd = task.last_cwd or task.target_repo
+                bound_codex_id = (task.metadata_ or {}).get(
+                    "codex_account_id"
+                )
+                task_model = task.model
+                task_service_tier = task.codex_service_tier
 
             config_dir = self._config_dirs.get(instance_id)
+            capacity_attempt = attempt
+            if capacity_retry:
+                pool = self.codex_pool
+                account_switcher = self.codex_task_account_switcher
+                capacity_account_id = (
+                    bound_codex_id
+                    if isinstance(bound_codex_id, str)
+                    else (
+                        pool.account_id_for_home(config_dir)
+                        if pool and config_dir
+                        else None
+                    )
+                )
+                if capacity_account_id:
+                    capacity_key = (task_id, capacity_account_id)
+                    capacity_attempt = (
+                        self._codex_capacity_attempts.get(capacity_key, 0) + 1
+                    )
+                    self._codex_capacity_attempts[capacity_key] = capacity_attempt
+                    self._codex_capacity_tried_accounts.setdefault(
+                        task_id, set()
+                    ).add(capacity_account_id)
+
+                switch_after = max(
+                    1,
+                    int(_settings.codex_capacity_switch_attempts),
+                )
+                if (
+                    pool
+                    and account_switcher
+                    and config_dir
+                    and capacity_account_id
+                    and capacity_attempt >= switch_after
+                ):
+                    tried = self._codex_capacity_tried_accounts.setdefault(
+                        task_id, set()
+                    )
+                    new_home = await (
+                        pool.select_random_native_capacity_alternative(
+                            config_dir,
+                            exclude=tried,
+                            model=task_model,
+                            service_tier=task_service_tier,
+                        )
+                    )
+                    if not new_home:
+                        # All native candidates were tried once. Start a new
+                        # randomized cycle, still excluding current + API pool.
+                        tried.clear()
+                        tried.add(capacity_account_id)
+                        new_home = await (
+                            pool.select_random_native_capacity_alternative(
+                                config_dir,
+                                exclude=tried,
+                                model=task_model,
+                                service_tier=task_service_tier,
+                            )
+                        )
+                    new_account_id = (
+                        pool.account_id_for_home(new_home)
+                        if new_home
+                        else None
+                    )
+                    if new_home and new_account_id:
+                        await account_switcher(
+                            task_id,
+                            new_account_id,
+                            defer_active=False,
+                        )
+                        self._config_dirs[instance_id] = new_home
+                        config_dir = new_home
+                        self._codex_capacity_attempts.pop(
+                            (task_id, capacity_account_id), None
+                        )
+                        logger.warning(
+                            "Codex capacity recovery switched task %d from "
+                            "%s to %s after %d observations",
+                            task_id,
+                            capacity_account_id,
+                            new_account_id,
+                            capacity_attempt,
+                        )
+                        await self.broadcaster.broadcast(f"task:{task_id}", {
+                            "event_type": "pool_rotation",
+                            "provider": "codex",
+                            "old_account": capacity_account_id,
+                            "new_account": new_account_id,
+                            "reason": "model_capacity",
+                        })
+                        capacity_attempt = 0
             delay = (
                 max(1.0, _settings.codex_capacity_retry_delay)
+                if capacity_retry and capacity_attempt > 0
+                else 0.0
                 if capacity_retry
                 else transient_retry_delay(
                     attempt,
@@ -6822,7 +6941,7 @@ class InstanceManager:
                 "retry #%d%s",
                 task_id,
                 delay,
-                attempt,
+                capacity_attempt if capacity_retry else attempt,
                 " (unbounded capacity retry)"
                 if capacity_retry
                 else f"/{retry_limit}",
@@ -6830,7 +6949,7 @@ class InstanceManager:
             await self.broadcaster.broadcast(f"task:{task_id}", {
                 "event_type": "transient_retry",
                 "task_id": task_id,
-                "attempt": attempt,
+                "attempt": capacity_attempt if capacity_retry else attempt,
                 "max_attempts": retry_limit,
                 "unbounded": capacity_retry,
                 "delay": round(delay, 1),
@@ -6840,13 +6959,15 @@ class InstanceManager:
                 capacity_wait = _CodexCapacityRetryWait(
                     task_id=task_id,
                     instance_id=instance_id,
-                    attempt=attempt,
+                    attempt=capacity_attempt,
                     delay=delay,
                 )
                 self._codex_capacity_retry_waits[task_id] = capacity_wait
             try:
                 if capacity_wait is None:
                     await asyncio.sleep(delay)
+                elif delay <= 0:
+                    pass
                 else:
                     try:
                         await asyncio.wait_for(
@@ -7497,9 +7618,6 @@ class InstanceManager:
                 new_home = pool.canonical_home(new_home)
                 old_quota = pool.cached_quota_for_home(old_home)
 
-                from backend.services.codex_session_migration import (
-                    migrate_codex_rollout_session,
-                )
                 from backend.services.codex_pool import quota_cooldown_seconds
 
                 old_account_id = pool.account_id_for_home(old_home)
@@ -7570,12 +7688,20 @@ class InstanceManager:
                         binding_committed = True
 
                     try:
-                        await asyncio.to_thread(
-                            migrate_codex_rollout_session,
-                            session_id,
-                            old_home,
-                            new_home,
-                        )
+                        if not (
+                            isinstance(self.codex_shared_state_dir, str)
+                            and self.codex_shared_state_dir
+                        ):
+                            from backend.services.codex_session_migration import (
+                                migrate_codex_rollout_session,
+                            )
+
+                            await asyncio.to_thread(
+                                migrate_codex_rollout_session,
+                                session_id,
+                                old_home,
+                                new_home,
+                            )
                         if not await generation_is_current(generation):
                             raise RuntimeError(
                                 "task generation changed after rollout copy"

@@ -1060,3 +1060,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **路由修正**：新增持久化 `global_account_id`，所有 Codex Session 只向该账号收敛。usage-limit/主动重选会并行刷新真实 quota，原生账号按最紧窗口剩余额度取最高，原生全耗尽时改走 API 号池。空闲 Task 立即复制 rollout + rebind + 改绑定，活跃 Task 不强杀并在收尾/下一回合收敛。
 - **时间修正**：所有前端时间固定 `Asia/Shanghai`，移除按浏览器/localStorage 分流。同时修复 ISO suffix 正则把日期中 `-05` 误当 UTC offset 的 bug，旧的 naive UTC 历史时间无需改库即会正确显示。
 - **验证**：Codex pool + resume 路由 `120 passed`，时区/Prefs/Pool Drawer 前端 `82 passed`，production build、Python compile 和 `git diff --check` 通过。
+
+### 2026-08-16 — blocked Goal 被普通消息反复唤醒与本地部署入口（commit 7033f0aa）
+
+- **Goal 根因与修复**：CCM 把普通 Standard 消息视为 paused/blocked Goal 的恢复指令，先执行 `thread/goal/set active` 再 steer 用户输入；问题回答完后，原生 Goal 继续创建新 turn，于是数据库真实写入大量“仍处于 blocked”的重复提醒。现在普通消息只走独立 `turn/start`，持久 Goal 保持 paused/blocked，面板将 blocked 明确显示为“已阻塞”。
+- **本地部署入口**：远端更新关闭时，管理员顶栏新增“部署本地版本”。`POST /api/system/deploy` 不访问远端，只复用 `start_repair` 的工作树、活动任务、数据库快照/迁移和受控重启保护；前端经 WS 与 health/status 轮询展示步骤并在可验证完成后提示刷新。
+- **验证**：Goal 与 System API 定向回归通过；前端全量 `44 files / 576 tests`、TypeScript 与 production build 通过。macOS 本机无法运行依赖 Linux `/proc`/systemd 身份的 15 个更新脚本测试，AWS 部署后另做真实 service/health 验证。

@@ -3791,17 +3791,15 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resumable_status", ["paused", "blocked"])
-async def test_standard_resume_keeps_resumable_goal_inactive_for_normal_message(
-    resumable_status,
-):
-    """Ordinary chat must not turn a paused/blocked Goal back on."""
+async def test_standard_resume_reactivates_paused_goal_before_steering():
+    """A new user message is an explicit resume signal for a paused Goal."""
 
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     prepared = False
     requests: list[tuple[str, dict]] = []
+    goal_checks = 0
 
     async def on_turn_prepared(_process, thread_id):
         nonlocal prepared
@@ -3809,6 +3807,7 @@ async def test_standard_resume_keeps_resumable_goal_inactive_for_normal_message(
         prepared = True
 
     async def request(method, params):
+        nonlocal goal_checks
         requests.append((method, params))
         if method == "thread/resume":
             return {
@@ -3818,23 +3817,44 @@ async def test_standard_resume_keeps_resumable_goal_inactive_for_normal_message(
                 },
             }
         if method == "thread/goal/get":
+            goal_checks += 1
             return {
                 "goal": {
-                    "status": resumable_status,
+                    "status": "paused" if goal_checks == 1 else "complete",
                 },
             }
-        if method == "turn/start":
+        if method == "thread/goal/set":
             assert prepared is True
-            assert params["threadId"] == "thread-paused-goal"
-            assert params["input"] == [
-                {"type": "text", "text": "answer this ordinary question"},
-            ]
-            return {"turn": {"id": "turn-ordinary-message"}}
+            assert params == {
+                "threadId": "thread-paused-goal",
+                "status": "active",
+            }
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/started",
+                {
+                    "threadId": "thread-paused-goal",
+                    "turn": {
+                        "id": "turn-resumed-goal",
+                        "status": "inProgress",
+                    },
+                },
+            )
+            return {"goal": {"status": "active"}}
+        if method == "turn/steer":
+            assert params == {
+                "threadId": "thread-paused-goal",
+                "expectedTurnId": "turn-resumed-goal",
+                "input": [
+                    {"type": "text", "text": "keep watching"},
+                ],
+            }
+            return {"turnId": "turn-resumed-goal"}
         raise AssertionError(f"unexpected request: {method}")
 
     server._request = AsyncMock(side_effect=request)
     process, thread_id = await server.start_turn(
-        prompt="answer this ordinary question",
+        prompt="keep watching",
         cwd="/tmp",
         model="gpt-5.6-sol",
         effort="high",
@@ -3848,17 +3868,18 @@ async def test_standard_resume_keeps_resumable_goal_inactive_for_normal_message(
     assert [method for method, _ in requests] == [
         "thread/resume",
         "thread/goal/get",
-        "turn/start",
+        "thread/goal/set",
+        "turn/steer",
     ]
-    assert process.admitted_turn_id == "turn-ordinary-message"
+    assert process.admitted_turn_id == "turn-resumed-goal"
     context = server._contexts_by_thread[thread_id]
-    assert context.following_native_goal is False
-    assert context.turn_id == "turn-ordinary-message"
+    assert context.following_native_goal is True
+    assert context.turn_id == "turn-resumed-goal"
 
     server._handle_notification("turn/completed", {
         "threadId": thread_id,
         "turn": {
-            "id": "turn-ordinary-message",
+            "id": "turn-resumed-goal",
             "status": "completed",
             "error": None,
         },
@@ -3869,7 +3890,7 @@ async def test_standard_resume_keeps_resumable_goal_inactive_for_normal_message(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "goal_status",
-    [None, "usageLimited", "budgetLimited", "complete"],
+    [None, "blocked", "usageLimited", "budgetLimited", "complete"],
 )
 async def test_standard_resume_does_not_bypass_non_paused_goal_status(
     goal_status,

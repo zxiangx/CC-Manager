@@ -3066,22 +3066,25 @@ class CodexAppServer:
             and not disable_autonomous_features
             and not tools_disabled
         ):
-            # A normal user message is not an instruction to resume an
-            # autonomous Goal. In particular, turning ``blocked`` back into
-            # ``active`` here makes Codex immediately start fresh continuation
-            # turns and repeatedly announce the same unresolved blocker. Keep
-            # paused/blocked state persisted while admitting an independent
-            # ordinary turn on the same native thread. Goal reactivation must
-            # go through an explicit Goal action instead.
+            # Stop intentionally pauses a native Goal. A later Standard user
+            # message is an explicit continuation signal, so restore that
+            # exact Goal instead of starting an unrelated regular turn and
+            # leaving the objective stranded. A blocked Goal is different: it
+            # has reached an explicit terminal blocker and must stay inactive
+            # until a dedicated Goal action changes its status.
             resumable_goal = await self._read_thread_goal(str(thread_id))
+            resume_native_goal = bool(
+                isinstance(resumable_goal, dict)
+                and resumable_goal.get("status") == "paused"
+            )
             if (
                 isinstance(resumable_goal, dict)
-                and resumable_goal.get("status") in {"paused", "blocked"}
+                and resumable_goal.get("status") == "blocked"
             ):
                 logger.info(
-                    "Keeping Codex Goal %s while admitting ordinary turn "
+                    "Keeping blocked Codex Goal inactive while admitting "
+                    "ordinary turn "
                     "task=%s thread=%s",
-                    resumable_goal.get("status"),
                     task_id,
                     thread_id,
                 )

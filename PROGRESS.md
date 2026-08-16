@@ -2,6 +2,12 @@
 
 > **重要：Claude 必须自主维护本文件。** 每次完成重要改动或遇到问题后，在对应章节记录。每条记录必须附上 git commit ID。
 
+## 2026-08-16：修正 paused 与 blocked Goal 的恢复边界
+
+- **回归原因（commit `1a0529f7`）**：为阻止 blocked Goal 在普通聊天后重新激活并重复提示，上一版误将 `paused` 与 `blocked` 一起隔离。由部署停服或用户 Stop 产生的 paused Goal 因而在下一条 Standard 消息后只运行一个普通 turn，原目标继续处于 paused，#13 无法自主续跑。
+- **修复（commit `1a0529f7`）**：恢复原有的精确状态分流：只有 `paused` 把下一条 Standard 消息视为恢复意图，按 owner → `thread/goal/set active` → exact `turn/started` → `turn/steer` 的顺序接回原生 Goal；`blocked`、usage/budget limited、complete 和无 Goal 仍保持 inactive 并走普通 `turn/start`，不会重新引入 #37 的 blocker 刷屏。
+- **验证（commit `1a0529f7`）**：先以回归测试复现 paused 被错误送往 `turn/start`，修复后 paused/blocked 状态矩阵 6 项通过；完整 `backend/tests/test_codex_app_server.py` 为 `189 passed`，Python compile 与 `git diff --check` 通过。
+
 ## 2026-08-08：Codex 动态 Plan 清单
 
 - **问题（commit `3f7b011`）**：CCM 旧 parser 只认识 `codex exec --json` 的 `todo_list` item，并把它压成普通 system 文本；常驻 app-server 没接计划快照，前端也没有清单组件，因此 Codex 调用 `update_plan` 时用户看不到桌面端的三态进度表。

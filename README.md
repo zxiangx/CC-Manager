@@ -325,7 +325,7 @@ curl -X POST http://localhost:8000/api/system/update \
 
 真正更新时自动执行：git pull → 刷新 PTY 依赖 → 数据库迁移 → 重建前端 → 智能重启（自动检测 systemd 服务名 `SERVICE_NAME`）。更新源优先使用目标分支配置的 tracking remote（例如本仓库的 `upstream/main`），没有 tracking remote 时回退 `origin`。
 
-状态检查会分别显示当前进程实际加载的 commit、磁盘 `HEAD`、数据库 Alembic current/head。三者含义不同：代码已经拉取成功，只说明磁盘是新版；依赖、前端产物或迁移失败时，旧服务仍可能继续运行，所以“远端与本地代码一致”不能作为部署完成的判断。此时页面会提供「修复并重新部署」，重新执行当前磁盘版本的依赖同步、PTY 刷新、前端安装/构建、数据库确认/迁移和受控重启；只有代码与数据库都已确认一致时才开放轻量重启。即使一切一致，详情页仍保留「手动重启」按钮。
+状态检查会分别显示当前进程实际加载的 commit、磁盘 `HEAD`、数据库 Alembic current/head。三者含义不同：代码已经拉取成功，只说明磁盘是新版；依赖、前端产物或迁移失败时，旧服务仍可能继续运行，所以“远端与本地代码一致”不能作为部署完成的判断。此时页面会提供「修复并重新部署」，重新执行当前磁盘版本的依赖同步、PTY 刷新、前端安装/构建、数据库确认/迁移和受控重启；只有代码与数据库都已确认一致时才开放轻量重启。即使一切一致，详情页仍保留「手动重启」按钮。若部署关闭了远端更新，管理员顶栏改为显示「部署本地版本」：它只部署服务器磁盘上的当前 commit，不拉取或覆盖远端代码，并在后台完成相同的安全部署事务；完成后页面会提示刷新。
 
 更新、修复和受控重启还要求 Git 工作树干净，包括 staged、unstaged 和未被 `.gitignore` 排除的 untracked 文件；否则新进程可能加载无法由 commit 证明的代码。数据库、日志、备份、构建产物等运行时文件应通过 `.gitignore` 明确排除。
 
@@ -475,6 +475,7 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | | `POST /api/system/update` | 一键更新重启 |
 | | `POST /api/system/update/reconcile` | 安全核对并收敛幽灵运行状态 |
 | | `POST /api/system/update/repair` | 对当前磁盘版本执行完整修复部署 |
+| | `POST /api/system/deploy` | 不访问远端，安全部署服务器磁盘上的当前版本 |
 | | `POST /api/system/restart` | 代码与数据库一致时受控重启 |
 | WebSocket | `ws://host/ws` | 实时推送（subscribe channel） |
 | Auth | `POST /api/auth/login` | Token 登录 |

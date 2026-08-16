@@ -13,6 +13,7 @@ import { getThemeOption } from '../../config/theme';
 import { getNavIcon } from '../../config/iconSets';
 import { PoolDrawer } from './PoolDrawer';
 import { UpdateButton } from '../System/UpdateButton';
+import { LocalDeployButton } from '../System/LocalDeployButton';
 import { PrefsMenu } from './PrefsMenu';
 
 interface AppShellProps {
@@ -91,15 +92,19 @@ export function AppShell({ currentPage, currentTaskId, onNavigate, wide, childre
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [hasWorker, setHasWorker] = useState(isAdmin);
   const [remoteUpdatesEnabled, setRemoteUpdatesEnabled] = useState(false);
+  const [systemConfigLoaded, setSystemConfigLoaded] = useState(false);
 
   useEffect(() => {
     let active = true;
     if (!isAdmin) return () => { active = false; };
     api.config().then((config) => {
-      if (active) setRemoteUpdatesEnabled(config.remote_updates_enabled === true);
+      if (active) {
+        setRemoteUpdatesEnabled(config.remote_updates_enabled === true);
+        setSystemConfigLoaded(true);
+      }
     }).catch(() => {
-      // Fail closed. Mounting UpdateButton starts automatic remote checks, so
-      // an unavailable or legacy capability response must keep it hidden.
+      // A missing capability response cannot safely enable either a remote
+      // update fetch or a host-level local deployment control.
     });
     return () => { active = false; };
   }, [isAdmin]);
@@ -306,7 +311,9 @@ export function AppShell({ currentPage, currentTaskId, onNavigate, wide, childre
               {ccUser.name && (
                 <span className="text-xs text-gray-400 mr-1 hidden sm:inline">{ccUser.name}</span>
               )}
-              {isAdmin && remoteUpdatesEnabled && <UpdateButton />}
+              {isAdmin && systemConfigLoaded && (
+                remoteUpdatesEnabled ? <UpdateButton /> : <LocalDeployButton />
+              )}
               {isAdmin && <PoolDrawer currentTaskId={currentTaskId} />}
               <PrefsMenu isAdmin={isAdmin} />
             </div>

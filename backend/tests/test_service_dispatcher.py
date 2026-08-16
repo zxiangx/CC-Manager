@@ -8698,7 +8698,7 @@ async def test_mode_capacity_rotates_native_account_after_three_retries(
         "deferred": False,
     })
     monkeypatch.setattr(
-        "backend.config.settings.codex_capacity_retry_delay", 180.0,
+        "backend.config.settings.codex_capacity_retry_delay", 30.0,
     )
     monkeypatch.setattr(
         "backend.config.settings.codex_capacity_switch_attempts", 3,
@@ -8720,9 +8720,9 @@ async def test_mode_capacity_rotates_native_account_after_three_retries(
         defer_active=False,
     )
     assert [call.args for call in sleep.await_args_list] == [
-        (180.0,),
-        (180.0,),
-        (180.0,),
+        (30.0,),
+        (30.0,),
+        (30.0,),
         (0.0,),
     ]
     assert dispatcher._relaunch_and_wait.await_args_list[-1].args[5] == (

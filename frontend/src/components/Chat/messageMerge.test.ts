@@ -106,6 +106,88 @@ describe('mergeChatHistory ephemeral events', () => {
 });
 
 describe('mergeChatHistory persisted identity', () => {
+  it('reconciles an optimistic attachment message when server metadata differs', () => {
+    const optimistic = message({
+      id: 1000,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'inspect this file',
+      raw_content: 'inspect this file',
+      attachments: [{
+        url: 'https://ccm.example/api/uploads/report.txt?upload=temporary',
+        name: 'report.txt',
+        is_image: false,
+      }],
+    });
+    const persisted = message({
+      id: 42,
+      role: 'user',
+      event_type: 'user_message',
+      content: '[Admin] inspect this file',
+      raw_content: 'inspect this file',
+      attachments: [{
+        url: '/api/uploads/report.txt',
+        name: 'report.txt',
+        is_image: false,
+      }],
+      persisted: true,
+    });
+
+    const merged = mergeChatHistory([persisted], [optimistic]);
+
+    expect(merged).toEqual([persisted]);
+  });
+
+  it('reconciles repeated optimistic user messages one-by-one', () => {
+    const first = message({
+      id: 1000,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'same request',
+      raw_content: 'same request',
+    });
+    const second = message({
+      ...first,
+      id: 1001,
+    });
+    const persisted = message({
+      id: 42,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'same request',
+      raw_content: 'same request',
+      persisted: true,
+    });
+
+    const merged = mergeChatHistory([persisted], [first, second]);
+
+    expect(merged).toHaveLength(2);
+    expect(merged.filter((entry) => entry.persisted)).toEqual([persisted]);
+    expect(merged.filter((entry) => !entry.persisted)).toHaveLength(1);
+  });
+
+  it('does not consume a later identical live message for an already-present row', () => {
+    const persisted = message({
+      id: 42,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'same request',
+      raw_content: 'same request',
+      persisted: true,
+    });
+    const later = message({
+      id: 1001,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'same request',
+      raw_content: 'same request',
+    });
+
+    const merged = mergeChatHistory([persisted], [persisted, later]);
+
+    expect(merged).toEqual([persisted, later]);
+  });
+
   it('keeps a persisted injected message outside the latest page in id order', () => {
     const injected = message({
       id: 10,

@@ -276,6 +276,14 @@ def _active_turn_id_from_error(error: BaseException | str) -> str | None:
     return actual if actual and actual != expected else None
 
 
+def _interrupt_error_proves_no_active_turn(
+    error: BaseException | str,
+) -> bool:
+    """Recognize app-server's explicit rejection after a turn already ended."""
+
+    return "no active turn to interrupt" in str(error).lower()
+
+
 def normalize_codex_home(codex_home: str | os.PathLike[str] | None = None) -> str:
     """Return the canonical, absolute CODEX_HOME used as the process key."""
 
@@ -2348,6 +2356,55 @@ class CodexAppServer:
                     )
                     break
                 except CodexAppServerError as exc:
+                    if _interrupt_error_proves_no_active_turn(exc):
+                        (
+                            _,
+                            status_type,
+                            active_turn_ids,
+                        ) = await self._read_descendant_status(
+                            context.thread_id,
+                        )
+                        if not self._interrupt_context_is_current(context):
+                            return
+                        self._apply_descendant_read_state(
+                            context.thread_id,
+                            status_type,
+                            active_turn_ids,
+                        )
+                        if status_type == "idle" and not active_turn_ids:
+                            pending = (
+                                context.pending_goal_terminal_notification
+                                or {}
+                            )
+                            pending_turn = pending.get("turn") or {}
+                            context.pending_goal_terminal_notification = None
+                            context.goal_terminal_generation += 1
+                            self._publish_turn_context_terminal(context, {
+                                "threadId": context.thread_id,
+                                "turn": {
+                                    "id": pending_turn.get("id") or turn_id,
+                                    "status": "interrupted",
+                                    "error": None,
+                                },
+                            })
+                            return
+                        if (
+                            not attempt
+                            and active_turn_ids
+                            and len(active_turn_ids) == 1
+                        ):
+                            actual_turn_id = next(iter(active_turn_ids))
+                            if not self._bind_turn_context(
+                                context,
+                                actual_turn_id,
+                                observed=True,
+                            ):
+                                raise CodexAppServerError(
+                                    "Could not bind authoritative Codex active "
+                                    f"turn {actual_turn_id}"
+                                ) from exc
+                            turn_id = actual_turn_id
+                            continue
                     actual_turn_id = _active_turn_id_from_error(exc)
                     if attempt or not actual_turn_id:
                         raise
@@ -3009,15 +3066,25 @@ class CodexAppServer:
             and not disable_autonomous_features
             and not tools_disabled
         ):
-            # Stop intentionally pauses a native Goal, while transient model
-            # failures can leave it blocked. Neither state is an explicit user
-            # cancellation: the next admitted message/retry must reactivate
-            # the same persisted objective instead of silently abandoning it.
+            # A normal user message is not an instruction to resume an
+            # autonomous Goal. In particular, turning ``blocked`` back into
+            # ``active`` here makes Codex immediately start fresh continuation
+            # turns and repeatedly announce the same unresolved blocker. Keep
+            # paused/blocked state persisted while admitting an independent
+            # ordinary turn on the same native thread. Goal reactivation must
+            # go through an explicit Goal action instead.
             resumable_goal = await self._read_thread_goal(str(thread_id))
-            resume_native_goal = bool(
+            if (
                 isinstance(resumable_goal, dict)
                 and resumable_goal.get("status") in {"paused", "blocked"}
-            )
+            ):
+                logger.info(
+                    "Keeping Codex Goal %s while admitting ordinary turn "
+                    "task=%s thread=%s",
+                    resumable_goal.get("status"),
+                    task_id,
+                    thread_id,
+                )
         if (
             resume_session_id
             and service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -4793,7 +4860,7 @@ class CodexAppServer:
                 and context.active_descendant_thread_ids
             ):
                 self._schedule_goal_descendant_gate(context)
-            if context is not None and not params.get("turnId"):
+            if context is not None:
                 self._finish_retained_goal_if_terminal(
                     context,
                     goal_status,

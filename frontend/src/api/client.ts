@@ -1799,6 +1799,11 @@ export const api = {
       '/api/system/update/repair',
       { method: 'POST', body: JSON.stringify({}) },
     ),
+  deployLocalVersion: () =>
+    request<{ update_id?: string; old_commit?: string; status?: string }>(
+      '/api/system/deploy',
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
   restartService: () =>
     request<{ status?: string }>('/api/system/restart', { method: 'POST' }),
   rollbackUpdate: (data: { confirm_database_restore?: boolean } = {}) =>

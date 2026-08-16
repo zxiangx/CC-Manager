@@ -2840,6 +2840,63 @@ async def test_signal_interrupt_reconciles_and_pauses_existing_goal_turn():
 
 
 @pytest.mark.asyncio
+async def test_interrupt_no_active_turn_reconciles_idle_as_stopped():
+    """An already-idle native turn is successful stop proof, not a retry loop."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-already-idle",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-already-ended"}}
+        if method == "turn/interrupt":
+            raise CodexAppServerRequestError(
+                "turn/interrupt failed: no active turn to interrupt"
+            )
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": "thread-already-idle",
+                    "status": {"type": "idle"},
+                    "turns": [{
+                        "id": "turn-already-ended",
+                        "status": "completed",
+                    }],
+                },
+            }
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="work that just finished",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=209,
+    )
+
+    process.send_signal(signal.SIGINT)
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 130
+    assert [call.args[0] for call in server._request.await_args_list][-2:] == [
+        "turn/interrupt",
+        "thread/read",
+    ]
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
 async def test_interrupt_continues_when_goals_feature_is_disabled():
     """A normal adopted turn remains stoppable when Goals is disabled."""
 
@@ -3159,6 +3216,66 @@ async def test_active_goal_rpc_failure_retries_without_false_success():
         rows.append(json.loads(line))
     terminal = next(row for row in rows if row.get("type") == "turn.completed")
     assert terminal["usage"]["input_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_terminal_goal_update_with_turn_id_closes_retained_idle_context():
+    """A terminal Goal event may retain turnId after that turn is already idle."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-goal-terminal-id",
+                "status": {"type": "idle"},
+            },
+        },
+        {"turn": {"id": "turn-goal-terminal-id"}},
+        {"goal": {"status": "active"}},
+    ])
+
+    process, _ = await server.start_turn(
+        prompt="finish the retained goal",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=308,
+    )
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-terminal-id",
+        "turnId": "turn-goal-terminal-id",
+        "goal": {"status": "active"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-goal-terminal-id",
+        "turn": {
+            "id": "turn-goal-terminal-id",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    for _ in range(20):
+        await asyncio.sleep(0)
+        context = server._contexts_by_thread.get("thread-goal-terminal-id")
+        if (
+            context is not None
+            and context.pending_goal_terminal_notification is not None
+        ):
+            break
+
+    assert process.returncode is None
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-terminal-id",
+        "turnId": "turn-goal-terminal-id",
+        "goal": {"status": "blocked"},
+    })
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    assert server._contexts_by_thread == {}
 
 
 @pytest.mark.asyncio
@@ -3675,17 +3792,16 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resumable_status", ["paused", "blocked"])
-async def test_standard_resume_reactivates_resumable_goal_before_steering(
+async def test_standard_resume_keeps_resumable_goal_inactive_for_normal_message(
     resumable_status,
 ):
-    """A message/retry resumes Goals that the user did not cancel."""
+    """Ordinary chat must not turn a paused/blocked Goal back on."""
 
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     prepared = False
     requests: list[tuple[str, dict]] = []
-    goal_checks = 0
 
     async def on_turn_prepared(_process, thread_id):
         nonlocal prepared
@@ -3693,7 +3809,6 @@ async def test_standard_resume_reactivates_resumable_goal_before_steering(
         prepared = True
 
     async def request(method, params):
-        nonlocal goal_checks
         requests.append((method, params))
         if method == "thread/resume":
             return {
@@ -3703,42 +3818,23 @@ async def test_standard_resume_reactivates_resumable_goal_before_steering(
                 },
             }
         if method == "thread/goal/get":
-            goal_checks += 1
             return {
                 "goal": {
-                    "status": resumable_status if goal_checks == 1 else "complete",
+                    "status": resumable_status,
                 },
             }
-        if method == "thread/goal/set":
+        if method == "turn/start":
             assert prepared is True
-            assert params == {
-                "threadId": "thread-paused-goal",
-                "status": "active",
-            }
-            asyncio.get_running_loop().call_soon(
-                server._handle_notification,
-                "turn/started",
-                {
-                    "threadId": "thread-paused-goal",
-                    "turn": {
-                        "id": "turn-resumed-goal",
-                        "status": "inProgress",
-                    },
-                },
-            )
-            return {"goal": {"status": "active"}}
-        if method == "turn/steer":
-            assert params == {
-                "threadId": "thread-paused-goal",
-                "expectedTurnId": "turn-resumed-goal",
-                "input": [{"type": "text", "text": "keep watching"}],
-            }
-            return {"turnId": "turn-resumed-goal"}
+            assert params["threadId"] == "thread-paused-goal"
+            assert params["input"] == [
+                {"type": "text", "text": "answer this ordinary question"},
+            ]
+            return {"turn": {"id": "turn-ordinary-message"}}
         raise AssertionError(f"unexpected request: {method}")
 
     server._request = AsyncMock(side_effect=request)
     process, thread_id = await server.start_turn(
-        prompt="keep watching",
+        prompt="answer this ordinary question",
         cwd="/tmp",
         model="gpt-5.6-sol",
         effort="high",
@@ -3752,18 +3848,17 @@ async def test_standard_resume_reactivates_resumable_goal_before_steering(
     assert [method for method, _ in requests] == [
         "thread/resume",
         "thread/goal/get",
-        "thread/goal/set",
-        "turn/steer",
+        "turn/start",
     ]
-    assert process.admitted_turn_id == "turn-resumed-goal"
+    assert process.admitted_turn_id == "turn-ordinary-message"
     context = server._contexts_by_thread[thread_id]
-    assert context.following_native_goal is True
-    assert context.turn_id == "turn-resumed-goal"
+    assert context.following_native_goal is False
+    assert context.turn_id == "turn-ordinary-message"
 
     server._handle_notification("turn/completed", {
         "threadId": thread_id,
         "turn": {
-            "id": "turn-resumed-goal",
+            "id": "turn-ordinary-message",
             "status": "completed",
             "error": None,
         },

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
-import type { Task, Project, ChatMessage, UploadResult } from '../../api/client';
+import type { Task, Project, ChatMessage } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
@@ -135,16 +135,6 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     started_at: null,
     completed_at: null,
     ...overrides,
-  };
-}
-
-function makeUpload(id: string, filename = `${id}.txt`): UploadResult {
-  return {
-    id,
-    filename,
-    path: `/srv/uploads/${filename}`,
-    url: `/api/uploads/${filename}`,
-    is_image: false,
   };
 }
 
@@ -688,7 +678,49 @@ describe('ChatView', () => {
       },
     );
 
-    it('shows pre-launch queue state instead of fake Codex thinking', async () => {
+    it('sends immediately when Codex reports no active root or descendants', async () => {
+      vi.mocked(api.getInjectCapabilities).mockResolvedValue({
+        attachment_protocol: 1,
+        codex_native_inputs: true,
+        adapter_active: true,
+        root_turn_active: false,
+        descendants_active: false,
+        descendant_count: 0,
+        parent_followup_supported: false,
+        launch_queued: false,
+      });
+      const task = makeTask({
+        id: 303,
+        provider: 'codex',
+        status: 'executing',
+        session_id: 'thread-prelaunch',
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(
+        await screen.findByText('Codex 当前没有运行中的 turn；可以直接发送新消息'),
+      ).toBeInTheDocument();
+      await userEvent.type(screen.getByRole('textbox'), 'start now');
+      fireEvent.keyDown(screen.getByRole('textbox'), {
+        key: 'Enter',
+        code: 'Enter',
+      });
+
+      await waitFor(() => {
+        expect(api.sendTaskChat).toHaveBeenCalledWith(
+          303,
+          'start now',
+          undefined,
+          undefined,
+          null,
+          expect.objectContaining({ provider: 'codex' }),
+        );
+      });
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(screen.queryByText(/Queued messages/)).not.toBeInTheDocument();
+    });
+
+    it('rejects a second message while the previous launch is pending', async () => {
       vi.mocked(api.getInjectCapabilities).mockResolvedValue({
         attachment_protocol: 1,
         codex_native_inputs: true,
@@ -700,23 +732,23 @@ describe('ChatView', () => {
         launch_queued: true,
       });
       const task = makeTask({
-        id: 303,
+        id: 305,
         provider: 'codex',
-        status: 'completed',
-        session_id: 'thread-prelaunch',
+        status: 'executing',
+        session_id: 'thread-launch-pending',
       });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
 
-      await userEvent.type(screen.getByRole('textbox'), 'queued request');
-      fireEvent.keyDown(screen.getByRole('textbox'), {
-        key: 'Enter',
-        code: 'Enter',
-      });
-
       expect(
-        await screen.findByText('消息已排队，Codex turn 尚未开始执行'),
+        await screen.findByText('Codex 请求正在启动（尚未进入模型）...'),
       ).toBeInTheDocument();
-      expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+      await userEvent.type(screen.getByRole('textbox'), 'do not queue this');
+      await userEvent.click(screen.getByTitle('核对状态并发送 (Enter)'));
+
+      expect(await screen.findByText(/当前消息未保存也未排队/)).toBeInTheDocument();
+      expect(screen.getByRole('textbox')).toHaveValue('do not queue this');
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
     });
 
     it('persists a message server-side and supersedes a capacity backoff', async () => {
@@ -920,7 +952,7 @@ describe('ChatView', () => {
       }
     });
 
-    it('treats an ownerless background tail as processing and keeps Interrupt usable', async () => {
+    it('keeps an ownerless background tail stoppable without queueing input', async () => {
       const task = makeTask({
         id: 34,
         status: 'completed',
@@ -930,9 +962,12 @@ describe('ChatView', () => {
         <ChatView task={task} projects={projects} onBack={onBack} />,
       );
 
-      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
-      fireEvent.change(textarea, { target: { value: 'wait behind background work' } });
-      expect(screen.getByTitle(/Add to queue/)).toBeInTheDocument();
+      const textarea = screen.getByPlaceholderText(/CCM 会先核对运行状态/i);
+      fireEvent.change(textarea, { target: { value: 'do not queue this' } });
+      await userEvent.click(screen.getByTitle(/核对状态并发送/));
+      expect(await screen.findByText(/当前运行状态不支持安全发送/)).toBeInTheDocument();
+      expect(textarea).toHaveValue('do not queue this');
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
 
       const interrupt = screen.getByTitle('Interrupt session');
       expect(interrupt).toBeEnabled();
@@ -952,7 +987,7 @@ describe('ChatView', () => {
       expect(screen.getByTitle(/Send \(Enter\)/)).toBeInTheDocument();
     });
 
-    it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
+    it('does not auto-send a draft when a running process exits', async () => {
       const task = makeTask({
         id: 35,
         status: 'executing',
@@ -971,10 +1006,8 @@ describe('ChatView', () => {
       });
       expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
 
-      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
-      fireEvent.change(textarea, { target: { value: 'queued follow-up' } });
-      await userEvent.click(screen.getByTitle(/Add to queue/));
-      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      const textarea = screen.getByRole('textbox');
+      fireEvent.change(textarea, { target: { value: 'keep this draft' } });
 
       act(() => {
         capturedOnMessage?.({
@@ -989,7 +1022,6 @@ describe('ChatView', () => {
       });
       expect(screen.getByText('后台运行中')).toBeInTheDocument();
       expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
-      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
       expect(api.sendTaskChat).not.toHaveBeenCalled();
 
       act(() => {
@@ -1002,7 +1034,6 @@ describe('ChatView', () => {
         await new Promise((resolve) => setTimeout(resolve, 650));
       });
       expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
-      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
       expect(api.sendTaskChat).not.toHaveBeenCalled();
 
       act(() => {
@@ -1016,224 +1047,27 @@ describe('ChatView', () => {
         });
       });
 
-      await waitFor(
-        () => expect(api.sendTaskChat).toHaveBeenCalled(),
-        { timeout: 2000 },
-      );
-      expect(
-        (api.sendTaskChat as ReturnType<typeof vi.fn>).mock.calls[0][1],
-      ).toBe('queued follow-up');
-      await waitFor(() => {
-        expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
-      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(textarea).toHaveValue('keep this draft');
     });
   });
 
-  describe('queued message attachment editing', () => {
-    beforeEach(() => {
-      localStorage.clear();
-      vi.mocked(api.sendTaskChat).mockResolvedValue({});
-    });
-
-    it('moves merged queue attachments into the composer and sends their existing path', async () => {
-      const task = makeTask({ id: 410, status: 'executing' });
-      const attachment = makeUpload('merge-report', 'report.md');
+  describe('removed browser message queue', () => {
+    it('deletes stale queue storage without restoring or sending it', async () => {
+      const task = makeTask({ id: 410, status: 'completed' });
       localStorage.setItem(
         `ccm-chat-queue-${task.id}`,
-        JSON.stringify([{ text: 'review the report', uploadResults: [attachment] }]),
-      );
-      const { rerender } = render(
-        <ChatView task={task} projects={projects} onBack={onBack} />,
+        JSON.stringify([{ text: 'obsolete queued request' }]),
       );
 
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-
-      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
-      expect(screen.getByRole('textbox')).toHaveValue('review the report');
-      expect(screen.getByText('report.md')).toBeInTheDocument();
-      await waitFor(() => {
-        expect(JSON.parse(
-          localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`) || '[]',
-        )).toEqual([attachment]);
-      });
-
-      rerender(
-        <ChatView
-          task={{ ...task, status: 'completed' }}
-          projects={projects}
-          onBack={onBack}
-        />,
-      );
-      await userEvent.click(await screen.findByTitle(/Send \(Enter\)/));
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
 
       await waitFor(() => {
-        expect(api.sendTaskChat).toHaveBeenCalledWith(
-          task.id,
-          'review the report',
-          [attachment.path],
-          undefined,
-          null,
-          {
-            provider: 'claude',
-            model: null,
-            codex_service_tier: 'default',
-          },
-        );
+        expect(localStorage.getItem(`ccm-chat-queue-${task.id}`)).toBeNull();
       });
-    });
-
-    it('persists merged attachments with the text draft across a remount', async () => {
-      const task = makeTask({ id: 411, status: 'executing' });
-      const attachment = makeUpload('draft-notes', 'notes.txt');
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([{ text: 'continue later', uploadResults: [attachment] }]),
-      );
-      const first = render(
-        <ChatView task={task} projects={projects} onBack={onBack} />,
-      );
-
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-      await waitFor(() => {
-        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
-      });
-      first.unmount();
-
-      render(<ChatView task={task} projects={projects} onBack={onBack} />);
-
-      expect(screen.getByRole('textbox')).toHaveValue('continue later');
-      expect(screen.getByText('notes.txt')).toBeInTheDocument();
-      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
-    });
-
-    it('restores attachments when editing one queued message', async () => {
-      const task = makeTask({ id: 412, status: 'executing' });
-      const attachment = makeUpload('edit-evidence', 'evidence.txt');
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([{ text: 'edit this', uploadResults: [attachment] }]),
-      );
-      render(<ChatView task={task} projects={projects} onBack={onBack} />);
-
-      await userEvent.click(screen.getByTitle('Edit in input'));
-
-      expect(screen.getByRole('textbox')).toHaveValue('edit this');
-      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
-      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
-    });
-
-    it('keeps merged attachments when the edited message is queued again', async () => {
-      const task = makeTask({ id: 417, status: 'executing' });
-      const attachment = makeUpload('requeue-upload', 'requeue.txt');
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([{ text: 'before edit', uploadResults: [attachment] }]),
-      );
-      render(<ChatView task={task} projects={projects} onBack={onBack} />);
-
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-      const textbox = screen.getByRole('textbox');
-      await userEvent.clear(textbox);
-      await userEvent.type(textbox, 'after edit');
-      await userEvent.click(screen.getByTitle(/Add to queue/));
-
-      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
-      expect(screen.getByText('after edit')).toBeInTheDocument();
-      await waitFor(() => {
-        expect(JSON.parse(
-          localStorage.getItem(`ccm-chat-queue-${task.id}`) || '[]',
-        )).toEqual([{
-          text: 'after edit',
-          uploadResults: [attachment],
-        }]);
-      });
-    });
-
-    it('deduplicates attachments while preserving queued message order', async () => {
-      const task = makeTask({ id: 413, status: 'executing' });
-      const repeated = makeUpload('same-upload', 'same.txt');
-      const other = makeUpload('other-upload', 'other.txt');
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([
-          { text: 'first', uploadResults: [repeated] },
-          { text: 'second', uploadResults: [repeated, other] },
-        ]),
-      );
-      render(<ChatView task={task} projects={projects} onBack={onBack} />);
-
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-
-      expect(screen.getByRole('textbox')).toHaveValue('first\n\nsecond');
-      expect(screen.getAllByText('same.txt')).toHaveLength(1);
-      expect(screen.getAllByText('other.txt')).toHaveLength(1);
-    });
-
-    it('rejects an over-limit merge atomically and keeps the queue intact', async () => {
-      const task = makeTask({ id: 414, status: 'executing' });
-      const attachments = Array.from(
-        { length: 11 },
-        (_, index) => makeUpload(`limit-${index}`, `limit-${index}.txt`),
-      );
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([
-          { text: 'first batch', uploadResults: attachments.slice(0, 6) },
-          { text: 'second batch', uploadResults: attachments.slice(6) },
-        ]),
-      );
-      render(<ChatView task={task} projects={projects} onBack={onBack} />);
-
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-
-      expect(screen.getByText(/合并后将有 11 个附件/)).toBeInTheDocument();
-      expect(screen.getByText('Queued messages (2)')).toBeInTheDocument();
       expect(screen.getByRole('textbox')).toHaveValue('');
-      expect(screen.queryByText('limit-0.txt')).not.toBeInTheDocument();
-    });
-
-    it('restores a merged attachment when sending fails', async () => {
-      const task = makeTask({ id: 415, status: 'executing' });
-      const attachment = makeUpload('retry-upload', 'retry.txt');
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([{ text: 'retry this', uploadResults: [attachment] }]),
-      );
-      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(new Error('send failed'));
-      const { rerender } = render(
-        <ChatView task={task} projects={projects} onBack={onBack} />,
-      );
-
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-      rerender(
-        <ChatView
-          task={{ ...task, status: 'completed' }}
-          projects={projects}
-          onBack={onBack}
-        />,
-      );
-      await userEvent.click(await screen.findByTitle(/Send \(Enter\)/));
-
-      expect(await screen.findByText(/send failed/)).toBeInTheDocument();
-      expect(screen.getByRole('textbox')).toHaveValue('retry this');
-      expect(screen.getByText('retry.txt')).toBeInTheDocument();
-      await waitFor(() => {
-        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
-      });
-    });
-
-    it('keeps the existing text-only merge behavior', async () => {
-      const task = makeTask({ id: 416, status: 'executing' });
-      localStorage.setItem(
-        `ccm-chat-queue-${task.id}`,
-        JSON.stringify([{ text: 'plain follow-up' }]),
-      );
-      render(<ChatView task={task} projects={projects} onBack={onBack} />);
-
-      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
-
-      expect(screen.getByRole('textbox')).toHaveValue('plain follow-up');
-      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      expect(screen.queryByText(/Queued messages/)).not.toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
     });
   });
 
@@ -1598,7 +1432,7 @@ describe('ChatView', () => {
       expect(screen.getByText('broken.txt')).toBeInTheDocument();
     });
 
-    it('keeps queue routing for worker tasks without live injection', async () => {
+    it('refuses worker-task input explicitly instead of queueing it', async () => {
       const task = makeTask({
         provider: 'codex',
         status: 'executing',
@@ -1608,7 +1442,11 @@ describe('ChatView', () => {
       render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
 
       await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
-      expect(screen.getByTitle('Add to queue (Enter)')).toBeInTheDocument();
+      await userEvent.type(screen.getByRole('textbox'), 'keep this locally');
+      await userEvent.click(screen.getByTitle('核对状态并发送 (Enter)'));
+      expect(await screen.findByText(/当前运行状态不支持安全发送/)).toBeInTheDocument();
+      expect(screen.getByRole('textbox')).toHaveValue('keep this locally');
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
       expect(screen.queryByText(/直接补充当前 turn/)).not.toBeInTheDocument();
     });
   });

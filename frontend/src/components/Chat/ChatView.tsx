@@ -4,7 +4,7 @@ import { api, isApiRequestError } from '../../api/client';
 import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, InjectTaskCapabilities, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, UserMessageIndexEntry, MessageBranchState } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Pin, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Pin, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -18,7 +18,6 @@ import {
   dedupeUploadResults,
   isUploadResult,
   MAX_FILES,
-  sameUploadResult,
   useFileUpload,
 } from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
@@ -44,11 +43,6 @@ interface ChatViewProps {
 interface ChatRuntimeViewProps extends ChatViewProps {
   canonicalTask: Task;
   onInternalBranchSelected: (task: Task) => Promise<void>;
-}
-
-interface QueuedMessage {
-  text: string;
-  uploadResults?: UploadResult[];
 }
 
 interface UserMessageNavigationItem {
@@ -402,8 +396,7 @@ function ChatRuntimeView({
   const [localStatus, setLocalStatus] = useState<string | null>(null);
   const [localBackgroundActive, setLocalBackgroundActive] = useState<boolean | null>(null);
   // 最近一次 WS status_change 时刻：在途旧轮询快照返回（prop 回退旧值）时
-  // 不能击穿刚到的 WS 状态——否则终态 effect 会误触发 autoDequeue，把排队
-  // 消息在 turn 进行中提前发出。超过一个轮询周期没有 WS 事件才允许清除。
+  // 不能击穿刚到的 WS 状态。超过一个轮询周期没有 WS 事件才允许清除。
   const lastWsStatusAt = useRef(0);
   // Background markers need the same stale-poll protection in both directions:
   // an older request can return `true` just after the authoritative WS `false`.
@@ -656,11 +649,17 @@ function ChatRuntimeView({
   const codexCapacityRetryWaiting = task.provider === 'codex'
     && !codexRootTurnActive
     && codexExecutionState?.capacity_retry_waiting === true;
-  const codexLaunchQueued = task.provider === 'codex'
+  const codexLaunchPending = task.provider === 'codex'
     && !codexRootTurnActive
     && !codexDescendantsOnly
     && !codexCapacityRetryWaiting
     && codexExecutionState?.launch_queued === true;
+  const codexStateKnownIdle = task.provider === 'codex'
+    && codexExecutionState !== null
+    && !codexRootTurnActive
+    && !codexDescendantsOnly
+    && !codexCapacityRetryWaiting
+    && !codexLaunchPending;
   const liveMessageAvailable = canInject && (
     task.provider !== 'codex'
     || codexRootTurnActive
@@ -900,137 +899,16 @@ function ChatRuntimeView({
     };
   }, [messages, task.description]);
 
-  // Message queue: pre-queue messages to auto-send after current turn completes
-  const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>(() => {
-    try {
-      const saved = localStorage.getItem(`ccm-chat-queue-${task.id}`);
-      if (!saved) return [];
-      const parsed = JSON.parse(saved);
-      // Migrate legacy string[] format
-      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
-        return (parsed as string[]).map(text => ({ text }));
-      }
-      if (!Array.isArray(parsed)) return [];
-      return parsed.flatMap((item): QueuedMessage[] => {
-        if (!item || typeof item !== 'object') return [];
-        const candidate = item as Partial<QueuedMessage>;
-        if (typeof candidate.text !== 'string') return [];
-        const uploadResults = Array.isArray(candidate.uploadResults)
-          ? dedupeUploadResults(candidate.uploadResults.filter(isUploadResult))
-          : undefined;
-        return [{
-          text: candidate.text,
-          uploadResults: uploadResults?.length ? uploadResults : undefined,
-        }];
-      });
-    } catch { return []; }
-  });
-  const messageQueueRef = useRef(messageQueue);
+  // The old browser-side pending-message queue has been removed. Clear stale
+  // queue payloads left by older CCM builds so they cannot reappear later.
   useEffect(() => {
-    messageQueueRef.current = messageQueue;
-    localStorage.setItem(`ccm-chat-queue-${task.id}`, JSON.stringify(messageQueue));
-  }, [messageQueue, task.id]);
+    try {
+      localStorage.removeItem(`ccm-chat-queue-${task.id}`);
+    } catch { /* storage may be unavailable */ }
+  }, [task.id]);
 
-  const addToQueue = useCallback((text: string, uploadResults?: UploadResult[]) => {
-    setMessageQueue(prev => [...prev, { text, uploadResults }]);
-  }, []);
-
-  const removeFromQueue = useCallback((index: number) => {
-    setMessageQueue(prev => prev.filter((_, i) => i !== index));
-  }, []);
-
-  const restoreQueuedUploads = useCallback((items: QueuedMessage[]): boolean => {
-    const queuedUploads = dedupeUploadResults(
-      items.flatMap((item) => item.uploadResults || []),
-    );
-    const existingUploaded = dedupeUploadResults([
-      ...forkSeedUploads,
-      ...fileUpload.uploadedResults,
-    ]);
-    const additions = queuedUploads.filter(
-      (upload) => !existingUploaded.some(
-        (existing) => sameUploadResult(existing, upload),
-      ),
-    );
-    const uploadsWithoutResults = (
-      fileUpload.uploads.length - fileUpload.uploadedResults.length
-    );
-    const projectedCount = (
-      existingUploaded.length + uploadsWithoutResults + additions.length
-    );
-    if (projectedCount > MAX_FILES) {
-      setError(
-        `合并后将有 ${projectedCount} 个附件，单条消息最多支持 ${MAX_FILES} 个；`
-        + '请先删除部分附件或队列消息。',
-      );
-      return false;
-    }
-    if (!fileUpload.addUploadedResults(additions)) {
-      setError(
-        `合并后附件超过 ${MAX_FILES} 个，队列已保持原样；请先删除部分附件。`,
-      );
-      return false;
-    }
-    return true;
-  }, [fileUpload, forkSeedUploads]);
-
-  const editQueueItem = useCallback((index: number) => {
-    const item = messageQueueRef.current[index];
-    if (!item) return;
-    if (!restoreQueuedUploads([item])) return;
-    setInput(prev => prev.trim() ? `${prev.trim()}\n\n${item.text}` : item.text);
-    setMessageQueue(prev => prev.filter((_, i) => i !== index));
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [restoreQueuedUploads]);
-
-  const mergeQueueToInput = useCallback(() => {
-    const queued = messageQueueRef.current;
-    if (queued.length === 0) return;
-    if (!restoreQueuedUploads(queued)) return;
-    setInput(prev => {
-      const current = prev.trim();
-      const merged = queued.map(q => q.text).join('\n\n');
-      return current ? `${current}\n\n${merged}` : merged;
-    });
-    setMessageQueue([]);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [restoreQueuedUploads]);
-
-  const moveQueueItem = useCallback((index: number, direction: 'up' | 'down') => {
-    setMessageQueue(prev => {
-      const next = [...prev];
-      const target = direction === 'up' ? index - 1 : index + 1;
-      if (target < 0 || target >= next.length) return prev;
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  }, []);
-
-  // Auto-dequeue: triggered by process_exit via flag increment
-  const [autoDequeueFlag, setAutoDequeueFlag] = useState(0);
-  const sendingRef = useRef(false);
-  sendingRef.current = sending;
   const backgroundActiveRef = useRef(false);
   backgroundActiveRef.current = backgroundActive;
-  const handleSendRef = useRef<(text: string, uploadResults?: UploadResult[]) => void>(() => {});
-
-  useEffect(() => {
-    if (autoDequeueFlag === 0) return;
-    // Delay to let React flush setSending(false) from status_change/process_exit
-    // before we check sendingRef. Without this, PTY mode (no process_exit)
-    // triggers autoDequeue in the same cycle as setSending(false) and the
-    // ref still reads true → skips the queued message.
-    const timer = setTimeout(() => {
-      if (sendingRef.current || backgroundActiveRef.current) return;
-      const queue = messageQueueRef.current;
-      if (queue.length > 0) {
-        const next = queue[0];
-        setMessageQueue(prev => prev.slice(1));
-        setTimeout(() => handleSendRef.current(next.text, next.uploadResults), 300);
-      }
-    }, 200);
-    return () => clearTimeout(timer);
-  }, [autoDequeueFlag]);
 
   useEffect(() => {
     const prev = document.title;
@@ -1313,7 +1191,6 @@ function ChatRuntimeView({
         }
         setSending(false);
         setLocalStatus(null);  // Reset — status_change WS may have been missed
-        setAutoDequeueFlag(f => f + 1);
         // Replace live-only bubbles with their persisted LogEntry ids so every
         // completed Codex turn immediately becomes a valid fork anchor.
         refreshHistoryRef.current();
@@ -1713,7 +1590,6 @@ function ChatRuntimeView({
 
   // Reset sending state when task reaches a terminal status
   // (catches cases where process_exit WebSocket event is missed — e.g. WS disconnect)
-  // Also trigger auto-dequeue so pending box messages get sent.
   useEffect(() => {
     if (
       !backgroundActive
@@ -1721,7 +1597,6 @@ function ChatRuntimeView({
     ) {
       clearLiveStreamCache(task.id);
       setSending(false);
-      setAutoDequeueFlag(f => f + 1);
     }
   }, [backgroundActive, effectiveStatus, task.id]);
 
@@ -2034,33 +1909,31 @@ function ChatRuntimeView({
     }
   };
 
-  const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
+  const handleSend = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim();
     const fileUploadResultsForTurn = dedupeUploadResults(
       fileUpload.uploadedResults,
     );
-    const uploadedResultsForTurn = fromQueue
-      ? dedupeUploadResults(preUploadedResults || [])
-      : dedupeUploadResults([
-        ...forkSeedUploads,
-        ...fileUploadResultsForTurn,
-      ]);
+    const uploadedResultsForTurn = dedupeUploadResults([
+      ...forkSeedUploads,
+      ...fileUploadResultsForTurn,
+    ]);
     const sendableAttachmentCount = uploadedResultsForTurn.length;
     if (!text && sendableAttachmentCount === 0) return;
 
-    if (!fromQueue && fileUpload.isUploading) {
+    if (fileUpload.isUploading) {
       setError('附件仍在上传，请等待上传完成后再发送。');
       return;
     }
-    if (!fromQueue && fileUpload.hasFailed) {
+    if (fileUpload.hasFailed) {
       setError('Retry or remove failed attachments before sending.');
       return;
     }
-    // One composer, automatic routing: a supported live turn is steered
-    // immediately; an idle Task starts a normal follow-up turn. Unsupported
-    // remote/shared transports keep the existing explicit queue behavior.
+    // One composer, automatic routing: a supported live turn is steered;
+    // an authoritatively idle Codex thread starts a normal follow-up. CCM no
+    // longer stores a second browser-side message to run later.
     let supersedeCapacityRetry = false;
-    if (isProcessing && canInject && !fromQueue) {
+    if (isProcessing && canInject) {
       if (task.provider === 'codex') {
         try {
           const capabilities = await api.getInjectCapabilities(task.id);
@@ -2077,6 +1950,20 @@ function ChatRuntimeView({
             return;
           }
           supersedeCapacityRetry = capabilities.capacity_retry_waiting === true;
+          if (
+            !supersedeCapacityRetry
+            && capabilities.launch_queued
+          ) {
+            setError('上一条请求仍在启动，当前消息未保存也未排队；请稍后重试。');
+            return;
+          }
+          if (
+            !supersedeCapacityRetry
+            && capabilities.descendants_active
+          ) {
+            setError('父 turn 当前不可启动；消息和附件已保留，请在状态明确后重试。');
+            return;
+          }
         } catch (e) {
           setError(
             `无法确认 Codex 父 turn 状态，消息和附件已保留：${
@@ -2094,23 +1981,12 @@ function ChatRuntimeView({
       }
     }
 
-    // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
-    if (isProcessing && !fromQueue && !supersedeCapacityRetry) {
-      if (text || sendableAttachmentCount > 0) {
-        addToQueue(
-          text,
-          uploadedResultsForTurn.length > 0 ? uploadedResultsForTurn : undefined,
-        );
-        setInput('');
-        fileUpload.clear();
-        consumeForkSeedUploads();
-      }
+    if (isProcessing && !canInject && !supersedeCapacityRetry) {
+      setError('当前运行状态不支持安全发送；消息和附件已保留，请先停止当前 turn 或等待其结束。');
       return;
     }
 
-    if (!fromQueue) {
-      setInput('');
-    }
+    setInput('');
     setSending(true);
     setError(null);
 
@@ -2119,7 +1995,7 @@ function ChatRuntimeView({
       let uploadedPaths: string[] | undefined;
       const uploadedResults = uploadedResultsForTurn;
       if (uploadedResults.length > 0) uploadedPaths = uploadedResults.map((r) => r.path);
-      if (!fromQueue) fileUpload.clear();
+      fileUpload.clear();
 
       // Optimistic message — show immediately, always with user prefix.
       // 附件也要立刻带上：WS 回包按内容去重时若整条丢弃，图片就再也不显示了
@@ -2162,9 +2038,7 @@ function ChatRuntimeView({
           launch_queued: true,
         }));
       }
-      if (!fromQueue) {
-        consumeForkSeedUploads();
-      }
+      consumeForkSeedUploads();
       await refreshMessageBranches();
       setModelOverride(null);
     } catch (e) {
@@ -2192,18 +2066,12 @@ function ChatRuntimeView({
       );
       setStillRunning(isBusyConflict);
       setError(errMsg);
-      if (!fromQueue && text) setInput(text);
-      if (!fromQueue && fileUploadResultsForTurn.length > 0) {
+      if (text) setInput(text);
+      if (fileUploadResultsForTurn.length > 0) {
         fileUpload.addUploadedResults(fileUploadResultsForTurn);
-      }
-      if (fromQueue && (text || preUploadedResults?.length)) {
-        setMessageQueue(prev => [{ text, uploadResults: preUploadedResults }, ...prev]);
       }
     }
   };
-
-  // Keep ref updated for auto-dequeue effect
-  handleSendRef.current = (text: string, uploadResults?: UploadResult[]) => handleSend(text, true, uploadResults);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     const nativeEvent = e.nativeEvent as KeyboardEvent;
@@ -2302,13 +2170,13 @@ function ChatRuntimeView({
                     if (resp.stopped === false) {
                       const cleared = resp.cleared_messages ?? 0;
                       setError(
-                        `Interrupt: no running process found${cleared > 0 ? `, cleared ${cleared} queued message(s)` : ''}. ` +
+                        `Interrupt: no running process found${cleared > 0 ? `, cancelled ${cleared} pending launch(es)` : ''}. ` +
                         'If output keeps arriving, the session may still be finishing.'
                       );
                     } else {
                       setError(null);
                     }
-                  } catch (e) {
+                  } catch {
                     setSending(false);
                     setStillRunning(false);
                     setLocalStatus(null);
@@ -2818,12 +2686,6 @@ function ChatRuntimeView({
             </span>
           </div>
         )}
-        {isProcessing && codexLaunchQueued && (
-          <div className="flex gap-2 items-center text-amber-300/90 text-sm px-3">
-            <ListPlus size={14} />
-            <span>消息已排队，Codex turn 尚未开始执行</span>
-          </div>
-        )}
         {isProcessing && codexCapacityRetryWaiting && (
           <div className="flex gap-2 items-center text-amber-300/90 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
@@ -2833,12 +2695,20 @@ function ChatRuntimeView({
             </span>
           </div>
         )}
-        {isProcessing && !codexDescendantsOnly && !codexLaunchQueued && !codexCapacityRetryWaiting && (
+        {isProcessing && codexLaunchPending && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
+            <span>Codex 请求正在启动（尚未进入模型）...</span>
+          </div>
+        )}
+        {isProcessing && !codexDescendantsOnly && !codexCapacityRetryWaiting && !codexLaunchPending && (
+          <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
+            {!codexStateKnownIdle && <Loader2 size={14} className="animate-spin" />}
             <span>
-              {task.provider === 'codex' && !codexRootTurnActive
-                ? '正在核对 Codex 状态（尚未确认模型正在执行）...'
+              {codexStateKnownIdle
+                ? 'Codex 当前没有运行中的 turn；可以直接发送新消息'
+                : task.provider === 'codex' && !codexRootTurnActive
+                ? '正在读取 Codex 的实际运行状态...'
                 : `${providerLabel} is thinking...`}
             </span>
           </div>
@@ -2924,84 +2794,6 @@ function ChatRuntimeView({
       {dropError && (
         <div className="mx-4 mb-2 px-3 py-2 bg-yellow-500/10 border border-yellow-500/30 rounded text-sm text-yellow-400">
           {dropError}
-        </div>
-      )}
-
-      {/* Message Queue Display */}
-      {messageQueue.length > 0 && (
-        <div className="border-t border-gray-800 bg-gray-900/50 px-4 py-2">
-          <div className="max-w-3xl mx-auto">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="text-xs text-amber-400 font-medium flex items-center gap-1.5">
-                <ListPlus size={12} />
-                Queued messages ({messageQueue.length})
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={mergeQueueToInput}
-                  className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-amber-300 transition-colors"
-                  title="Merge queued messages into input"
-                >
-                  <Copy size={11} />
-                  Merge
-                </button>
-                <button
-                  onClick={() => setMessageQueue([])}
-                  className="text-xs text-gray-500 hover:text-red-400 transition-colors"
-                >
-                  Clear all
-                </button>
-              </div>
-            </div>
-            <div className="space-y-1 max-h-32 overflow-y-auto">
-              {messageQueue.map((item, idx) => (
-                <div key={idx} className="flex items-center gap-1.5 group/q">
-                  <span className="text-[10px] text-gray-600 w-4 text-right shrink-0">{idx + 1}</span>
-                  <div className="flex-1 min-w-0 bg-gray-800/60 rounded px-2.5 py-1 text-xs text-gray-300 truncate flex items-center gap-1.5">
-                    {item.uploadResults && item.uploadResults.length > 0 && (
-                      <span className="inline-flex items-center gap-0.5 text-amber-400 shrink-0" title={item.uploadResults.map(r => r.filename).join(', ')}>
-                        <Paperclip size={10} />
-                        <span className="text-[10px]">{item.uploadResults.length}</span>
-                      </span>
-                    )}
-                    <span className="truncate">{item.text}</span>
-                  </div>
-                  <div className="flex items-center gap-0.5 opacity-0 group-hover/q:opacity-100 transition-opacity shrink-0">
-                    <button
-                      onClick={() => editQueueItem(idx)}
-                      className="p-0.5 text-gray-500 hover:text-amber-300"
-                      title="Edit in input"
-                    >
-                      <Pencil size={12} />
-                    </button>
-                    <button
-                      onClick={() => moveQueueItem(idx, 'up')}
-                      disabled={idx === 0}
-                      className="p-0.5 text-gray-500 hover:text-gray-300 disabled:opacity-30"
-                      title="Move up"
-                    >
-                      <ChevronDown size={12} className="rotate-180" />
-                    </button>
-                    <button
-                      onClick={() => moveQueueItem(idx, 'down')}
-                      disabled={idx === messageQueue.length - 1}
-                      className="p-0.5 text-gray-500 hover:text-gray-300 disabled:opacity-30"
-                      title="Move down"
-                    >
-                      <ChevronDown size={12} />
-                    </button>
-                    <button
-                      onClick={() => removeFromQueue(idx)}
-                      className="p-0.5 text-gray-500 hover:text-red-400"
-                      title="Remove"
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
       )}
 
@@ -3224,7 +3016,7 @@ function ChatRuntimeView({
                     : isProcessing && liveMessageAvailable
                       ? '直接给正在运行的 Agent 补充消息...'
                     : isProcessing
-                      ? 'Type next message to queue...'
+                      ? '输入消息；CCM 会先核对运行状态...'
                       : 'Type a follow-up message...'
               }
               disabled={injecting || (!task.session_id && !task.shared_from_id)}
@@ -3243,12 +3035,12 @@ function ChatRuntimeView({
                 ? '启动父 Agent 新 turn (Enter)'
                 : isProcessing && liveMessageAvailable
                 ? '发送到运行中的 turn (Enter)'
-                : isProcessing ? 'Add to queue (Enter)' : 'Send (Enter)'}
+                : isProcessing ? '核对状态并发送 (Enter)' : 'Send (Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 isProcessing && codexCapacityRetryWaiting ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
                 : isProcessing && codexParentFollowupAvailable ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
                 : isProcessing && liveMessageAvailable ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
-                : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
+                : isProcessing ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
               {isProcessing && codexCapacityRetryWaiting
@@ -3257,7 +3049,7 @@ function ChatRuntimeView({
                 ? <Send size={18} />
                 : isProcessing && liveMessageAvailable
                   ? <Syringe size={18} />
-                  : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+                  : <Send size={18} />}
             </button>
           </div>
           </div>
@@ -3478,7 +3270,8 @@ function fallbackCopy(text: string): Promise<void> {
     ta.focus();
     ta.select();
     try {
-      document.execCommand('copy') ? resolve() : reject();
+      if (document.execCommand('copy')) resolve();
+      else reject();
     } catch {
       reject();
     } finally {
@@ -3743,7 +3536,8 @@ function AskUserCard({
     setSelected((prev) => {
       const cur = new Set(prev[qi] || []);
       if (multi) {
-        cur.has(label) ? cur.delete(label) : cur.add(label);
+        if (cur.has(label)) cur.delete(label);
+        else cur.add(label);
       } else {
         cur.clear();
         cur.add(label);

@@ -130,6 +130,7 @@ async def test_remote_update_mutations_are_disabled_but_restart_remains_availabl
 ):
     service = MagicMock()
     service.restart = AsyncMock(return_value={"status": "started"})
+    service.start_repair = AsyncMock(return_value={"status": "started"})
     monkeypatch.setattr("backend.main.update_service", service)
     monkeypatch.setattr(
         "backend.api.system.settings.remote_updates_enabled", False,
@@ -143,6 +144,7 @@ async def test_remote_update_mutations_are_disabled_but_restart_remains_availabl
     rollback_response = await client.post(
         "/api/system/update/rollback", json={},
     )
+    deploy_response = await client.post("/api/system/deploy", json={})
     restart_response = await client.post("/api/system/restart")
 
     for response in (
@@ -156,7 +158,28 @@ async def test_remote_update_mutations_are_disabled_but_restart_remains_availabl
             "Remote CCM updates are disabled on this deployment"
         )
     assert restart_response.status_code == 200
+    assert deploy_response.status_code == 200
+    service.start_repair.assert_awaited_once_with(skip_frontend_build=False)
     service.restart.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_local_deploy_returns_conflict_when_repair_is_blocked(
+    client, monkeypatch,
+):
+    service = MagicMock()
+    service.start_repair = AsyncMock(return_value={
+        "error": "当前有 2 个任务正在运行，请等待任务完成后再修复",
+        "update_blocked": True,
+        "active_task_count": 2,
+    })
+    monkeypatch.setattr("backend.main.update_service", service)
+
+    response = await client.post("/api/system/deploy", json={})
+
+    assert response.status_code == 409
+    assert "当前有 2 个任务正在运行" in response.json()["detail"]
+    service.start_repair.assert_awaited_once_with(skip_frontend_build=False)
 
 
 @pytest.mark.asyncio

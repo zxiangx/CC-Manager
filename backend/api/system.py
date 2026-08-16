@@ -203,6 +203,24 @@ async def restart_service():
     return result
 
 
+@router.post("/deploy", dependencies=[Depends(require_admin)])
+async def deploy_local_version():
+    """Deploy the exact CCM commit already present on this server.
+
+    This deliberately bypasses the *remote update* feature flag because it
+    never fetches or checks out remote code. ``start_repair`` remains the
+    single safety-controlled implementation for dependency sync, frontend
+    build, database snapshot/migration, and service restart.
+    """
+
+    result = await _get_update_service().start_repair(
+        skip_frontend_build=False,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
 @router.post("/update/repair", dependencies=[Depends(require_admin)])
 async def repair_update(req: UpdateRequest | None = None):
     _require_remote_updates_enabled()

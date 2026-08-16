@@ -589,7 +589,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_codex_app_server.py::test_existing_goal_turn_notification_rebinds_submission_id` | adopted goal 同时保留 active/submission 两个通知 ID，任一 ID 的 assistant/terminal 事件都不能丢 |
 | `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
 | `test_codex_app_server.py::test_standard_resume_reactivates_paused_goal_before_steering` | Standard follow-up 先注册 CCM owner，再恢复 `paused` 原生 Goal，等待精确 `turn/started` 并把用户消息 steer 到该 turn |
-| `test_codex_app_server.py::test_standard_resume_does_not_bypass_non_paused_goal_status` | 只有 `paused` 可由下一条消息自动续跑；`blocked`、usage/budget limited、complete 与无 Goal 均保持普通 `turn/start` 语义 |
+| `test_codex_app_server.py::test_standard_resume_keeps_resumable_goal_inactive_for_normal_message` / `test_standard_resume_does_not_bypass_non_paused_goal_status` | `paused`、`blocked`、usage/budget limited、complete 与无 Goal 收到普通消息时均保持 Goal 状态并使用普通 `turn/start` 语义 |
 | `test_codex_app_server.py::test_todo_list_updates_are_forwarded_with_exact_turn_identity` | 当前 app-server `turn/plan/updated` 权威快照转换成结构化 `todo_list`，保留 exact turn identity |
 | `test_service_instance_manager.py::test_codex_todo_updates_replace_one_durable_snapshot` | 同一 turn 的计划更新删除旧 snapshot、以新 log id 持久化最新版本，数据库只留一条且不会掉出最新历史页 |
 | `test_chat_timestamp.py::test_chat_history_exposes_structured_codex_todo_snapshot` | HTTP 历史返回稳定 `todo_id`、explanation 和规范化的三态 items |
@@ -781,6 +781,8 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
 | `test_alembic_migrations.py::TestPublishedMigrationHistory` | `b6e1f4a2c9d7`、`f7a1c3d9e5b2` 与 sibling `5f7a9c2e4d61` 三种已部署状态都可升级到唯一 merge head；Plan cleanup 和 mergepoint 可降级/再升级，且旧 revision 文件无需改写 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
+| `LocalDeployButton.test.tsx` / `test_api_system.py` | 远端更新关闭时仍可从顶栏部署服务器本地版本；入口不触发远端检查，复用 repair 安全事务并保留活动 Session 阻断 |
+| `test_standard_resume_keeps_resumable_goal_inactive_for_normal_message` | paused/blocked 原生 Goal 收到普通消息时保持原状态，消息走普通 `turn/start`，不得重新激活自治 Goal |
 
 ##### `test_service_pr_review.py` — PR 审核服务
 

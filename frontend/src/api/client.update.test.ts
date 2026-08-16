@@ -20,15 +20,17 @@ describe('System update API routing', () => {
     vi.clearAllMocks();
   });
 
-  it('uses dedicated reconcile, repair, restart, and confirmed rollback endpoints', async () => {
+  it('uses dedicated reconcile, repair, local deploy, restart, and confirmed rollback endpoints', async () => {
     await api.reconcileUpdateState();
     await api.repairUpdate();
+    await api.deployLocalVersion();
     await api.restartService();
     await api.rollbackUpdate({ confirm_database_restore: true });
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       '/api/system/update/reconcile',
       '/api/system/update/repair',
+      '/api/system/deploy',
       '/api/system/restart',
       '/api/system/update/rollback',
     ]);
@@ -40,7 +42,8 @@ describe('System update API routing', () => {
       body: '{}',
     });
     expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: 'POST' });
-    expect(fetchMock.mock.calls[3][1]).toMatchObject({
+    expect(fetchMock.mock.calls[3][1]).toMatchObject({ method: 'POST' });
+    expect(fetchMock.mock.calls[4][1]).toMatchObject({
       method: 'POST',
       body: JSON.stringify({ confirm_database_restore: true }),
     });

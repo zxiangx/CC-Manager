@@ -21,6 +21,8 @@ vi.mock('../../api/client', () => ({
     getCloudRouterAccounts: vi.fn().mockResolvedValue([]),
     config: vi.fn().mockResolvedValue({ remote_updates_enabled: true }),
     startUpdate: vi.fn(),
+    deployLocalVersion: vi.fn(),
+    getUpdateStatus: vi.fn().mockResolvedValue({ status: 'idle' }),
     health: vi.fn(),
   },
   clearToken: vi.fn(),
@@ -128,7 +130,7 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
   });
 
-  it('does not mount the update control or start update checks when disabled', async () => {
+  it('shows local deploy without starting remote update checks when remote updates are disabled', async () => {
     vi.mocked(api.config).mockResolvedValue({
       remote_updates_enabled: false,
     } as Awaited<ReturnType<typeof api.config>>);
@@ -136,6 +138,7 @@ describe('AppShell layout and z-index architecture', () => {
     renderShell();
 
     await waitFor(() => expect(api.config).toHaveBeenCalledTimes(1));
+    expect(screen.getByTitle('部署本地版本')).toBeInTheDocument();
     expect(screen.queryByTitle('更新并重启')).not.toBeInTheDocument();
     expect(api.startUpdate).not.toHaveBeenCalled();
   });

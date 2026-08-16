@@ -11,7 +11,7 @@ interface NativeGoalPanelProps {
 const statusPresentation: Record<string, { label: string; classes: string }> = {
   active: { label: '运行中', classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
   paused: { label: '已暂停', classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
-  blocked: { label: '恢复中', classes: 'bg-orange-500/15 text-orange-300 border-orange-500/30' },
+  blocked: { label: '已阻塞', classes: 'bg-orange-500/15 text-orange-300 border-orange-500/30' },
   usageLimited: { label: '额度受限', classes: 'bg-rose-500/15 text-rose-300 border-rose-500/30' },
   budgetLimited: { label: '预算已达上限', classes: 'bg-rose-500/15 text-rose-300 border-rose-500/30' },
   complete: { label: '已完成', classes: 'bg-sky-500/15 text-sky-300 border-sky-500/30' },

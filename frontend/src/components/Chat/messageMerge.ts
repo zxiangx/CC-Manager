@@ -57,6 +57,25 @@ function messageFingerprint(message: ChatMessage): string {
   ]);
 }
 
+/**
+ * Optimistic user bubbles are created from the upload response while the
+ * persisted row is rebuilt from server-side attachment metadata. Those two
+ * attachment representations are allowed to differ, so reconcile them by the
+ * canonical user input and let the persisted row supply the final attachments.
+ * Counts are still consumed one-by-one; two intentionally repeated messages
+ * therefore remain two messages.
+ */
+function userMessageFingerprint(message: ChatMessage): string | null {
+  if (message.event_type !== 'user_message' || message.role !== 'user') {
+    return null;
+  }
+  return JSON.stringify([
+    message.event_type,
+    message.role,
+    message.raw_content ?? message.content,
+  ]);
+}
+
 function stableLiveKey(message: ChatMessage): string | null {
   if (message.todo_id) return `todo:${message.todo_id}`;
   const nativeId = message.item_id || message.stream_item_id;
@@ -134,9 +153,17 @@ export function mergeChatHistory(
       .filter((key): key is string => key !== null),
   );
   const snapshotCounts = new Map<string, number>();
+  const persistedUserCounts = new Map<string, number>();
   for (const message of snapshot) {
     const key = messageFingerprint(message);
     snapshotCounts.set(key, (snapshotCounts.get(key) || 0) + 1);
+    const userKey = message.persisted ? userMessageFingerprint(message) : null;
+    if (userKey) {
+      persistedUserCounts.set(
+        userKey,
+        (persistedUserCounts.get(userKey) || 0) + 1,
+      );
+    }
   }
 
   const extras: ChatMessage[] = [];
@@ -147,10 +174,20 @@ export function mergeChatHistory(
     const key = messageFingerprint(message);
     if (message.persisted && snapshotIds.has(message.id)) {
       consume(snapshotCounts, key);
+      const persistedUserKey = userMessageFingerprint(message);
+      if (persistedUserKey) consume(persistedUserCounts, persistedUserKey);
       continue;
     }
     const stableKey = stableLiveKey(message);
     if (!message.persisted && stableKey && snapshotStableKeys.has(stableKey)) {
+      continue;
+    }
+    const userKey = !message.persisted ? userMessageFingerprint(message) : null;
+    if (userKey && consume(persistedUserCounts, userKey)) {
+      // Also consume the strict fingerprint when it happens to match. Without
+      // this, one persisted row could remove a second identical optimistic
+      // bubble through the generic reconciliation path below.
+      consume(snapshotCounts, key);
       continue;
     }
     if (!message.persisted && consume(snapshotCounts, key)) {

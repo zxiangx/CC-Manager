@@ -2,6 +2,13 @@
 
 > **重要：Claude 必须自主维护本文件。** 每次完成重要改动或遇到问题后，在对应章节记录。每条记录必须附上 git commit ID。
 
+## 2026-08-17：Codex 原生 Goal 可保留暂停并显式恢复
+
+- **功能（commit `9d322849`）**：Goal 面板新增“暂停 / 启用 / 删除”三种明确操作。用户暂停先终止当前 Goal turn、保留 objective/进度/用量；启用通过不可见的 task-scoped control continuation 恢复 exact native Goal，不生成伪用户消息；删除仍是唯一永久清除操作。
+- **Agent 控制（commit `9d322849`）**：Codex 主 Agent 保留原生 `create_goal`，并新增窄化的 `ccm_pause_goal` / `ccm_resume_goal`。Agent 暂停让当前 turn 正常收尾但阻止后续 push，Agent 无删除权限；Goal 工具由 Codex 专用启动参数控制，Claude MCP 进程不会暴露它们。
+- **边界（commit `9d322849`）**：普通消息不再暗中恢复 paused/blocked/limited/complete Goal；只有显式启用才可恢复。重复启用请求按 Task 去重，容量重试、账号切换与安全 requeue 均保留显式恢复标记；手动 pause 还会取消 descendant gate 的临时恢复标记，避免子 Agent idle 后把它重新激活。
+- **验证（commit `9d322849`）**：app-server `192 passed`、Task API `157 passed`、Dispatcher `242 passed`、服务器隔离 MCP `81 passed`，前端组件测试、TypeScript 与 production build 通过。InstanceManager `293 passed`；其余 2 项仅为 macOS `/tmp` 规范化为 `/private/tmp` 的既有平台断言差异。
+
 ## 2026-08-16：修正 paused 与 blocked Goal 的恢复边界
 
 - **回归原因（commit `1a0529f7`）**：为阻止 blocked Goal 在普通聊天后重新激活并重复提示，上一版误将 `paused` 与 `blocked` 一起隔离。由部署停服或用户 Stop 产生的 paused Goal 因而在下一条 Standard 消息后只运行一个普通 turn，原目标继续处于 paused，#13 无法自主续跑。

@@ -403,6 +403,9 @@ class QueuedMessage:
     # start a new native session.  Preserve that admission fact on the exact
     # queued object if routing/slot contention requires another queue attempt.
     allow_new_session: bool = field(compare=False, default=False)
+    # Goal-control resume is an explicit management action, unlike ordinary
+    # chat. It may reactivate a retained paused Goal; normal messages must not.
+    resume_native_goal: bool = field(compare=False, default=False)
     # Default monitor/sub-agent reports may arrive while the initial Task turn
     # owns an active generation but has not persisted its native session id.
     # They must wait for that session instead of starting a duplicate turn.
@@ -683,6 +686,11 @@ class GlobalDispatcher:
         # Entries intentionally outlive empty queues: deleting one could make a
         # stale dequeued message's old generation look current again.
         self._task_queue_generations: dict[int, int] = {}
+        # At most one explicit Goal-resume control may be queued/in-flight per
+        # Task. The native Goal stays paused until launch admission, so state
+        # reads alone cannot deduplicate a rapid double click or repeated tool
+        # call without this exact in-process latch.
+        self._native_goal_resume_pending: set[int] = set()
         # Fresh lifecycle tasks waiting for a provider-account cooldown or
         # maintenance window. TaskQueue excludes them without consuming retry
         # budget, while unrelated pending tasks can still use idle instances.
@@ -948,7 +956,7 @@ class GlobalDispatcher:
         self,
         *,
         reconcile_auxiliary: bool = True,
-    ):
+    ) -> bool:
         """Reconcile persisted claims with generations owned by this process.
 
         An OS PID is not attachable state and may have been reused.  After a
@@ -11014,7 +11022,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         allow_new_session: bool | None = None,
-    ):
+        resume_native_goal: bool = False,
+    ) -> bool:
         """Enqueue a message for the main agent of a task.
 
         Messages are processed serially by a per-task consumer. Registration
@@ -11050,6 +11059,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if allow_new_session is None
                 else allow_new_session
             ),
+            resume_native_goal=resume_native_goal,
             defer_for_initial_session=(
                 allow_new_session is None and internal_session_report
             ),
@@ -11057,9 +11067,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         async with self._dispatch_claim_lock:
             if self._maintenance_shutdown_committed:
                 raise TaskStartPausedError("service shutdown has already been committed")
+            if (
+                resume_native_goal
+                and task_id in self._native_goal_resume_pending
+            ):
+                logger.info(
+                    "Ignoring duplicate Goal-resume control for task %s",
+                    task_id,
+                )
+                return False
             msg.queue_generation = self._task_queue_generations.get(task_id, 0)
             q = self._get_task_queue(task_id)
             await q.put(msg)
+            if resume_native_goal:
+                self._native_goal_resume_pending.add(task_id)
             self._pending_task_starts.add(task_id)
             self._ensure_queue_worker(task_id)
             capacity_superseded = False
@@ -11075,6 +11096,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             f"Enqueued message for task {task_id}: source={source} priority={priority} "
             f"queue_depth={q.qsize()} capacity_superseded={capacity_superseded}"
         )
+        return True
 
     async def clear_task_queue(self, task_id: int) -> int:
         """Drop all pending queued messages for a task (used on interrupt).
@@ -11089,6 +11111,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             q = self._task_queues.get(task_id)
             if q is None:
                 self._pending_task_starts.discard(task_id)
+                self._native_goal_resume_pending.discard(task_id)
                 return 0
             # q.get() removes an item before the consumer can acquire the
             # admission lock to register it as in-flight. In that state the
@@ -11103,14 +11126,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             cleared = 0
             while True:
                 try:
-                    q.get_nowait()
+                    queued = q.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                if queued.resume_native_goal:
+                    self._native_goal_resume_pending.discard(task_id)
                 q.task_done()
                 cleared += 1
             if q.empty() and not self._task_queue_inflight.get(task_id, 0):
                 self._pending_task_starts.discard(task_id)
             if cancelled_handoff:
+                self._native_goal_resume_pending.discard(task_id)
                 cleared += 1
         if cleared:
             logger.info(f"Cleared {cleared} pending queued message(s) for task {task_id} on interrupt")
@@ -11267,15 +11293,21 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 try:
                     claimed = await self._claim_dequeued_message(task_id, msg)
                 except BaseException:
+                    if msg.resume_native_goal:
+                        self._native_goal_resume_pending.discard(task_id)
                     q.task_done()
                     raise
                 if not claimed:
+                    if msg.resume_native_goal:
+                        async with self._dispatch_claim_lock:
+                            self._native_goal_resume_pending.discard(task_id)
                     q.task_done()
                     logger.info(
                         "Discarded cancelled queued-message handoff for task %s",
                         task_id,
                     )
                     continue
+                message_requeued = False
                 try:
                     while True:
                         await self.wait_until_resumed()
@@ -11352,6 +11384,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                     task_id,
                                 )
                                 await q.put(msg)
+                                message_requeued = True
                                 await asyncio.sleep(
                                     CODEX_ROUTING_RETRY_DELAY
                                 )
@@ -11365,6 +11398,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 task_id, exc,
                             )
                             await q.put(msg)
+                            message_requeued = True
                             retry_after = getattr(exc, "retry_after", None)
                             await asyncio.sleep(
                                 max(
@@ -11395,6 +11429,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         msg.instance_claim = None
                     q.task_done()
                     async with self._dispatch_claim_lock:
+                        if msg.resume_native_goal and not message_requeued:
+                            self._native_goal_resume_pending.discard(task_id)
                         inflight = self._task_queue_inflight.get(task_id, 0) - 1
                         if inflight > 0:
                             self._task_queue_inflight[task_id] = inflight
@@ -12165,6 +12201,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 source_log_id=msg.source_log_id,
                 current_message=msg.current_message,
                 queue_timestamp=msg.timestamp,
+                resume_native_goal=msg.resume_native_goal,
             )
             inst_id = inst.id
             task_provider = (task.provider or "claude").lower()

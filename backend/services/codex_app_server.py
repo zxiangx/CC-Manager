@@ -2622,6 +2622,7 @@ class CodexAppServer:
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
+        explicit_resume_native_goal: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -3066,25 +3067,34 @@ class CodexAppServer:
             and not disable_autonomous_features
             and not tools_disabled
         ):
-            # Stop intentionally pauses a native Goal. A later Standard user
-            # message is an explicit continuation signal, so restore that
-            # exact Goal instead of starting an unrelated regular turn and
-            # leaving the objective stranded. A blocked Goal is different: it
-            # has reached an explicit terminal blocker and must stay inactive
-            # until a dedicated Goal action changes its status.
+            # A retained paused Goal is a real control state. Ordinary chat
+            # must not reactivate it: the user may ask a question while work
+            # remains deliberately paused. Only the dedicated Goal-control
+            # path sets ``resume_native_goal`` after preparing the Goal and
+            # reserving this exact Task lifecycle.
             resumable_goal = await self._read_thread_goal(str(thread_id))
             resume_native_goal = bool(
-                isinstance(resumable_goal, dict)
-                and resumable_goal.get("status") == "paused"
+                explicit_resume_native_goal
+                and isinstance(resumable_goal, dict)
+                and resumable_goal.get("status")
+                in {
+                    "paused",
+                    "blocked",
+                    "usageLimited",
+                    "budgetLimited",
+                    "complete",
+                }
             )
             if (
                 isinstance(resumable_goal, dict)
-                and resumable_goal.get("status") == "blocked"
+                and resumable_goal.get("status") in {"paused", "blocked"}
+                and not resume_native_goal
             ):
                 logger.info(
-                    "Keeping blocked Codex Goal inactive while admitting "
+                    "Keeping Codex Goal %s inactive while admitting "
                     "ordinary turn "
                     "task=%s thread=%s",
+                    resumable_goal.get("status"),
                     task_id,
                     thread_id,
                 )
@@ -3976,6 +3986,65 @@ class CodexAppServer:
             raise ValueError("thread_id is required")
         await self.ensure_started()
         return await self._read_thread_goal(thread_id)
+
+    async def pause_thread_goal(
+        self,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Persist a manual pause without clearing the native Goal.
+
+        This operation is also callable from inside the active Goal turn via
+        the task-scoped MCP tool. Serialize it with the descendant gate and
+        clear the gate-owned pause marker first so a later child-idle event
+        cannot mistake a manual pause for its temporary pause and reactivate
+        the Goal behind the caller's back.
+        """
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+        context = self._contexts_by_thread.get(thread_id)
+
+        async def _pause() -> dict[str, Any]:
+            if context is not None and self._context_is_current(context):
+                context.goal_paused_for_descendants = False
+            existing = await self._read_thread_goal(thread_id)
+            if existing is None:
+                raise CodexAppServerError(
+                    f"Codex thread {thread_id} does not have a Goal"
+                )
+            if existing.get("status") != "paused":
+                response = await self._request(
+                    "thread/goal/set",
+                    {"threadId": thread_id, "status": "paused"},
+                )
+                goal = (
+                    response.get("goal")
+                    if isinstance(response, dict)
+                    else None
+                )
+                if not isinstance(goal, dict) or goal.get("status") != "paused":
+                    raise CodexAppServerError(
+                        "thread/goal/set did not confirm a paused Goal"
+                    )
+            authoritative = await self._read_thread_goal(thread_id)
+            if (
+                not isinstance(authoritative, dict)
+                or authoritative.get("status") != "paused"
+            ):
+                raise CodexAppServerError(
+                    f"Codex Goal was not paused for {thread_id}"
+                )
+            return authoritative
+
+        if context is None or not self._context_is_current(context):
+            return await _pause()
+        lock = context.goal_descendant_gate_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            context.goal_descendant_gate_lock = lock
+        async with lock:
+            return await _pause()
 
     async def clear_thread_goal(
         self,
@@ -5698,11 +5767,14 @@ class CodexAppServerRegistry:
         thread_id: str,
         *,
         clear: bool,
+        pause: bool = False,
     ) -> dict[str, Any] | None | bool:
         """Reserve a native thread for one Goal snapshot or clear RPC."""
 
         if not thread_id:
             raise ValueError("thread_id is required")
+        if clear and pause:
+            raise ValueError("Goal operation cannot clear and pause together")
         home = normalize_codex_home(codex_home)
         token = object()
         reserved_owner = False
@@ -5739,7 +5811,11 @@ class CodexAppServerRegistry:
             result = (
                 await server.clear_thread_goal(thread_id)
                 if clear
-                else await server.read_thread_goal(thread_id)
+                else (
+                    await server.pause_thread_goal(thread_id)
+                    if pause
+                    else await server.read_thread_goal(thread_id)
+                )
             )
             succeeded = True
             return result
@@ -5769,6 +5845,23 @@ class CodexAppServerRegistry:
             clear=False,
         )
         return result if isinstance(result, dict) else None
+
+    async def pause_thread_goal(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        result = await self._thread_goal_operation(
+            codex_home,
+            thread_id,
+            clear=False,
+            pause=True,
+        )
+        if not isinstance(result, dict):
+            raise CodexAppServerError(
+                f"Codex Goal pause returned invalid data for {thread_id}"
+            )
+        return result
 
     async def clear_thread_goal(
         self,

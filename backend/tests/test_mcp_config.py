@@ -14,11 +14,13 @@ from backend.mcp import (
 )
 from backend.services import mcp_config
 from backend.services.mcp_config import (
+    CCM_GOAL_CONTROL_TOOLS,
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
     CCM_SUB_AGENT_CONTROLLER_TOOLS,
     CCM_SUB_AGENT_TOOLS,
     McpServerSpec,
+    build_goal_control_mcp_server_specs,
     build_mcp_server_specs,
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
@@ -49,6 +51,11 @@ EXPECTED_MAIN_TOOLS = (
     "create_sub_agent",
     "check_sub_agents",
     "stop_sub_agent",
+)
+EXPECTED_REGISTERED_MAIN_TOOLS = (
+    *EXPECTED_MAIN_TOOLS,
+    "ccm_pause_goal",
+    "ccm_resume_goal",
 )
 EXPECTED_MONITOR_TOOLS = (
     "report_status",
@@ -169,7 +176,7 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
             tool_timeout_sec=60.0,
         ),
     )
-    assert CCM_SKILLS_TOOLS == EXPECTED_MAIN_TOOLS
+    assert CCM_SKILLS_TOOLS == EXPECTED_REGISTERED_MAIN_TOOLS
 
 
 def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
@@ -276,8 +283,27 @@ def test_sub_agent_controller_spec_is_narrow_and_required(monkeypatch):
         "create_sub_agent",
         "check_sub_agents",
         "stop_sub_agent",
+        "ccm_pause_goal",
+        "ccm_resume_goal",
     )
     assert "create_monitor" not in spec.enabled_tools
+    assert "--enable-goal-control" in spec.args
+
+
+def test_goal_control_spec_is_available_without_full_main_mcp(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+
+    (spec,) = build_goal_control_mcp_server_specs(
+        42,
+        api_base="http://manager:8321",
+    )
+
+    assert spec.required is True
+    assert spec.enabled_tools == CCM_GOAL_CONTROL_TOOLS
+    assert spec.enabled_tools == ("ccm_pause_goal", "ccm_resume_goal")
+    assert "ccm_read_skill" not in spec.enabled_tools
+    assert "create_monitor" not in spec.enabled_tools
+    assert "--enable-goal-control" in spec.args
 
 
 @pytest.mark.parametrize(
@@ -402,6 +428,13 @@ def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():
     assert monitor_tools.issubset(local_codex_spec.enabled_tools)
     assert "ccm_read_skill" in closed_codex_spec.enabled_tools
     assert "ccm_read_user_skill" in closed_codex_spec.enabled_tools
+    assert set(CCM_GOAL_CONTROL_TOOLS).isdisjoint(claude_spec.enabled_tools)
+    assert set(CCM_GOAL_CONTROL_TOOLS).issubset(
+        closed_codex_spec.enabled_tools
+    )
+    assert "--enable-goal-control" not in claude_spec.args
+    assert "--enable-goal-control" in closed_codex_spec.args
+    assert "--enable-goal-control" in local_codex_spec.args
 
 
 @pytest.mark.parametrize(

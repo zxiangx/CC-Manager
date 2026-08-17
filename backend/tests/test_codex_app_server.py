@@ -3791,8 +3791,8 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
 
 
 @pytest.mark.asyncio
-async def test_standard_resume_reactivates_paused_goal_before_steering():
-    """A new user message is an explicit resume signal for a paused Goal."""
+async def test_explicit_goal_control_reactivates_paused_goal_before_steering():
+    """Only an explicit Goal-control request may reactivate a paused Goal."""
 
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -3862,6 +3862,7 @@ async def test_standard_resume_reactivates_paused_goal_before_steering():
         git_env=None,
         task_id=306,
         on_turn_prepared=on_turn_prepared,
+        explicit_resume_native_goal=True,
     )
 
     assert thread_id == "thread-paused-goal"
@@ -3890,9 +3891,9 @@ async def test_standard_resume_reactivates_paused_goal_before_steering():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "goal_status",
-    [None, "blocked", "usageLimited", "budgetLimited", "complete"],
+    [None, "paused", "blocked", "usageLimited", "budgetLimited", "complete"],
 )
-async def test_standard_resume_does_not_bypass_non_paused_goal_status(
+async def test_standard_resume_keeps_inactive_goal_status(
     goal_status,
 ):
     server = CodexAppServer("codex")
@@ -4075,6 +4076,93 @@ async def test_interrupt_followed_goal_between_turns_pauses_and_closes():
         "thread/read",
     ]
     assert server._contexts_by_thread == {}
+
+
+@pytest.mark.asyncio
+async def test_manual_goal_pause_cancels_descendant_gate_resume_marker():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    goal_reads = 0
+
+    async def request(method, params):
+        nonlocal goal_reads
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-manual-pause",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-manual-pause"}}
+        if method == "thread/goal/get":
+            goal_reads += 1
+            return {
+                "goal": {
+                    "threadId": "thread-manual-pause",
+                    "status": "active" if goal_reads == 1 else "paused",
+                },
+            }
+        if method == "thread/goal/set":
+            assert params == {
+                "threadId": "thread-manual-pause",
+                "status": "paused",
+            }
+            return {
+                "goal": {
+                    "threadId": "thread-manual-pause",
+                    "status": "paused",
+                },
+            }
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="work",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=408,
+    )
+    context = server._contexts_by_thread[thread_id]
+    context.goal_paused_for_descendants = True
+
+    goal = await server.pause_thread_goal(thread_id)
+
+    assert goal["status"] == "paused"
+    assert context.goal_paused_for_descendants is False
+    assert [call.args[0] for call in server._request.await_args_list][-3:] == [
+        "thread/goal/get",
+        "thread/goal/set",
+        "thread/goal/get",
+    ]
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-manual-pause",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_goal_pause_requires_authoritative_paused_readback():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"goal": {"status": "active"}},
+        {"goal": {"status": "paused"}},
+        {"goal": {"status": "active"}},
+    ])
+
+    with pytest.raises(CodexAppServerError, match="was not paused"):
+        await server.pause_thread_goal("thread-pause-race")
 
 
 @pytest.mark.asyncio

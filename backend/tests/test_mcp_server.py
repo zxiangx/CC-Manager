@@ -21,6 +21,70 @@ def test_mcp_server_tools_registered():
     assert "create_monitor" in names
     assert "check_monitors" in names
     assert "stop_monitor" in names
+    assert "ccm_pause_goal" in names
+    assert "ccm_resume_goal" in names
+
+
+def test_goal_control_tools_are_removed_without_codex_launch_flag():
+    tools = mcp_mod.mcp._tool_manager._tools
+    original = dict(tools)
+    try:
+        mcp_mod._configure_goal_control_tools(False)
+        assert "ccm_pause_goal" not in tools
+        assert "ccm_resume_goal" not in tools
+    finally:
+        tools.clear()
+        tools.update(original)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "expected_json", "queued", "expected_status"),
+    [
+        (
+            mcp_mod.ccm_pause_goal,
+            {"status": "paused", "finish_current_turn": True},
+            False,
+            "paused",
+        ),
+        (
+            mcp_mod.ccm_resume_goal,
+            {"status": "active"},
+            True,
+            "resume_requested",
+        ),
+    ],
+)
+async def test_goal_control_tools_call_task_scoped_endpoint(
+    tool,
+    expected_json,
+    queued,
+    expected_status,
+):
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {
+        "goal": {"status": expected_json["status"]},
+        "queued": queued,
+    }
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.patch = AsyncMock(return_value=response)
+
+    with patch(
+        "backend.mcp.ccm_skills_server.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = json.loads(await tool())
+
+    assert result["success"] is True
+    assert result["status"] == expected_status
+    client.patch.assert_awaited_once_with(
+        "http://localhost:9999/api/tasks/42/native-goal",
+        headers={},
+        json=expected_json,
+    )
 
 
 def test_api_url():

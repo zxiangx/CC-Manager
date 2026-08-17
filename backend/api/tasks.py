@@ -6,8 +6,10 @@ import uuid
 from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -964,6 +966,13 @@ def _require_native_goal_task(task: Task) -> tuple[str, str]:
     if not task.session_id:
         raise HTTPException(409, "This Task does not have a Codex thread yet")
     return _resolve_codex_thread_routing_home(task), task.session_id
+
+
+class NativeGoalStateRequest(BaseModel):
+    status: Literal["active", "paused"]
+    # Agent self-pause must let the MCP tool call and current answer finish.
+    # User controls leave this false and stop the current Goal generation.
+    finish_current_turn: bool = False
 
 
 @router.get("/{task_id}/native-goal")
@@ -3422,6 +3431,153 @@ async def stop_task_session(
     return await _finish_task_operation(
         _stop_task_session_local_impl(task_id, db)
     )
+
+
+@router.patch("/{task_id}/native-goal")
+async def set_native_goal_state(
+    task_id: int,
+    body: NativeGoalStateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Pause or explicitly resume one retained Codex-native Goal."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(
+        db,
+        task_id,
+        action=f"set its native Goal {body.status}",
+    )
+    worker_task = await _worker_task_or_none(db, task_id)
+    if worker_task is not None:
+        return await _proxy(
+            worker_task,
+            "PATCH",
+            f"/api/tasks/{task_id}/native-goal",
+            body.model_dump(),
+        )
+
+    codex_home, thread_id = _require_native_goal_task(task)
+    from backend.main import dispatcher, instance_manager
+
+    async with get_task_operation_lock(task_id):
+        try:
+            goal = await instance_manager.read_codex_thread_goal(
+                codex_home,
+                thread_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Could not read native Goal before state control "
+                "task=%s thread=%s error=%s",
+                task_id,
+                thread_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                409,
+                "The native Goal is temporarily unavailable; its state was not changed",
+            ) from exc
+        if goal is None:
+            raise HTTPException(409, "This Task does not currently have a Goal")
+
+        if body.status == "paused":
+            if goal.get("status") == "paused":
+                return {
+                    "goal": goal,
+                    "accepted": False,
+                    "queued": False,
+                }
+
+            if not body.finish_current_turn:
+                # The ordinary stop path pauses before interrupting and owns
+                # all Task/Instance generation bookkeeping. Between native
+                # turns there may be no process owner, which is harmless: the
+                # direct pause below still persists the authoritative state.
+                try:
+                    await _finish_task_operation(
+                        _stop_task_session_local_impl(task_id, db)
+                    )
+                except HTTPException as exc:
+                    if exc.status_code != 400:
+                        raise
+
+            try:
+                paused = await instance_manager.pause_codex_thread_goal(
+                    codex_home,
+                    thread_id,
+                )
+                verified = await instance_manager.read_codex_thread_goal(
+                    codex_home,
+                    thread_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Could not pause native Goal task=%s thread=%s error=%s",
+                    task_id,
+                    thread_id,
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    409,
+                    "CCM could not prove that the native Goal was paused",
+                ) from exc
+            if (
+                paused.get("status") != "paused"
+                or not isinstance(verified, dict)
+                or verified.get("status") != "paused"
+            ):
+                raise HTTPException(
+                    409,
+                    "The native Goal did not remain paused after the control operation",
+                )
+            return {
+                "goal": verified,
+                "accepted": True,
+                "queued": False,
+            }
+
+        if goal.get("status") == "active":
+            return {
+                "goal": goal,
+                "accepted": False,
+                "queued": False,
+            }
+
+        from backend.services.dispatcher import PRIORITY_USER, TaskStartPausedError
+
+        try:
+            enqueued = await dispatcher.enqueue_message(
+                task_id=task_id,
+                prompt="继续按照当前已保存的 Goal 自主工作。",
+                priority=PRIORITY_USER,
+                source="goal-control:resume",
+                expected_task_routing=(
+                    (task.provider or "codex").lower(),
+                    task.model,
+                    task.codex_service_tier or "default",
+                ),
+                current_message="继续按照当前已保存的 Goal 自主工作。",
+                resume_native_goal=True,
+            )
+        except TaskStartPausedError as exc:
+            raise HTTPException(
+                409,
+                "服务即将重启，Goal 恢复请求未被接受，请重连后重试",
+            ) from exc
+        return {
+            "goal": goal,
+            "accepted": enqueued is not False,
+            "queued": True,
+        }
 
 
 @router.delete("/{task_id}/native-goal")

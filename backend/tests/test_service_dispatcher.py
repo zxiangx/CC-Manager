@@ -4752,6 +4752,35 @@ async def test_user_queue_supersedes_capacity_only_after_durable_enqueue(
 
 
 @pytest.mark.asyncio
+async def test_goal_resume_control_is_deduplicated_until_queue_settles(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d._ensure_queue_worker = MagicMock()
+
+    first = await d.enqueue_message(
+        73,
+        "resume retained goal",
+        source="goal-control:resume",
+        resume_native_goal=True,
+    )
+    duplicate = await d.enqueue_message(
+        73,
+        "resume retained goal",
+        source="goal-control:resume",
+        resume_native_goal=True,
+    )
+
+    assert first is True
+    assert duplicate is False
+    assert d._task_queues[73].qsize() == 1
+    assert 73 in d._native_goal_resume_pending
+
+    assert await d.clear_task_queue(73) == 1
+    assert 73 not in d._native_goal_resume_pending
+
+
+@pytest.mark.asyncio
 async def test_monitor_queue_does_not_supersede_user_capacity_retry(db_factory):
     d = _make_dispatcher(db_factory)
     d.instance_manager.supersede_codex_capacity_retry = MagicMock(
@@ -6801,6 +6830,24 @@ async def test_missing_session_recovery_uses_recency_wrapper(
     )
     assert launch["current_message"] == "hi"
     assert launch["source_log_id"] == 654
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_control_reaches_exact_instance_launch(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    msg.resume_native_goal = True
+
+    await d._process_queued_message(task_id, msg)
+
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["resume_native_goal"] is True
+    assert launch["current_message"] == "hi"
 
 
 @pytest.mark.asyncio

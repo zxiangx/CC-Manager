@@ -1351,6 +1351,21 @@ export const api = {
     request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
   getNativeGoal: (id: number) =>
     request<{ goal: NativeGoal | null }>(`/api/tasks/${id}/native-goal`),
+  setNativeGoalStatus: (
+    id: number,
+    status: 'active' | 'paused',
+    finishCurrentTurn = false,
+  ) => request<{
+    goal: NativeGoal;
+    accepted: boolean;
+    queued: boolean;
+  }>(`/api/tasks/${id}/native-goal`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      status,
+      finish_current_turn: finishCurrentTurn,
+    }),
+  }),
   cancelNativeGoal: (id: number) =>
     request<{ goal: null; cancelled: boolean }>(`/api/tasks/${id}/native-goal`, { method: 'DELETE' }),
   listForkAnchors: (id: number) =>

@@ -2859,6 +2859,8 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
             "create_sub_agent",
             "check_sub_agents",
             "stop_sub_agent",
+            "ccm_pause_goal",
+            "ccm_resume_goal",
         }
 
 
@@ -3191,6 +3193,8 @@ async def test_codex_app_server_uses_passed_sub_agent_controller_specs(
         "create_sub_agent",
         "check_sub_agents",
         "stop_sub_agent",
+        "ccm_pause_goal",
+        "ccm_resume_goal",
     }
     assert "create_monitor" not in specs[0].enabled_tools
     assert process.unsubscribe_on_terminal is True

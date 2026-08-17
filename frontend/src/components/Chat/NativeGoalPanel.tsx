@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../../api/client';
 import type { NativeGoal } from '../../api/client';
-import { ListTodo, Loader2, RefreshCw, Trash2, X } from '../icons';
+import { ListTodo, Loader2, Play, RefreshCw, StopCircle, Trash2, X } from '../icons';
 
 interface NativeGoalPanelProps {
   taskId: number;
@@ -44,6 +44,7 @@ export function NativeGoalPanel({ taskId, onCancelled }: NativeGoalPanelProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  const [changingStatus, setChangingStatus] = useState<'active' | 'paused' | null>(null);
   const [cancelArmed, setCancelArmed] = useState(false);
 
   const refresh = useCallback(async (quiet = false) => {
@@ -72,8 +73,28 @@ export function NativeGoalPanel({ taskId, onCancelled }: NativeGoalPanelProps) {
     setGoal(null);
     setLoaded(false);
     setError(null);
+    setChangingStatus(null);
     setCancelArmed(false);
   }, [taskId]);
+
+  const setGoalStatus = async (status: 'active' | 'paused') => {
+    setChangingStatus(status);
+    setCancelArmed(false);
+    setError(null);
+    try {
+      const result = await api.setNativeGoalStatus(taskId, status);
+      setGoal(result.goal);
+      setLoaded(true);
+      onCancelled?.();
+      if (status === 'active' && result.queued) {
+        window.setTimeout(() => void refresh(true), 1_000);
+      }
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : String(requestError));
+    } finally {
+      setChangingStatus(null);
+    }
+  };
 
   const cancelGoal = async () => {
     if (!cancelArmed) {
@@ -98,6 +119,7 @@ export function NativeGoalPanel({ taskId, onCancelled }: NativeGoalPanelProps) {
   const presentation = goal
     ? (statusPresentation[goal.status] || { label: goal.status, classes: 'bg-gray-700 text-gray-300 border-gray-600' })
     : null;
+  const busy = cancelling || changingStatus !== null;
 
   return (
     <>
@@ -116,7 +138,7 @@ export function NativeGoalPanel({ taskId, onCancelled }: NativeGoalPanelProps) {
 
       {open && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/65 p-4" onMouseDown={(event) => {
-          if (event.target === event.currentTarget && !cancelling) setOpen(false);
+          if (event.target === event.currentTarget && !busy) setOpen(false);
         }}>
           <div className="flex max-h-[82vh] w-full max-w-xl flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-800 shadow-2xl">
             <div className="flex items-center justify-between border-b border-gray-700 bg-gray-900/70 px-4 py-3">
@@ -128,10 +150,10 @@ export function NativeGoalPanel({ taskId, onCancelled }: NativeGoalPanelProps) {
                 </div>
               </div>
               <div className="flex items-center gap-1">
-                <button type="button" onClick={() => void refresh()} disabled={loading || cancelling} className="p-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-40" title="刷新 Goal">
+                <button type="button" onClick={() => void refresh()} disabled={loading || busy} className="p-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-40" title="刷新 Goal">
                   <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                 </button>
-                <button type="button" onClick={() => setOpen(false)} disabled={cancelling} className="p-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-40" aria-label="关闭 Goal 面板">
+                <button type="button" onClick={() => setOpen(false)} disabled={busy} className="p-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-40" aria-label="关闭 Goal 面板">
                   <X size={18} />
                 </button>
               </div>
@@ -156,15 +178,29 @@ export function NativeGoalPanel({ taskId, onCancelled }: NativeGoalPanelProps) {
                     <div className="rounded-lg bg-gray-900/50 p-2"><div className="text-gray-500">运行时间</div><div className="mt-1 text-gray-200">{formatDuration(goal.timeUsedSeconds)}</div></div>
                     <div className="rounded-lg bg-gray-900/50 p-2"><div className="text-gray-500">创建时间</div><div className="mt-1 text-gray-200">{formatGoalTime(goal.createdAt)}</div></div>
                   </div>
-                  {goal.status !== 'complete' && (
-                    <div className="rounded-lg border border-red-500/20 bg-red-500/5 p-3">
-                      <div className="mb-2 text-xs text-gray-400">取消会停止正在执行的 Goal 回合，并永久清除此 Goal；之后不会再自动续跑。</div>
-                      <button type="button" onClick={cancelGoal} disabled={cancelling} className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium disabled:opacity-50 ${cancelArmed ? 'bg-red-600 text-white hover:bg-red-500' : 'border border-red-500/40 text-red-300 hover:bg-red-500/10'}`}>
-                        {cancelling ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                        {cancelling ? '正在停止并取消…' : cancelArmed ? '再次点击确认取消' : '取消 Goal'}
-                      </button>
+                  <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-3">
+                    <div className="mb-2 text-xs text-gray-400">
+                      暂停会保留 Goal、进度和用量，并停止后续自动 push；之后可随时重新启用。
                     </div>
-                  )}
+                    {goal.status === 'active' ? (
+                      <button type="button" onClick={() => void setGoalStatus('paused')} disabled={busy} className="flex items-center gap-1.5 rounded border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-500/10 disabled:opacity-50">
+                        {changingStatus === 'paused' ? <Loader2 size={14} className="animate-spin" /> : <StopCircle size={14} />}
+                        {changingStatus === 'paused' ? '正在暂停…' : '暂停 Goal'}
+                      </button>
+                    ) : (
+                      <button type="button" onClick={() => void setGoalStatus('active')} disabled={busy} className="flex items-center gap-1.5 rounded border border-emerald-500/40 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50">
+                        {changingStatus === 'active' ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+                        {changingStatus === 'active' ? '正在启用…' : '启用 Goal'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-red-500/20 bg-red-500/5 p-3">
+                    <div className="mb-2 text-xs text-gray-400">删除会停止正在执行的 Goal 回合，并永久清除此 Goal；该操作与暂停不同。</div>
+                    <button type="button" onClick={cancelGoal} disabled={busy} className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium disabled:opacity-50 ${cancelArmed ? 'bg-red-600 text-white hover:bg-red-500' : 'border border-red-500/40 text-red-300 hover:bg-red-500/10'}`}>
+                      {cancelling ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                      {cancelling ? '正在停止并删除…' : cancelArmed ? '再次点击确认删除' : '删除 Goal'}
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <div className="py-12 text-center"><ListTodo size={28} className="mx-auto mb-3 text-gray-700" /><div className="text-sm text-gray-300">当前没有 Goal</div><div className="mt-1 text-xs text-gray-600">在 Codex 中创建 Goal 后，它会自动显示在这里。</div></div>

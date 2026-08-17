@@ -833,6 +833,7 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
+        resume_native_goal: bool = False,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -919,6 +920,7 @@ class InstanceManager:
                                 current_message=current_message,
                                 queue_timestamp=queue_timestamp,
                                 codex_service_tier=codex_service_tier,
+                                resume_native_goal=resume_native_goal,
                             )
                     except BaseException:
                         current_process = (
@@ -996,6 +998,7 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
+        resume_native_goal: bool = False,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -1203,8 +1206,16 @@ class InstanceManager:
             and enabled_skills.get("sub-agent")
             and not pr_review_task
         )
+        codex_goal_control_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and not pr_review_task
+            and not codex_main_mcp_required
+        )
         codex_mcp_required = (
-            codex_main_mcp_required or codex_sub_agent_mcp_required
+            codex_main_mcp_required
+            or codex_sub_agent_mcp_required
+            or codex_goal_control_mcp_required
         )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
         codex_exec_route = "direct-exec"
@@ -1223,6 +1234,12 @@ class InstanceManager:
             )
 
             codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
+        elif codex_goal_control_mcp_required:
+            from backend.services.mcp_config import (
+                build_goal_control_mcp_server_specs,
+            )
+
+            codex_mcp_specs = build_goal_control_mcp_server_specs(task_id)
 
         if (
             provider == "codex"
@@ -1240,6 +1257,24 @@ class InstanceManager:
             raise CodexRequiredMcpError(
                 "Codex Sub-Agent MCP requires the app-server transport; "
                 "exec fallback does not provide live thread control"
+            )
+
+        if (
+            provider == "codex"
+            and codex_goal_control_mcp_required
+            and not settings.codex_app_server_enabled
+        ):
+            logger.error(
+                "Codex transport fail-closed route=direct-exec "
+                "reason=goal-control-requires-app-server task_id=%s "
+                "instance_id=%s home=%s",
+                task_id,
+                instance_id,
+                config_dir,
+            )
+            raise CodexRequiredMcpError(
+                "Codex Goal pause/resume requires the app-server transport; "
+                "exec fallback cannot prove native Goal state"
             )
 
         if (
@@ -1297,6 +1332,7 @@ class InstanceManager:
                         ),
                         disable_autonomous_features=pr_review_task,
                         tools_disabled=pr_review_task,
+                        resume_native_goal=resume_native_goal,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1687,6 +1723,7 @@ class InstanceManager:
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
                 "codex_service_tier": codex_service_tier,
+                "resume_native_goal": resume_native_goal,
             }
 
         return await self._persist_and_track_launch(
@@ -1976,6 +2013,18 @@ class InstanceManager:
                 registry = self._ensure_codex_app_server_registry()
                 return await registry.read_thread_goal(home, thread_id)
 
+    async def pause_codex_thread_goal(
+        self, codex_home: str, thread_id: str,
+    ) -> dict:
+        """Persist a manual pause while preserving the native Goal."""
+
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.pause_thread_goal(home, thread_id)
+
     async def clear_codex_thread_goal(
         self, codex_home: str, thread_id: str,
     ) -> bool:
@@ -2140,6 +2189,7 @@ class InstanceManager:
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
+        resume_native_goal: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -2162,6 +2212,7 @@ class InstanceManager:
             sandbox_mode=sandbox_mode,
             disable_autonomous_features=disable_autonomous_features,
             tools_disabled=tools_disabled,
+            explicit_resume_native_goal=resume_native_goal,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -6166,6 +6217,8 @@ class InstanceManager:
                         retry_kwargs["queue_timestamp"] = params[
                             "queue_timestamp"
                         ]
+                    if params.get("resume_native_goal") is True:
+                        retry_kwargs["resume_native_goal"] = True
                     await enqueuer(**retry_kwargs)
                 # Still clean up instance below so it's available for the retry
                 # fall through to normal cleanup
@@ -6292,6 +6345,8 @@ class InstanceManager:
                                         retry_kwargs["queue_timestamp"] = (
                                             params["queue_timestamp"]
                                         )
+                                    if params.get("resume_native_goal") is True:
+                                        retry_kwargs["resume_native_goal"] = True
                                     await dispatcher.enqueue_message(
                                         **retry_kwargs
                                     )
@@ -7011,6 +7066,9 @@ class InstanceManager:
                 codex_service_tier=params.get(
                     "codex_service_tier", "default"
                 ),
+                resume_native_goal=bool(
+                    params.get("resume_native_goal", False)
+                ),
             )
             return True
 
@@ -7099,6 +7157,8 @@ class InstanceManager:
                 requeue_kwargs["queue_timestamp"] = params[
                     "queue_timestamp"
                 ]
+            if params.get("resume_native_goal") is True:
+                requeue_kwargs["resume_native_goal"] = True
             await dispatcher.enqueue_message(**requeue_kwargs)
             logger.warning(
                 "%s chat task %d %s routing failed; requeued original "
@@ -7196,6 +7256,9 @@ class InstanceManager:
                     queue_timestamp=params.get("queue_timestamp"),
                     codex_service_tier=params.get(
                         "codex_service_tier", "default"
+                    ),
+                    resume_native_goal=bool(
+                        params.get("resume_native_goal", False)
                     ),
                 )
                 return True
@@ -7333,6 +7396,9 @@ class InstanceManager:
                 queue_timestamp=params.get("queue_timestamp"),
                 codex_service_tier=params.get(
                     "codex_service_tier", "default"
+                ),
+                resume_native_goal=bool(
+                    params.get("resume_native_goal", False)
                 ),
             )
             return True

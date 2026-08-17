@@ -18,6 +18,7 @@ mcp = FastMCP("ccm-skills", instructions="CCM task skill tools")
 _TASK_ID: int = 0
 _API_BASE: str = "http://localhost:8000"
 _AUTH_TOKEN: str = ""
+_GOAL_CONTROL_TOOL_NAMES = ("ccm_pause_goal", "ccm_resume_goal")
 
 
 def _api_url(path: str) -> str:
@@ -28,6 +29,15 @@ def _headers() -> dict[str, str]:
     if _AUTH_TOKEN:
         return {"Authorization": f"Bearer {_AUTH_TOKEN}"}
     return {}
+
+
+def _configure_goal_control_tools(enabled: bool) -> None:
+    """Keep native Goal controls invisible outside Codex task launches."""
+
+    if enabled:
+        return
+    for name in _GOAL_CONTROL_TOOL_NAMES:
+        mcp._tool_manager._tools.pop(name, None)
 
 
 async def _get_task_data() -> dict:
@@ -461,6 +471,73 @@ async def ccm_disable_skill(skill_name: str) -> str:
 
 
 @mcp.tool()
+async def ccm_pause_goal() -> str:
+    """暂停当前 Task 的原生 Codex Goal，但保留目标和全部进度。
+
+    当前回合会正常收尾；暂停后 Codex 不再自动创建后续 Goal 回合。
+    当你判断需要等待外部条件、等待用户决定或用户明确要求暂停时调用。
+    不要用 complete/blocked 代替用户要求的暂停，也不要删除 Goal。
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.patch(
+                _api_url("/native-goal"),
+                headers=_headers(),
+                json={
+                    "status": "paused",
+                    "finish_current_turn": True,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        goal = data.get("goal") if isinstance(data, dict) else None
+        return json.dumps({
+            "success": True,
+            "status": goal.get("status") if isinstance(goal, dict) else "paused",
+            "message": "当前 Goal 已暂停并保留；本回合结束后不会继续自动 push。",
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "error": str(exc)},
+            ensure_ascii=False,
+        )
+
+
+@mcp.tool()
+async def ccm_resume_goal() -> str:
+    """启用当前 Task 中保留的原生 Codex Goal。
+
+    恢复请求会在当前回合结束并取得安全的 Task 生命周期 owner 后启动；
+    不会创建第二个 Goal，也不会产生一条可见的伪用户消息。
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.patch(
+                _api_url("/native-goal"),
+                headers=_headers(),
+                json={"status": "active"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        return json.dumps({
+            "success": True,
+            "status": "resume_requested" if data.get("queued") else "active",
+            "message": (
+                "Goal 恢复请求已接受；当前回合结束后会继续自主工作。"
+                if data.get("queued")
+                else "Goal 已经处于运行状态。"
+            ),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "error": str(exc)},
+            ensure_ascii=False,
+        )
+
+
+@mcp.tool()
 async def create_monitor(
     description: str,
     context: str = "",
@@ -665,10 +742,12 @@ if __name__ == "__main__":
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--api-base", default="http://localhost:8000")
     parser.add_argument("--auth-token", default="")
+    parser.add_argument("--enable-goal-control", action="store_true")
     args = parser.parse_args()
 
     _TASK_ID = args.task_id
     _API_BASE = args.api_base
     _AUTH_TOKEN = args.auth_token
+    _configure_goal_control_tools(args.enable_goal_control)
 
     mcp.run(transport="stdio")

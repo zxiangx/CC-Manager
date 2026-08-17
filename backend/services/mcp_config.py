@@ -43,6 +43,12 @@ CCM_SKILLS_TOOLS = (
     "create_sub_agent",
     "check_sub_agents",
     "stop_sub_agent",
+    "ccm_pause_goal",
+    "ccm_resume_goal",
+)
+CCM_GOAL_CONTROL_TOOLS = (
+    "ccm_pause_goal",
+    "ccm_resume_goal",
 )
 CCM_MONITOR_AGENT_TOOLS = (
     "report_status",
@@ -61,6 +67,7 @@ CCM_SUB_AGENT_CONTROLLER_TOOLS = (
     "create_sub_agent",
     "check_sub_agents",
     "stop_sub_agent",
+    *CCM_GOAL_CONTROL_TOOLS,
 )
 
 
@@ -145,6 +152,12 @@ def build_mcp_server_specs(
     """
 
     enabled_tools = CCM_SKILLS_TOOLS
+    if (provider or "claude").lower() != "codex":
+        enabled_tools = tuple(
+            tool
+            for tool in enabled_tools
+            if tool not in CCM_GOAL_CONTROL_TOOLS
+        )
     if (
         (provider or "claude").lower() == "codex"
         and not codex_monitor_enabled
@@ -159,11 +172,15 @@ def build_mcp_server_specs(
             if tool not in CODEX_UNSUPPORTED_MAIN_TOOLS
         )
 
+    context_args = ["--task-id", str(task_id)]
+    if (provider or "claude").lower() == "codex":
+        context_args.append("--enable-goal-control")
+
     return (
         _ccm_server_spec(
             name="ccm_skills",
             module="backend.mcp.ccm_skills_server",
-            context_args=("--task-id", str(task_id)),
+            context_args=tuple(context_args),
             enabled_tools=enabled_tools,
             api_base=api_base,
         ),
@@ -209,8 +226,33 @@ def build_sub_agent_controller_mcp_server_specs(
         _ccm_server_spec(
             name="ccm_skills",
             module="backend.mcp.ccm_skills_server",
-            context_args=("--task-id", str(task_id)),
+            context_args=(
+                "--task-id",
+                str(task_id),
+                "--enable-goal-control",
+            ),
             enabled_tools=CCM_SUB_AGENT_CONTROLLER_TOOLS,
+            api_base=api_base,
+        ),
+    )
+
+
+def build_goal_control_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+) -> tuple[McpServerSpec, ...]:
+    """Expose only retained native-Goal pause/resume to a Codex parent."""
+
+    return (
+        _ccm_server_spec(
+            name="ccm_skills",
+            module="backend.mcp.ccm_skills_server",
+            context_args=(
+                "--task-id",
+                str(task_id),
+                "--enable-goal-control",
+            ),
+            enabled_tools=CCM_GOAL_CONTROL_TOOLS,
             api_base=api_base,
         ),
     )

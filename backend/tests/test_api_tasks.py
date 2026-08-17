@@ -137,6 +137,183 @@ async def test_cancel_native_goal_stops_then_clears_and_verifies(
 
 
 @pytest.mark.asyncio
+async def test_pause_native_goal_stops_current_turn_and_preserves_goal(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Goal pause",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-goal-pause"
+        await db.commit()
+
+    active = {"threadId": "thread-goal-pause", "status": "active"}
+    paused = {"threadId": "thread-goal-pause", "status": "paused"}
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-goal-home",
+        ),
+        patch(
+            "backend.api.tasks._stop_task_session_local_impl",
+            new_callable=AsyncMock,
+            return_value={"ok": True, "stopped": True},
+        ) as stop_goal_turn,
+        patch.object(
+            backend.main.instance_manager,
+            "read_codex_thread_goal",
+            new_callable=AsyncMock,
+            side_effect=[active, paused],
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "pause_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=paused,
+        ) as pause_goal,
+    ):
+        response = await client.patch(
+            f"/api/tasks/{task_id}/native-goal",
+            json={"status": "paused"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "goal": paused,
+        "accepted": True,
+        "queued": False,
+    }
+    stop_goal_turn.assert_awaited_once()
+    pause_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-pause",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_pause_keeps_current_turn_alive(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Agent Goal pause",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-agent-pause"
+        await db.commit()
+
+    active = {"threadId": "thread-agent-pause", "status": "active"}
+    paused = {"threadId": "thread-agent-pause", "status": "paused"}
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-goal-home",
+        ),
+        patch(
+            "backend.api.tasks._stop_task_session_local_impl",
+            new_callable=AsyncMock,
+        ) as stop_goal_turn,
+        patch.object(
+            backend.main.instance_manager,
+            "read_codex_thread_goal",
+            new_callable=AsyncMock,
+            side_effect=[active, paused],
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "pause_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=paused,
+        ),
+    ):
+        response = await client.patch(
+            f"/api/tasks/{task_id}/native-goal",
+            json={
+                "status": "paused",
+                "finish_current_turn": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["goal"]["status"] == "paused"
+    stop_goal_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_native_goal_uses_invisible_control_continuation(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Goal resume",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-goal-resume"
+        await db.commit()
+
+    blocked = {"threadId": "thread-goal-resume", "status": "blocked"}
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-goal-home",
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "read_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=blocked,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "enqueue_message",
+            new_callable=AsyncMock,
+        ) as enqueue,
+    ):
+        response = await client.patch(
+            f"/api/tasks/{task_id}/native-goal",
+            json={"status": "active"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "goal": blocked,
+        "accepted": True,
+        "queued": True,
+    }
+    assert enqueue.await_args.kwargs["source"] == "goal-control:resume"
+    assert enqueue.await_args.kwargs["resume_native_goal"] is True
+    assert "source_log_id" not in enqueue.await_args.kwargs
+    assert enqueue.await_args.kwargs["expected_task_routing"] == (
+        "codex",
+        "gpt-5.6-sol",
+        "default",
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_task_wakes_dispatcher_after_commit(client):
     """New work should not wait for the dispatcher's 2-second safety poll."""
     from backend.main import dispatcher

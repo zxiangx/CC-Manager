@@ -2271,6 +2271,7 @@ async def test_live_codex_quota_rejects_active_ephemeral_exec(tmp_path):
     ("operation", "registry_method"),
     [
         ("read", "read_thread"),
+        ("compact", "compact_thread"),
         ("create", "create_thread"),
         ("fork", "fork_thread"),
         ("delete", "delete_thread"),
@@ -2292,6 +2293,8 @@ async def test_codex_thread_operations_reject_exec_owned_home(
     ):
         if operation == "read":
             await im.read_codex_thread(codex_home, "thread-source")
+        elif operation == "compact":
+            await im.compact_codex_thread(codex_home, "thread-source")
         elif operation == "create":
             await im.create_codex_thread(
                 codex_home,

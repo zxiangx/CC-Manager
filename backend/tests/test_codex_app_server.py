@@ -5335,6 +5335,33 @@ async def test_read_and_fork_thread_use_native_app_server_protocol():
 
 
 @pytest.mark.asyncio
+async def test_compact_thread_uses_native_async_compaction_protocol():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={})
+
+    await server.compact_thread("thread-compact")
+
+    server.ensure_started.assert_awaited_once()
+    server._request.assert_awaited_once_with(
+        "thread/compact/start",
+        {"threadId": "thread-compact"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_thread_rejects_known_active_native_work():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    runtime = server._runtime_state_for("thread-compact")
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-compacting")
+
+    with pytest.raises(CodexAppServerBusyError, match="active native work"):
+        await server.compact_thread("thread-compact")
+
+
+@pytest.mark.asyncio
 async def test_create_empty_thread_uses_native_start_without_turn():
     server = CodexAppServer("codex")
     server.ensure_started = AsyncMock()
@@ -6321,6 +6348,7 @@ class _RegistryFakeServer:
         self.steered = []
         self.create_thread_calls = []
         self.recycle_thread_calls = []
+        self.compact_thread_calls = []
         type(self).instances.append(self)
 
     @property
@@ -6349,6 +6377,11 @@ class _RegistryFakeServer:
             "id": thread_id,
             "turns": [{"id": "turn-1", "status": "completed", "items": []}],
         }
+
+    async def compact_thread(self, thread_id):
+        if thread_id in self.active_threads:
+            raise CodexAppServerBusyError(f"{thread_id} is active")
+        self.compact_thread_calls.append(thread_id)
 
     async def create_thread(
         self,
@@ -6876,6 +6909,26 @@ async def test_registry_recycles_exact_thread_without_releasing_owner(
     assert server.recycle_thread_calls == [thread_id]
     assert server.shutdown_count == 0
     assert registry._servers[home] is server
+
+
+@pytest.mark.asyncio
+async def test_registry_compacts_exact_thread_without_releasing_owner(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "manual-compact")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        await registry.compact_thread(home, "thread-compact")
+
+    server = registry._servers[home]
+    assert registry._thread_owners["thread-compact"] == home
+    assert "thread-compact" not in registry._starting_threads
+    assert home not in registry._starting
+    assert server.compact_thread_calls == ["thread-compact"]
 
 
 @pytest.mark.asyncio

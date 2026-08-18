@@ -1349,6 +1349,8 @@ export const api = {
     request<Task>(`/api/tasks/${id}/unread`, { method: 'POST' }),
   stopTaskSession: (id: number) =>
     request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
+  compactTaskContext: (id: number) =>
+    request<{ ok: boolean; started: boolean; thread_id: string }>(`/api/tasks/${id}/compact`, { method: 'POST' }),
   getNativeGoal: (id: number) =>
     request<{ goal: NativeGoal | null }>(`/api/tasks/${id}/native-goal`),
   setNativeGoalStatus: (

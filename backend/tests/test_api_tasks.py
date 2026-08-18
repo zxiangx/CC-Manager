@@ -79,6 +79,88 @@ async def test_native_goal_endpoint_reads_persisted_codex_goal(
 
 
 @pytest.mark.asyncio
+async def test_compact_endpoint_starts_native_codex_compaction(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Compact context",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-compact"
+        await db.commit()
+
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-compact-home",
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "compact_codex_thread",
+            new_callable=AsyncMock,
+        ) as compact_thread,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/compact")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "started": True,
+        "thread_id": "thread-compact",
+    }
+    compact_thread.assert_awaited_once_with(
+        "/tmp/codex-compact-home",
+        "thread-compact",
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_endpoint_maps_busy_native_thread_to_conflict(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.services.codex_app_server import CodexAppServerBusyError
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Busy compact context",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-busy-compact"
+        await db.commit()
+
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-compact-home",
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "compact_codex_thread",
+            new_callable=AsyncMock,
+            side_effect=CodexAppServerBusyError("active turn"),
+        ),
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/compact")
+
+    assert response.status_code == 409
+    assert "thread is busy" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_cancel_native_goal_stops_then_clears_and_verifies(
     client,
     session_factory,

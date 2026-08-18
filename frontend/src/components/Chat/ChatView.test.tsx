@@ -16,6 +16,7 @@ vi.mock('../../api/client', () => ({
     sendTaskChat: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
     stopTaskSession: vi.fn().mockResolvedValue({}),
+    compactTaskContext: vi.fn().mockResolvedValue({ ok: true, started: true, thread_id: 'session-123' }),
     listForkAnchors: vi.fn().mockResolvedValue([]),
     listMessageBranches: vi.fn().mockResolvedValue([]),
     getMessageBranchSession: vi.fn().mockRejectedValue(new Error('unsupported')),
@@ -184,6 +185,44 @@ describe('ChatView', () => {
       injected: true,
     });
     (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    (api.compactTaskContext as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      started: true,
+      thread_id: 'session-123',
+    });
+  });
+
+  describe('native context compaction', () => {
+    it('starts Codex native compaction from the composer toolbar', async () => {
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const compact = await screen.findByTitle('主动压缩 Codex 上下文');
+      await userEvent.click(compact);
+
+      await waitFor(() => {
+        expect(api.compactTaskContext).toHaveBeenCalledWith(1);
+      });
+      expect(await screen.findByText('Codex 已开始主动压缩当前上下文。')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('disables native compaction while the task is running', async () => {
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', status: 'executing' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(await screen.findByTitle('等待当前 turn 和子 Agent 全部结束后再压缩')).toBeDisabled();
+    });
   });
 
   describe('composer keyboard behavior', () => {

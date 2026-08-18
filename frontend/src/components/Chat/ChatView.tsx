@@ -405,7 +405,14 @@ function ChatRuntimeView({
   const [interrupting, setInterrupting] = useState(false);
   const [stillRunning, setStillRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [compacting, setCompacting] = useState(false);
+  const [compactNotice, setCompactNotice] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setCompacting(false);
+    setCompactNotice(null);
+  }, [task.id]);
   const initialDraftUploads = useMemo(
     () => loadStoredUploadResults(draftUploadsKey),
     [draftUploadsKey],
@@ -1909,6 +1916,21 @@ function ChatRuntimeView({
     }
   };
 
+  const handleCompact = async () => {
+    if (compacting || isProcessing) return;
+    setCompacting(true);
+    setCompactNotice(null);
+    setError(null);
+    try {
+      await api.compactTaskContext(task.id);
+      setCompactNotice('Codex 已开始主动压缩当前上下文。');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '无法启动 Codex 上下文压缩');
+    } finally {
+      setCompacting(false);
+    }
+  };
+
   const handleSend = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim();
     const fileUploadResultsForTurn = dedupeUploadResults(
@@ -1920,6 +1942,7 @@ function ChatRuntimeView({
     ]);
     const sendableAttachmentCount = uploadedResultsForTurn.length;
     if (!text && sendableAttachmentCount === 0) return;
+    setCompactNotice(null);
 
     if (fileUpload.isUploading) {
       setError('附件仍在上传，请等待上传完成后再发送。');
@@ -2958,6 +2981,24 @@ function ChatRuntimeView({
             {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
               <ForkButton onClick={openFork} />
             )}
+            {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && codexAppServerEnabled && (
+              <button
+                type="button"
+                onClick={handleCompact}
+                disabled={compacting || isProcessing}
+                className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-gray-500 transition-colors hover:bg-indigo-500/10 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40"
+                title={isProcessing
+                  ? '等待当前 turn 和子 Agent 全部结束后再压缩'
+                  : compacting
+                    ? '正在启动 Codex 上下文压缩'
+                    : '主动压缩 Codex 上下文'}
+              >
+                {compacting
+                  ? <Loader2 size={15} className="animate-spin" />
+                  : <Sparkles size={15} />}
+                <span className="hidden sm:inline">Compact</span>
+              </button>
+            )}
             {/* Message navigation — always visible, right-aligned */}
             <div className="ml-auto flex items-center gap-0.5">
               <button
@@ -2984,6 +3025,11 @@ function ChatRuntimeView({
             </div>
           </div>
           {/* Row 2: full-width input */}
+          {compactNotice && (
+            <div className="text-[10px] leading-relaxed text-emerald-300/85">
+              {compactNotice}
+            </div>
+          )}
           {isProcessing && liveMessageAvailable && (
             codexParentFollowupAvailable ? (
               <div className="text-[10px] leading-relaxed text-amber-300/85">

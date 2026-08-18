@@ -4123,6 +4123,45 @@ class CodexAppServer:
             )
         return thread
 
+    async def compact_thread(self, thread_id: str) -> None:
+        """Start Codex's native asynchronous compaction for one idle thread."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+        runtime = self._thread_runtime.get(thread_id)
+        if (
+            self.has_active_thread(thread_id)
+            or (
+                runtime is not None
+                and (
+                    runtime.status_type == "active"
+                    or bool(runtime.active_turn_ids)
+                )
+            )
+        ):
+            raise CodexAppServerBusyError(
+                f"Codex thread {thread_id} still has active native work"
+            )
+
+        # The RPC acknowledges admission before compaction finishes. Once the
+        # mutating request is on the wire, settle its acknowledgement even if
+        # the HTTP caller disconnects so CCM never reports an unknown outcome.
+        request = asyncio.create_task(self._request(
+            "thread/compact/start",
+            {"threadId": thread_id},
+        ))
+        while not request.done():
+            try:
+                await asyncio.shield(request)
+            except asyncio.CancelledError:
+                continue
+        result = request.result()
+        if result:
+            raise CodexAppServerError(
+                "thread/compact/start returned an unexpected non-empty result"
+            )
+
     async def create_thread(
         self,
         *,
@@ -5934,6 +5973,66 @@ class CodexAppServerRegistry:
                         self._thread_owners.pop(thread_id, None)
 
             await _settle_registry_cleanup(_release_read_thread())
+
+    async def compact_thread(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> None:
+        """Start native compaction while fencing the thread's exact owner."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        home = normalize_codex_home(codex_home)
+        token = object()
+        reserved_owner = False
+
+        async with self._lock:
+            if self._shutdown_requested or home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is unavailable: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._starting_threads or thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server = self._new_server(home)
+                self._servers[home] = server
+            if server.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active CCM turn"
+                )
+            if owner is None:
+                self._thread_owners[thread_id] = home
+                reserved_owner = True
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        accepted = False
+        try:
+            await server.compact_thread(thread_id)
+            accepted = True
+        finally:
+            async def _release_compact_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+                    if (
+                        reserved_owner
+                        and not accepted
+                        and self._thread_owners.get(thread_id) == home
+                    ):
+                        self._thread_owners.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_compact_thread())
 
     @asynccontextmanager
     async def thread_routing_guard(

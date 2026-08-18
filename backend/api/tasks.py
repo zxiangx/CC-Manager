@@ -1018,6 +1018,93 @@ async def get_native_goal(
     return {"goal": goal}
 
 
+@router.post("/{task_id}/compact")
+async def compact_codex_context(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger Codex app-server's native manual context compaction."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(
+        db,
+        task_id,
+        action="compacted its Codex context",
+    )
+    worker_task = await _worker_task_or_none(db, task_id)
+    if worker_task is not None:
+        return await _proxy(
+            worker_task,
+            "POST",
+            f"/api/tasks/{task_id}/compact",
+        )
+    if task.shared_from_id is not None:
+        raise HTTPException(
+            409,
+            "Shared shadow Tasks cannot compact the owner's native Codex thread",
+        )
+
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        task = await db.get(Task, task_id)
+        if task is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, task, db)
+        if task.worker_id is not None or task.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Task routing changed while context compaction was being admitted",
+            )
+        codex_home, thread_id = _require_native_goal_task(task)
+
+        from backend.main import instance_manager
+        from backend.services.codex_app_server import (
+            CodexAppServerBusyError,
+            CodexAppServerRequestError,
+        )
+
+        try:
+            await instance_manager.compact_codex_thread(
+                codex_home,
+                thread_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except CodexAppServerBusyError as exc:
+            raise HTTPException(
+                409,
+                "Codex thread is busy; wait for the current turn and sub-agents to finish",
+            ) from exc
+        except CodexAppServerRequestError as exc:
+            raise HTTPException(
+                409,
+                f"Codex rejected manual context compaction: {exc}",
+            ) from exc
+        except Exception as exc:
+            logger.warning(
+                "Could not start native Codex compaction task=%s thread=%s error=%s",
+                task_id,
+                thread_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                502,
+                "CCM could not start native Codex context compaction",
+            ) from exc
+
+    return {
+        "ok": True,
+        "started": True,
+        "thread_id": thread_id,
+    }
+
+
 def _normalized_task_update_values(updates: dict) -> dict:
     """Mirror TaskQueue's explicit-NULL handling for one fenced UPDATE."""
 

@@ -2001,6 +2001,18 @@ class InstanceManager:
                 registry = self._ensure_codex_app_server_registry()
                 return await registry.read_thread(home, thread_id)
 
+    async def compact_codex_thread(
+        self, codex_home: str, thread_id: str,
+    ) -> None:
+        """Start native manual compaction for one exact Codex thread."""
+
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                await registry.compact_thread(home, thread_id)
+
     async def read_codex_thread_goal(
         self, codex_home: str, thread_id: str,
     ) -> dict | None:

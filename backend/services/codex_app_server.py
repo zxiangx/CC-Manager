@@ -4144,6 +4144,28 @@ class CodexAppServer:
                 f"Codex thread {thread_id} still has active native work"
             )
 
+        # Manual compaction operates on app-server's loaded thread runtime,
+        # not merely the rollout indexed on disk.  After a CCM/app-server
+        # restart a perfectly valid persisted thread is cold, and sending
+        # thread/compact/start directly is rejected as ``thread not found``.
+        # thread/resume is idempotent for an already-loaded thread and gives us
+        # an authoritative status snapshot before the mutating request.
+        resumed = await self._request(
+            "thread/resume",
+            {"threadId": thread_id},
+        )
+        thread = resumed.get("thread") if isinstance(resumed, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise CodexAppServerError(
+                f"thread/resume returned an invalid thread for {thread_id}"
+            )
+        self._known_threads.add(thread_id)
+        _require_idle_thread_status(
+            thread,
+            thread_id=thread_id,
+            operation="manual context compaction",
+        )
+
         # The RPC acknowledges admission before compaction finishes. Once the
         # mutating request is on the wire, settle its acknowledgement even if
         # the HTTP caller disconnects so CCM never reports an unknown outcome.

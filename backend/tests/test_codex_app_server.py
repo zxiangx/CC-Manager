@@ -7,7 +7,7 @@ import signal
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -5338,13 +5338,48 @@ async def test_read_and_fork_thread_use_native_app_server_protocol():
 async def test_compact_thread_uses_native_async_compaction_protocol():
     server = CodexAppServer("codex")
     server.ensure_started = AsyncMock()
-    server._request = AsyncMock(return_value={})
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-compact",
+                "status": {"type": "idle"},
+            },
+        },
+        {},
+    ])
 
     await server.compact_thread("thread-compact")
 
     server.ensure_started.assert_awaited_once()
+    assert server._request.await_args_list == [
+        call(
+            "thread/resume",
+            {"threadId": "thread-compact"},
+        ),
+        call(
+            "thread/compact/start",
+            {"threadId": "thread-compact"},
+        ),
+    ]
+    assert "thread-compact" in server._known_threads
+
+
+@pytest.mark.asyncio
+async def test_compact_thread_rejects_cold_thread_that_resumes_active():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {
+            "id": "thread-compact",
+            "status": {"type": "active"},
+        },
+    })
+
+    with pytest.raises(CodexThreadNotIdleError, match="manual context compaction"):
+        await server.compact_thread("thread-compact")
+
     server._request.assert_awaited_once_with(
-        "thread/compact/start",
+        "thread/resume",
         {"threadId": "thread-compact"},
     )
 

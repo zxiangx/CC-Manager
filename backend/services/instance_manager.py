@@ -23,6 +23,7 @@ from backend.models.task import Task
 from backend.models.log_entry import LogEntry
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
+    context_compaction_notice,
     is_context_window_exceeded,
     read_codex_rollout_last_usage,
 )
@@ -6341,7 +6342,30 @@ class InstanceManager:
                                         task_id,
                                     )
                                 else:
+                                    compact_notice = context_compaction_notice(
+                                        "CCM automatic",
+                                        "CCM summarized a context-overflowed "
+                                        "chat turn before retrying in a new "
+                                        "session.",
+                                    )
+                                    db.add(LogEntry(
+                                        instance_id=instance_id,
+                                        task_id=task_id,
+                                        event_type="system_event",
+                                        role="system",
+                                        content=compact_notice,
+                                        is_error=False,
+                                    ))
                                     await db.commit()
+                                    await self.broadcaster.broadcast(
+                                        f"task:{task_id}",
+                                        {
+                                            "event_type": "system_event",
+                                            "role": "system",
+                                            "content": compact_notice,
+                                            "is_error": False,
+                                        },
+                                    )
                                     from backend.services.dispatcher import PRIORITY_USER
                                     current_message = (
                                         params.get("current_message")
@@ -8270,6 +8294,15 @@ class InstanceManager:
                 "event_type": "thinking",
                 "role": "assistant",
                 "content": text,
+            })
+        elif codex_type == "context.compacted":
+            event.update({
+                "event_type": "system_event",
+                "role": "system",
+                "content": context_compaction_notice(
+                    str(data.get("compact_kind") or "Automatic"),
+                    "Codex compressed the active conversation history.",
+                ),
             })
         elif item_type in {"collab_agent_tool_call", "collabAgentToolCall"}:
             # app-server uses an item-local ``status=completed`` for Codex's

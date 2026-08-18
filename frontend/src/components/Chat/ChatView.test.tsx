@@ -193,6 +193,36 @@ describe('ChatView', () => {
   });
 
   describe('native context compaction', () => {
+    it('renders a durable context-compaction divider prominently', async () => {
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: 701,
+        role: 'system',
+        event_type: 'system_event',
+        content: '[Context compacted · Automatic] Codex compressed the active conversation history.',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-18T07:00:00Z',
+        image_urls: null,
+        attachments: null,
+      }]);
+
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const marker = await screen.findByTestId('context-compaction-marker');
+      expect(marker).toHaveAttribute('role', 'separator');
+      expect(marker).toHaveTextContent('Context compacted · Automatic');
+      expect(marker).toHaveTextContent('Codex compressed the active conversation history.');
+    });
+
     it('starts Codex native compaction from the composer toolbar', async () => {
       render(
         <ChatView

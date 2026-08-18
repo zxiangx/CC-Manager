@@ -28,6 +28,7 @@ from backend.services.task_artifact_contract import (
 )
 from backend.services.codex_pool import CodexPool
 from backend.models.instance import Instance
+from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 
 
@@ -6941,6 +6942,18 @@ async def test_codex_precompact_uses_full_context_tokens(
     assert "[基础当前消息 — 默认最高优先级]\nhi" in launch["prompt"]
     assert launch["current_message"] == "hi"
     assert launch["source_log_id"] == 321
+    async with db_factory() as db:
+        marker = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.content.like(
+                        "[Context compacted · CCM automatic]%"
+                    ),
+                )
+            )
+        ).scalar_one()
+    assert "已自动压缩摘要" in marker.content
 
 
 @pytest.mark.asyncio
@@ -7003,9 +7016,20 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
     assert launch["request_blocked_recovery"] is True
     async with db_factory() as db:
         task = await db.get(Task, task_id)
+        marker = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.content.like(
+                        "[Context compacted · Safe recovery]%"
+                    ),
+                )
+            )
+        ).scalar_one()
         assert task.metadata_["codex_quarantined_sessions"] == ["sess-1"]
         assert "codex_quarantine_reason" not in task.metadata_
         assert "codex_quarantined_session_id" not in task.metadata_
+        assert "quarantined Codex thread" in marker.content
 
 
 @pytest.mark.asyncio

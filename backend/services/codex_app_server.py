@@ -5304,13 +5304,20 @@ class CodexAppServer:
                 item,
             )
             normalized = self._normalize_item(item)
+            if normalized and normalized.get("type") == "context_compaction":
+                context.process.feed({
+                    "type": "context.compacted",
+                    "compact_kind": "Automatic",
+                    "item": normalized,
+                    "turn_id": context.turn_id,
+                })
+                return
             if normalized and normalized.get("type") not in {
                 "user_message",
                 # These are lifecycle metadata, not user-facing completion
                 # events. Passing them to the generic parser would render
                 # misleading ``item.completed`` separators.
                 "sub_agent_activity",
-                "context_compaction",
             }:
                 context.process.feed({
                     "type": "item.completed",

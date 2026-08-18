@@ -121,6 +121,20 @@ async def test_compact_endpoint_starts_native_codex_compaction(
         "thread-compact",
         service_tier="default",
     )
+    async with session_factory() as db:
+        from backend.models.log_entry import LogEntry
+        from sqlalchemy import select
+
+        marker = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.content.like("[Context compacted · Manual]%"),
+                )
+            )
+        ).scalar_one()
+    assert "accepted the manual context compaction request" in marker.content
 
 
 @pytest.mark.asyncio

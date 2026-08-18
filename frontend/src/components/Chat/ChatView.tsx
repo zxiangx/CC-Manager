@@ -3950,6 +3950,29 @@ const MessageBubble = memo(function MessageBubble({
 
   if (message.event_type === 'system_init' || message.event_type === 'process_exit' || message.event_type === 'system_event') {
     const content = message.content || 'system';
+    const compactMatch = content.match(/^\[Context compacted · ([^\]]+)\]\s*(.*)$/s);
+    if (compactMatch) {
+      const [, kind, detail] = compactMatch;
+      return (
+        <div
+          className="my-4 flex items-center gap-3"
+          data-testid="context-compaction-marker"
+          role="separator"
+          aria-label={`Context compacted: ${kind}`}
+        >
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent to-violet-500/70" />
+          <div className="max-w-[85%] rounded-lg border border-violet-400/50 bg-violet-500/15 px-3 py-2 text-center shadow-[0_0_18px_rgba(139,92,246,0.12)]">
+            <div className="flex items-center justify-center gap-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-violet-200">
+              <Sparkles size={13} />
+              Context compacted · {kind}
+            </div>
+            {detail && <div className="mt-1 text-[11px] text-violet-300/75">{detail}</div>}
+            {message.timestamp && <MessageTimestamp timestamp={message.timestamp} className="mt-1" />}
+          </div>
+          <div className="h-px flex-1 bg-gradient-to-l from-transparent to-violet-500/70" />
+        </div>
+      );
+    }
     const isMonitor = content.startsWith('[Monitor') || content.startsWith('[Agent') || content.startsWith('[Sub-Agent');
     if (isMonitor) {
       // Legacy monitor/agent system_events: render with reduced opacity

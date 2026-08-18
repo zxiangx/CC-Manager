@@ -22,6 +22,17 @@ _CONTEXT_LIMIT_MARKERS = (
     "input is too long for the requested model",
 )
 
+CONTEXT_COMPACTION_MARKER_PREFIX = "[Context compacted · "
+
+
+def context_compaction_notice(kind: str, detail: str | None = None) -> str:
+    """Build the durable chat marker recognized by the CCM frontend."""
+
+    notice = f"{CONTEXT_COMPACTION_MARKER_PREFIX}{kind}]"
+    if detail:
+        notice += f" {detail.strip()}"
+    return notice
+
 
 def build_compacted_resume_prompt(
     summary: str,

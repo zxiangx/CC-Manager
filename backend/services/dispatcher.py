@@ -30,6 +30,7 @@ from backend.services.git_config import merge_git_config, settings_to_dict
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
+    context_compaction_notice,
     context_tokens_used,
     is_context_window_exceeded,
 )
@@ -6128,6 +6129,21 @@ class GlobalDispatcher:
                                             ),
                                         )
                                     )
+                                    compact_notice = None
+                                    if compacted.rowcount:
+                                        compact_notice = context_compaction_notice(
+                                            "CCM automatic",
+                                            "CCM summarized a context-overflowed "
+                                            "turn before retrying in a new session.",
+                                        )
+                                        db.add(LogEntry(
+                                            instance_id=instance_id,
+                                            task_id=task.id,
+                                            event_type="system_event",
+                                            role="system",
+                                            content=compact_notice,
+                                            is_error=False,
+                                        ))
                                     await db.commit()
                                     if compacted.rowcount:
                                         await self.broadcaster.broadcast("tasks", {
@@ -6136,6 +6152,15 @@ class GlobalDispatcher:
                                             "new_status": "pending",
                                             "instance_id": instance_id,
                                         })
+                                        await self.broadcaster.broadcast(
+                                            f"task:{task.id}",
+                                            {
+                                                "event_type": "system_event",
+                                                "role": "system",
+                                                "content": compact_notice,
+                                                "is_error": False,
+                                            },
+                                        )
                                     return
                     except Exception:
                         logger.exception(
@@ -11862,6 +11887,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 recovered_session_id = recovery_session_id
                 recovered_context_usage = task.context_window_usage
                 recovered_prompt = msg.prompt
+                recovery_compaction_notice = None
                 if cloned:
                     recovered_session_id = cloned["session_id"]
                     logger.info(
@@ -11881,6 +11907,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     recovered_session_id = None
                     recovered_context_usage = None
                     if summary:
+                        recovery_compaction_notice = context_compaction_notice(
+                            "Safe recovery",
+                            (
+                                "CCM summarized the quarantined Codex thread "
+                                "before starting a replacement session."
+                                if quarantined_codex_session
+                                else (
+                                    "CCM summarized the unavailable native "
+                                    "session before starting a replacement."
+                                )
+                            ),
+                        )
                         if quarantined_codex_session:
                             summary = (
                                 "## CCM 安全恢复说明\n"
@@ -11993,7 +12031,26 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     current.metadata_ = clear_active_quarantine(
                         current.metadata_
                     )
+                if recovery_compaction_notice:
+                    db.add(LogEntry(
+                        instance_id=recovery_instance_id,
+                        task_id=task_id,
+                        event_type="system_event",
+                        role="system",
+                        content=recovery_compaction_notice,
+                        is_error=False,
+                    ))
                 await db.commit()
+                if recovery_compaction_notice:
+                    await self.broadcaster.broadcast(
+                        f"task:{task_id}",
+                        {
+                            "event_type": "system_event",
+                            "role": "system",
+                            "content": recovery_compaction_notice,
+                            "is_error": False,
+                        },
+                    )
                 msg.prompt = recovered_prompt
                 if recovered_session_id is None:
                     msg.allow_new_session = True
@@ -12161,8 +12218,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         task.context_window_usage = None
                         # 在聊天里给用户留一条可见的压缩提示（落库 + 实时广播）
                         notice = (
-                            f"⚡ 上下文已达 {utilization * 100:.0f}%"
-                            f"（{used_tokens:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
+                            context_compaction_notice(
+                                "CCM automatic",
+                                f"上下文已达 {utilization * 100:.0f}%",
+                            )
+                            + f"（{used_tokens:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
                             f"已自动压缩摘要并开启新会话延续上下文"
                         )
                         db.add(LogEntry(

@@ -17,6 +17,7 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.task import Task
 from backend.models.instance import Instance
+from backend.models.log_entry import LogEntry
 from backend.schemas.task import (
     TaskActionRequest,
     TaskCreate,
@@ -34,6 +35,7 @@ from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
 from backend.services.codex_models import validate_codex_service_tier
+from backend.services.context_compaction import context_compaction_notice
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
     _finish_despite_cancellation as _finish_task_operation,
@@ -1098,6 +1100,33 @@ async def compact_codex_context(
                 502,
                 "CCM could not start native Codex context compaction",
             ) from exc
+
+        notice = context_compaction_notice(
+            "Manual",
+            "Codex accepted the manual context compaction request.",
+        )
+        marker = LogEntry(
+            instance_id=task.instance_id,
+            task_id=task_id,
+            event_type="system_event",
+            role="system",
+            content=notice,
+            is_error=False,
+        )
+        db.add(marker)
+        await db.commit()
+        await db.refresh(marker)
+        await instance_manager.broadcaster.broadcast(
+            f"task:{task_id}",
+            {
+                "id": marker.id,
+                "event_type": "system_event",
+                "role": "system",
+                "content": notice,
+                "is_error": False,
+                "timestamp": marker.timestamp.isoformat(),
+            },
+        )
 
     return {
         "ok": True,

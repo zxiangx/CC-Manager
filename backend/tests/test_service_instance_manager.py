@@ -643,6 +643,26 @@ def test_parse_codex_metadata_item_completion_is_ignored(item_type):
     assert event is None
 
 
+def test_parse_codex_context_compacted_is_prominent_system_marker():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "context.compacted",
+        "compact_kind": "Automatic",
+        "item": {
+            "type": "context_compaction",
+            "id": "compact-1",
+        },
+    }))
+
+    assert event["event_type"] == "system_event"
+    assert event["role"] == "system"
+    assert event["content"].startswith(
+        "[Context compacted · Automatic]"
+    )
+    assert event["is_error"] is False
+
+
 @pytest.mark.parametrize(
     ("item_type", "extra"),
     [

@@ -4361,6 +4361,48 @@ async def test_notifications_stream_delta_and_finish_process():
 
 
 @pytest.mark.asyncio
+async def test_native_context_compaction_emits_durable_marker_event():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-compact", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-compact"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="hi", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=1,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-compact",
+        "turnId": "turn-compact",
+        "item": {
+            "type": "contextCompaction",
+            "id": "compact-1",
+        },
+    })
+    marker = json.loads(await process.stdout.readline())
+
+    assert marker == {
+        "type": "context.compacted",
+        "compact_kind": "Automatic",
+        "item": {
+            "type": "context_compaction",
+            "id": "compact-1",
+        },
+        "turn_id": "turn-compact",
+    }
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-compact",
+        "turn": {"id": "turn-compact", "status": "completed"},
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
 async def test_todo_list_updates_are_forwarded_with_exact_turn_identity():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -4494,6 +4536,7 @@ async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
     assert [line["type"] for line in lines] == [
         "item.started",
         "item.completed",
+        "context.compacted",
         "turn.completed",
     ]
     assert lines[0]["item"] == {
@@ -4509,7 +4552,9 @@ async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
     }
     assert lines[1]["item"]["type"] == "collab_agent_tool_call"
     assert lines[1]["item"]["status"] == "completed"
-    assert lines[2]["type"] == "turn.completed"
+    assert lines[2]["compact_kind"] == "Automatic"
+    assert lines[2]["item"]["type"] == "context_compaction"
+    assert lines[3]["type"] == "turn.completed"
     assert "child-1" not in server._contexts_by_descendant
 
 

@@ -406,6 +406,10 @@ class QueuedMessage:
     # Goal-control resume is an explicit management action, unlike ordinary
     # chat. It may reactivate a retained paused Goal; normal messages must not.
     resume_native_goal: bool = field(compare=False, default=False)
+    # True only for the one automatic replacement turn created after a Codex
+    # Request blocked terminal.  InstanceManager carries this into exact launch
+    # bookkeeping so another block cannot create an unattended retry loop.
+    request_blocked_recovery: bool = field(compare=False, default=False)
     # Default monitor/sub-agent reports may arrive while the initial Task turn
     # owns an active generation but has not persisted its native session id.
     # They must wait for that session instead of starting a duplicate turn.
@@ -11023,6 +11027,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         queue_timestamp: float | None = None,
         allow_new_session: bool | None = None,
         resume_native_goal: bool = False,
+        request_blocked_recovery: bool = False,
     ) -> bool:
         """Enqueue a message for the main agent of a task.
 
@@ -11060,6 +11065,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 else allow_new_session
             ),
             resume_native_goal=resume_native_goal,
+            request_blocked_recovery=request_blocked_recovery,
             defer_for_initial_session=(
                 allow_new_session is None and internal_session_report
             ),
@@ -12202,6 +12208,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 current_message=msg.current_message,
                 queue_timestamp=msg.timestamp,
                 resume_native_goal=msg.resume_native_goal,
+                request_blocked_recovery=msg.request_blocked_recovery,
             )
             inst_id = inst.id
             task_provider = (task.provider or "claude").lower()

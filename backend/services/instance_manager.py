@@ -834,6 +834,7 @@ class InstanceManager:
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
         resume_native_goal: bool = False,
+        request_blocked_recovery: bool = False,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -921,6 +922,9 @@ class InstanceManager:
                                 queue_timestamp=queue_timestamp,
                                 codex_service_tier=codex_service_tier,
                                 resume_native_goal=resume_native_goal,
+                                request_blocked_recovery=(
+                                    request_blocked_recovery
+                                ),
                             )
                     except BaseException:
                         current_process = (
@@ -999,6 +1003,7 @@ class InstanceManager:
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
         resume_native_goal: bool = False,
+        request_blocked_recovery: bool = False,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -1333,6 +1338,9 @@ class InstanceManager:
                         disable_autonomous_features=pr_review_task,
                         tools_disabled=pr_review_task,
                         resume_native_goal=resume_native_goal,
+                        request_blocked_recovery=(
+                            request_blocked_recovery
+                        ),
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1724,6 +1732,7 @@ class InstanceManager:
                 "queue_timestamp": queue_timestamp,
                 "codex_service_tier": codex_service_tier,
                 "resume_native_goal": resume_native_goal,
+                "request_blocked_recovery": request_blocked_recovery,
             }
 
         return await self._persist_and_track_launch(
@@ -2210,6 +2219,7 @@ class InstanceManager:
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
         resume_native_goal: bool = False,
+        request_blocked_recovery: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -2263,6 +2273,7 @@ class InstanceManager:
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
                 "codex_service_tier": codex_service_tier,
+                "request_blocked_recovery": request_blocked_recovery,
             }
 
         try:
@@ -6239,6 +6250,8 @@ class InstanceManager:
                         ]
                     if params.get("resume_native_goal") is True:
                         retry_kwargs["resume_native_goal"] = True
+                    if params.get("request_blocked_recovery") is True:
+                        retry_kwargs["request_blocked_recovery"] = True
                     await enqueuer(**retry_kwargs)
                 # Still clean up instance below so it's available for the retry
                 # fall through to normal cleanup
@@ -6367,6 +6380,13 @@ class InstanceManager:
                                         )
                                     if params.get("resume_native_goal") is True:
                                         retry_kwargs["resume_native_goal"] = True
+                                    if (
+                                        params.get("request_blocked_recovery")
+                                        is True
+                                    ):
+                                        retry_kwargs[
+                                            "request_blocked_recovery"
+                                        ] = True
                                     await dispatcher.enqueue_message(
                                         **retry_kwargs
                                     )
@@ -6420,6 +6440,7 @@ class InstanceManager:
             capacity_retry_superseded
             or self._chat_terminal_succeeded(process, exit_code)
         )
+        launch_params = self._launch_params.get(instance_id) or {}
         from backend.services.codex_recovery import (
             is_request_blocked,
             quarantine_metadata,
@@ -6428,6 +6449,10 @@ class InstanceManager:
             task_id
             and chat_initiated
             and is_request_blocked(provider, failure_text)
+        )
+        request_blocked_auto_recovery = False
+        request_blocked_recovery_already_attempted = bool(
+            launch_params.get("request_blocked_recovery")
         )
         # A provider-level rejection does not mean the reusable CCM worker is
         # unhealthy. Keep the slot available while the Task records a failed,
@@ -6510,7 +6535,14 @@ class InstanceManager:
                             task_values.update(
                                 error_message=(
                                     "Request blocked. CCM 已隔离该 Codex thread；"
-                                    "下一条消息会从安全摘要自动创建新 thread。"
+                                    + (
+                                        "自动恢复也被阻断，请发送新指令后重试。"
+                                        if request_blocked_recovery_already_attempted
+                                        else (
+                                            "正在从安全摘要自动创建新 thread "
+                                            "继续执行。"
+                                        )
+                                    )
                                 ),
                                 metadata_=quarantine_metadata(
                                     current_task_generation.metadata_,
@@ -6528,6 +6560,10 @@ class InstanceManager:
                     if not task_update.rowcount:
                         await db.rollback()
                         return
+                    request_blocked_auto_recovery = bool(
+                        recoverable_codex_block
+                        and not request_blocked_recovery_already_attempted
+                    )
                     if final_status == "failed" and not _fatal_provider_error:
                         process_label = self._provider_process_label(
                             instance_id, provider
@@ -6831,6 +6867,63 @@ class InstanceManager:
         if owns_instance_turn():
             self._launch_params.pop(instance_id, None)
             self._codex_exec_homes.pop(instance_id, None)
+        if request_blocked_auto_recovery:
+            await self._enqueue_request_blocked_recovery(
+                task_id,
+                launch_params,
+            )
+
+    async def _enqueue_request_blocked_recovery(
+        self,
+        task_id: int,
+        launch_params: dict,
+    ) -> bool:
+        """Queue one safe replacement turn after a poisoned Codex response."""
+
+        enqueuer = self.task_message_enqueuer
+        if enqueuer is None:
+            logger.warning(
+                "Task %d hit Request blocked but no task message enqueuer "
+                "is configured",
+                task_id,
+            )
+            return False
+        from backend.services.codex_recovery import (
+            REQUEST_BLOCKED_RECOVERY_PROMPT,
+        )
+        from backend.services.dispatcher import PRIORITY_USER
+
+        kwargs = {
+            "task_id": task_id,
+            "prompt": REQUEST_BLOCKED_RECOVERY_PROMPT,
+            "priority": PRIORITY_USER,
+            "source": "harness:request-blocked-recovery",
+            "current_message": REQUEST_BLOCKED_RECOVERY_PROMPT,
+            "allow_new_session": True,
+            "request_blocked_recovery": True,
+        }
+        if isinstance(launch_params.get("enabled_skills"), dict):
+            kwargs["command_skills"] = dict(
+                launch_params["enabled_skills"]
+            )
+        if isinstance(launch_params.get("model"), str):
+            kwargs["model_override"] = launch_params["model"]
+        try:
+            enqueued = await enqueuer(**kwargs)
+        except Exception:
+            logger.exception(
+                "Failed to enqueue Request-blocked automatic recovery for "
+                "task %d",
+                task_id,
+            )
+            return False
+        if enqueued:
+            logger.warning(
+                "Task %d Request blocked; enqueued one-shot safe-session "
+                "recovery",
+                task_id,
+            )
+        return bool(enqueued)
 
     async def _try_chat_transient_retry(
         self, instance_id: int, task_id: int, exit_code: int, stderr_text: str,
@@ -7089,6 +7182,9 @@ class InstanceManager:
                 resume_native_goal=bool(
                     params.get("resume_native_goal", False)
                 ),
+                request_blocked_recovery=bool(
+                    params.get("request_blocked_recovery", False)
+                ),
             )
             return True
 
@@ -7179,6 +7275,8 @@ class InstanceManager:
                 ]
             if params.get("resume_native_goal") is True:
                 requeue_kwargs["resume_native_goal"] = True
+            if params.get("request_blocked_recovery") is True:
+                requeue_kwargs["request_blocked_recovery"] = True
             await dispatcher.enqueue_message(**requeue_kwargs)
             logger.warning(
                 "%s chat task %d %s routing failed; requeued original "
@@ -7279,6 +7377,9 @@ class InstanceManager:
                     ),
                     resume_native_goal=bool(
                         params.get("resume_native_goal", False)
+                    ),
+                    request_blocked_recovery=bool(
+                        params.get("request_blocked_recovery", False)
                     ),
                 )
                 return True
@@ -7419,6 +7520,9 @@ class InstanceManager:
                 ),
                 resume_native_goal=bool(
                     params.get("resume_native_goal", False)
+                ),
+                request_blocked_recovery=bool(
+                    params.get("request_blocked_recovery", False)
                 ),
             )
             return True

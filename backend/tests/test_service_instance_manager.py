@@ -7641,6 +7641,11 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
 async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     db_factory,
 ):
+    from backend.services.codex_recovery import (
+        REQUEST_BLOCKED_RECOVERY_PROMPT,
+    )
+    from backend.services.dispatcher import PRIORITY_USER
+
     async with db_factory() as db:
         inst = Instance(name="codex-request-blocked-inst", status="running")
         task = Task(
@@ -7676,7 +7681,13 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
         db_factory,
         MagicMock(broadcast=AsyncMock()),
     )
+    manager.task_message_enqueuer = AsyncMock(return_value=True)
     manager.processes[inst_id] = process
+    manager._launch_params[inst_id] = {
+        "model": "gpt-5.6-sol",
+        "enabled_skills": {"sub-agent": True},
+        "request_blocked_recovery": False,
+    }
 
     await manager._consume_output(
         inst_id,
@@ -7694,9 +7705,79 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     assert task.metadata_["codex_quarantine_reason"] == "request_blocked"
     assert task.metadata_["codex_quarantined_session_id"] == "poisoned-thread"
     assert task.metadata_["codex_quarantined_sessions"] == ["poisoned-thread"]
-    assert "下一条消息" in task.error_message
+    assert "正在从安全摘要" in task.error_message
     assert inst.status == "idle"
     assert inst.current_task_id is None
+    manager.task_message_enqueuer.assert_awaited_once_with(
+        task_id=task_id,
+        prompt=REQUEST_BLOCKED_RECOVERY_PROMPT,
+        priority=PRIORITY_USER,
+        source="harness:request-blocked-recovery",
+        current_message=REQUEST_BLOCKED_RECOVERY_PROMPT,
+        allow_new_session=True,
+        request_blocked_recovery=True,
+        command_skills={"sub-agent": True},
+        model_override="gpt-5.6-sol",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_request_blocked_auto_recovery_is_one_shot(db_factory):
+    async with db_factory() as db:
+        inst = Instance(name="codex-recovery-blocked-inst", status="running")
+        task = Task(
+            title="codex recovery blocked task",
+            description="d",
+            status="executing",
+            provider="codex",
+            session_id="replacement-thread",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        inst.current_task_id = task.id
+        await db.commit()
+        inst_id, task_id = inst.id, task.id
+
+    process = _make_mock_process(returncode=0)
+    output = iter([
+        json.dumps({
+            "type": "turn.failed",
+            "error": {"message": "Request blocked."},
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.task_message_enqueuer = AsyncMock(return_value=True)
+    manager.processes[inst_id] = process
+    manager._launch_params[inst_id] = {
+        "request_blocked_recovery": True,
+    }
+
+    await manager._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        inst = await db.get(Instance, inst_id)
+
+    assert task.status == "failed"
+    assert task.metadata_["codex_quarantine_reason"] == "request_blocked"
+    assert "自动恢复也被阻断" in task.error_message
+    assert inst.status == "idle"
+    manager.task_message_enqueuer.assert_not_awaited()
 
 
 @pytest.mark.asyncio

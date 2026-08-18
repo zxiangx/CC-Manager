@@ -6978,6 +6978,7 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
     clone = AsyncMock()
     monkeypatch.setattr(tasks_mod, "_clone_session", clone)
     d._compact_session = AsyncMock(return_value="bounded conversation summary")
+    msg.request_blocked_recovery = True
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         task.provider = "codex"
@@ -6999,6 +7000,7 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
     assert "CCM 安全恢复说明" in launch["prompt"]
     assert "bounded conversation summary" in launch["prompt"]
     assert launch["current_message"] == "hi"
+    assert launch["request_blocked_recovery"] is True
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         assert task.metadata_["codex_quarantined_sessions"] == ["sess-1"]

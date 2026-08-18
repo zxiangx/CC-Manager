@@ -9,6 +9,10 @@ QUARANTINE_REASON_KEY = "codex_quarantine_reason"
 QUARANTINED_SESSION_KEY = "codex_quarantined_session_id"
 QUARANTINED_SESSIONS_KEY = "codex_quarantined_sessions"
 REQUEST_BLOCKED_REASON = "request_blocked"
+REQUEST_BLOCKED_RECOVERY_PROMPT = (
+    "The content returned by your previous request caused a Request blocked "
+    "error. Please use a different approach and continue."
+)
 
 
 def is_request_blocked(provider: str | None, message: object) -> bool:

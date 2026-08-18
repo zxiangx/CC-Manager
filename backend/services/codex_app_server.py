@@ -4123,11 +4123,22 @@ class CodexAppServer:
             )
         return thread
 
-    async def compact_thread(self, thread_id: str) -> None:
+    async def compact_thread(
+        self,
+        thread_id: str,
+        *,
+        service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
+    ) -> None:
         """Start Codex's native asynchronous compaction for one idle thread."""
 
         if not thread_id:
             raise ValueError("thread_id is required")
+        service_tier = normalize_codex_service_tier(service_tier)
+        rpc_service_tier = (
+            CODEX_SERVICE_TIER_PRIORITY
+            if service_tier == CODEX_SERVICE_TIER_PRIORITY
+            else None
+        )
         await self.ensure_started()
         runtime = self._thread_runtime.get(thread_id)
         if (
@@ -4150,9 +4161,25 @@ class CodexAppServer:
         # thread/compact/start directly is rejected as ``thread not found``.
         # thread/resume is idempotent for an already-loaded thread and gives us
         # an authoritative status snapshot before the mutating request.
+        actual_tier_proxy = self._actual_tier_proxy
+        if (
+            self._require_actual_tier_proof
+            and (
+                actual_tier_proxy is None
+                or not actual_tier_proxy.is_alive
+            )
+        ):
+            raise CodexServiceTierUnavailableError(
+                "Codex actual service-tier proxy is unavailable before "
+                "manual context compaction"
+            )
+
         resumed = await self._request(
             "thread/resume",
-            {"threadId": thread_id},
+            {
+                "threadId": thread_id,
+                "serviceTier": rpc_service_tier,
+            },
         )
         thread = resumed.get("thread") if isinstance(resumed, dict) else None
         if not isinstance(thread, dict) or thread.get("id") != thread_id:
@@ -4165,6 +4192,33 @@ class CodexAppServer:
             thread_id=thread_id,
             operation="manual context compaction",
         )
+        effective_service_tier = _canonical_app_server_service_tier(
+            resumed.get("serviceTier")
+            if isinstance(resumed, dict)
+            else None
+        )
+        if effective_service_tier != rpc_service_tier:
+            effective_service_tier = await self._update_loaded_thread_service_tier(
+                thread_id,
+                rpc_service_tier,
+            )
+        if effective_service_tier != rpc_service_tier:
+            raise CodexServiceTierUnavailableError(
+                "Codex did not admit the requested service tier before "
+                "manual context compaction"
+            )
+        if actual_tier_proxy is not None:
+            try:
+                # Native compaction starts its own hidden model turn. Register
+                # the root lineage before the async RPC so the loopback proof
+                # proxy can admit that request even though CCM has no ordinary
+                # TurnProcess adapter for it.
+                actual_tier_proxy.set_thread_tier(thread_id, service_tier)
+            except CodexTierProofError as exc:
+                raise CodexServiceTierUnavailableError(
+                    "Codex service tier could not be fenced before manual "
+                    f"context compaction: {exc}"
+                ) from exc
 
         # The RPC acknowledges admission before compaction finishes. Once the
         # mutating request is on the wire, settle its acknowledgement even if
@@ -6000,6 +6054,8 @@ class CodexAppServerRegistry:
         self,
         codex_home: str | os.PathLike[str] | None,
         thread_id: str,
+        *,
+        service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
     ) -> None:
         """Start native compaction while fencing the thread's exact owner."""
 
@@ -6039,7 +6095,10 @@ class CodexAppServerRegistry:
 
         accepted = False
         try:
-            await server.compact_thread(thread_id)
+            await server.compact_thread(
+                thread_id,
+                service_tier=service_tier,
+            )
             accepted = True
         finally:
             async def _release_compact_thread() -> None:

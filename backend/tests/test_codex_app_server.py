@@ -5354,7 +5354,10 @@ async def test_compact_thread_uses_native_async_compaction_protocol():
     assert server._request.await_args_list == [
         call(
             "thread/resume",
-            {"threadId": "thread-compact"},
+            {
+                "threadId": "thread-compact",
+                "serviceTier": None,
+            },
         ),
         call(
             "thread/compact/start",
@@ -5380,7 +5383,60 @@ async def test_compact_thread_rejects_cold_thread_that_resumes_active():
 
     server._request.assert_awaited_once_with(
         "thread/resume",
-        {"threadId": "thread-compact"},
+        {
+            "threadId": "thread-compact",
+            "serviceTier": None,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_thread_registers_hidden_turn_with_actual_tier_proxy():
+    server = CodexAppServer(
+        "codex",
+        actual_tier_proxy_route=CodexTierProxyRoute(
+            "https://upstream.example/v1",
+        ),
+        require_actual_tier_proof=True,
+    )
+    server.ensure_started = AsyncMock()
+    proxy = SimpleNamespace(
+        is_alive=True,
+        set_thread_tier=MagicMock(),
+    )
+    server._actual_tier_proxy = proxy
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-compact",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "priority",
+        },
+        {},
+    ])
+
+    await server.compact_thread(
+        "thread-compact",
+        service_tier="priority",
+    )
+
+    assert server._request.await_args_list == [
+        call(
+            "thread/resume",
+            {
+                "threadId": "thread-compact",
+                "serviceTier": "priority",
+            },
+        ),
+        call(
+            "thread/compact/start",
+            {"threadId": "thread-compact"},
+        ),
+    ]
+    proxy.set_thread_tier.assert_called_once_with(
+        "thread-compact",
+        "priority",
     )
 
 
@@ -6413,10 +6469,10 @@ class _RegistryFakeServer:
             "turns": [{"id": "turn-1", "status": "completed", "items": []}],
         }
 
-    async def compact_thread(self, thread_id):
+    async def compact_thread(self, thread_id, *, service_tier="default"):
         if thread_id in self.active_threads:
             raise CodexAppServerBusyError(f"{thread_id} is active")
-        self.compact_thread_calls.append(thread_id)
+        self.compact_thread_calls.append((thread_id, service_tier))
 
     async def create_thread(
         self,
@@ -6957,13 +7013,17 @@ async def test_registry_compacts_exact_thread_without_releasing_owner(
         "backend.services.codex_app_server.CodexAppServer",
         _RegistryFakeServer,
     ):
-        await registry.compact_thread(home, "thread-compact")
+        await registry.compact_thread(
+            home,
+            "thread-compact",
+            service_tier="priority",
+        )
 
     server = registry._servers[home]
     assert registry._thread_owners["thread-compact"] == home
     assert "thread-compact" not in registry._starting_threads
     assert home not in registry._starting
-    assert server.compact_thread_calls == ["thread-compact"]
+    assert server.compact_thread_calls == [("thread-compact", "priority")]
 
 
 @pytest.mark.asyncio

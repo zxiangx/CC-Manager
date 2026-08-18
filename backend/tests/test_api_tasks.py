@@ -119,6 +119,7 @@ async def test_compact_endpoint_starts_native_codex_compaction(
     compact_thread.assert_awaited_once_with(
         "/tmp/codex-compact-home",
         "thread-compact",
+        service_tier="default",
     )
 
 

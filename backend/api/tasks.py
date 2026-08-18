@@ -1073,6 +1073,7 @@ async def compact_codex_context(
             await instance_manager.compact_codex_thread(
                 codex_home,
                 thread_id,
+                service_tier=task.codex_service_tier or "default",
             )
         except asyncio.CancelledError:
             raise

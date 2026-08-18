@@ -2002,7 +2002,11 @@ class InstanceManager:
                 return await registry.read_thread(home, thread_id)
 
     async def compact_codex_thread(
-        self, codex_home: str, thread_id: str,
+        self,
+        codex_home: str,
+        thread_id: str,
+        *,
+        service_tier: str = "default",
     ) -> None:
         """Start native manual compaction for one exact Codex thread."""
 
@@ -2011,7 +2015,11 @@ class InstanceManager:
         ):
             async with self.codex_home_app_server_guard(codex_home) as home:
                 registry = self._ensure_codex_app_server_registry()
-                await registry.compact_thread(home, thread_id)
+                await registry.compact_thread(
+                    home,
+                    thread_id,
+                    service_tier=service_tier,
+                )
 
     async def read_codex_thread_goal(
         self, codex_home: str, thread_id: str,

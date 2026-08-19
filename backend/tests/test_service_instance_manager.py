@@ -7896,6 +7896,10 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
         MagicMock(broadcast=AsyncMock()),
     )
     manager.task_message_enqueuer = AsyncMock(return_value=True)
+    replay_prompt = request_blocked_replay_prompt("exact user request")
+    manager._create_request_blocked_edit_branch = AsyncMock(
+        return_value=(987, 654, replay_prompt),
+    )
     manager.processes[inst_id] = process
     manager._launch_params[inst_id] = {
         "model": "gpt-5.6-sol",
@@ -7925,17 +7929,133 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     assert inst.status == "idle"
     assert inst.current_task_id is None
     manager.task_message_enqueuer.assert_awaited_once_with(
-        task_id=task_id,
-        prompt=request_blocked_replay_prompt("exact user request"),
+        task_id=987,
+        prompt=replay_prompt,
         priority=PRIORITY_USER,
         source="harness:request-blocked-recovery",
-        current_message=request_blocked_replay_prompt("exact user request"),
-        allow_new_session=True,
+        current_message=replay_prompt,
+        allow_new_session=False,
         request_blocked_recovery=True,
-        source_log_id=source_log_id,
+        source_log_id=654,
         command_skills={"sub-agent": True},
         model_override="gpt-5.6-sol",
     )
+    manager._create_request_blocked_edit_branch.assert_awaited_once_with(
+        task_id,
+        source_log_id,
+        replay_prompt,
+        {"raw_content": "exact user request"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_blocked_recovery_creates_real_edit_branch(db_factory):
+    from backend.api.chat import _is_forkable_user_message
+    from backend.services.codex_recovery import request_blocked_replay_prompt
+
+    async with db_factory() as db:
+        source = Task(
+            title="blocked source",
+            description="initial",
+            status="failed",
+            provider="codex",
+            session_id="thread-source",
+            metadata_={
+                "codex_account_id": "codex-a",
+                "codex_quarantine_reason": "request_blocked",
+                "codex_quarantined_session_id": "thread-source",
+                "codex_native_goal_handoff": {
+                    "objective": "must not leak",
+                    "status": "active",
+                },
+            },
+        )
+        db.add(source)
+        await db.flush()
+        before = LogEntry(
+            instance_id=1,
+            task_id=source.id,
+            event_type="message",
+            role="assistant",
+            content="context before request",
+            raw_json='{"item_id":"item-1","turn_id":"turn-1"}',
+        )
+        request = LogEntry(
+            instance_id=1,
+            task_id=source.id,
+            event_type="user_message",
+            role="user",
+            content="do the work",
+            raw_json='{"raw_content":"do the work"}',
+        )
+        blocked_middle = LogEntry(
+            instance_id=1,
+            task_id=source.id,
+            event_type="message",
+            role="assistant",
+            content="must not be copied",
+            raw_json='{"item_id":"item-2","turn_id":"turn-2"}',
+        )
+        db.add_all([before, request, blocked_middle])
+        await db.commit()
+        source_id, request_id = source.id, request.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    replay_prompt = request_blocked_replay_prompt("do the work")
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "failed", "items": [{"id": "item-2"}]},
+    ]
+    with (
+        patch(
+            "backend.api.chat._codex_fork_home",
+            return_value=("/tmp/codex-home", "codex-a"),
+        ),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-source", "turns": turns}),
+        ),
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-edited"}),
+        ),
+    ):
+        forked_id, replay_log_id, model_prompt = (
+            await manager._create_request_blocked_edit_branch(
+                source_id,
+                request_id,
+                replay_prompt,
+                {"raw_content": "do the work"},
+            )
+        )
+
+    assert model_prompt == replay_prompt
+    async with db_factory() as db:
+        source = await db.get(Task, source_id)
+        forked = await db.get(Task, forked_id)
+        logs = (
+            await db.execute(
+                select(LogEntry)
+                .where(LogEntry.task_id == forked_id)
+                .order_by(LogEntry.id)
+            )
+        ).scalars().all()
+    assert source.active_message_branch_task_id == forked_id
+    assert forked.message_branch_root_task_id == source_id
+    assert forked.session_id == "thread-edited"
+    assert "codex_quarantine_reason" not in forked.metadata_
+    assert "codex_quarantined_session_id" not in forked.metadata_
+    assert "codex_native_goal_handoff" not in forked.metadata_
+    assert [row.content for row in logs] == [
+        "context before request",
+        f"Forked from Task #{source_id}",
+        "[Request blocked · Edited replay] CCM returned to the last user "
+        "message and created a new editable branch.",
+        replay_prompt,
+    ]
+    assert logs[-1].id == replay_log_id
+    assert _is_forkable_user_message(logs[-1]) is True
+    assert json.loads(logs[-1].raw_json)["raw_content"] == replay_prompt
 
 
 @pytest.mark.asyncio

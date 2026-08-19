@@ -6729,7 +6729,7 @@ class InstanceManager:
                                         "自动恢复也被阻断，请发送新指令后重试。"
                                         if request_blocked_recovery_already_attempted
                                         else (
-                                            "正在新 thread 中自动重发上一条请求。"
+                                            "正在创建 Edit 分支并自动重发上一条请求。"
                                         )
                                     )
                                 ),
@@ -7068,7 +7068,7 @@ class InstanceManager:
         task_id: int,
         launch_params: dict,
     ) -> bool:
-        """Replay the blocked turn's human request in one clean Codex thread."""
+        """Replay the last human request through the native Edit branch flow."""
 
         enqueuer = self.task_message_enqueuer
         if enqueuer is None:
@@ -7082,51 +7082,81 @@ class InstanceManager:
         from backend.services.dispatcher import PRIORITY_USER
 
         replay_message = None
-        source_log_id = launch_params.get("source_log_id")
-        if type(source_log_id) is int:
-            try:
-                async with self.db_factory() as db:
-                    source_log = await db.get(LogEntry, source_log_id)
-                    if (
-                        source_log is not None
-                        and source_log.task_id == task_id
-                        and source_log.role == "user"
-                        and source_log.event_type == "user_message"
-                    ):
-                        raw = json.loads(source_log.raw_json or "{}")
-                        if isinstance(raw, dict):
-                            replay_message = raw.get("raw_content")
-                        replay_message = replay_message or source_log.content
-            except Exception:
-                logger.exception(
-                    "Could not load the original user request for blocked "
-                    "task %d",
-                    task_id,
+        source_log_id = None
+        source_metadata: dict = {}
+        try:
+            from backend.api.chat import _is_forkable_user_message
+
+            async with self.db_factory() as db:
+                rows = (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.task_id == task_id,
+                            LogEntry.role == "user",
+                            LogEntry.event_type == "user_message",
+                        )
+                        .order_by(LogEntry.id.desc())
+                    )
+                ).scalars().all()
+                source_log = next(
+                    (row for row in rows if _is_forkable_user_message(row)),
+                    None,
                 )
-        if not isinstance(replay_message, str) or not replay_message.strip():
-            replay_message = launch_params.get("current_message")
-        if not isinstance(replay_message, str) or not replay_message.strip():
-            replay_message = launch_params.get("prompt")
-        if not isinstance(replay_message, str) or not replay_message.strip():
+                if source_log is not None:
+                    source_log_id = source_log.id
+                    raw = json.loads(source_log.raw_json or "{}")
+                    if isinstance(raw, dict):
+                        source_metadata = raw
+                        replay_message = raw.get("raw_content")
+                    replay_message = replay_message or source_log.content
+        except Exception:
+            logger.exception(
+                "Could not load the last editable user request for blocked "
+                "task %d",
+                task_id,
+            )
+        if (
+            type(source_log_id) is not int
+            or not isinstance(replay_message, str)
+            or not replay_message.strip()
+        ):
             logger.error(
-                "Task %d hit Request blocked but its original request is "
-                "unavailable; refusing to invent a recovery prompt",
+                "Task %d hit Request blocked but its last editable user "
+                "request is unavailable; refusing a non-Edit recovery",
                 task_id,
             )
             return False
         replay_prompt = request_blocked_replay_prompt(replay_message)
 
+        try:
+            (
+                recovery_task_id,
+                recovery_log_id,
+                model_prompt,
+            ) = await self._create_request_blocked_edit_branch(
+                task_id,
+                source_log_id,
+                replay_prompt,
+                source_metadata,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to create Request-blocked Edit branch for task %d",
+                task_id,
+            )
+            return False
+
         kwargs = {
-            "task_id": task_id,
-            "prompt": replay_prompt,
+            "task_id": recovery_task_id,
+            "prompt": model_prompt,
             "priority": PRIORITY_USER,
             "source": "harness:request-blocked-recovery",
             "current_message": replay_prompt,
-            "allow_new_session": True,
+            "allow_new_session": False,
             "request_blocked_recovery": True,
+            "source_log_id": recovery_log_id,
         }
-        if type(source_log_id) is int:
-            kwargs["source_log_id"] = source_log_id
         if isinstance(launch_params.get("enabled_skills"), dict):
             kwargs["command_skills"] = dict(
                 launch_params["enabled_skills"]
@@ -7144,11 +7174,172 @@ class InstanceManager:
             return False
         if enqueued:
             logger.warning(
-                "Task %d Request blocked; enqueued one-shot clean-thread "
+                "Task %d Request blocked; enqueued one-shot Edit-branch "
                 "request replay",
                 task_id,
             )
         return bool(enqueued)
+
+    async def _create_request_blocked_edit_branch(
+        self,
+        task_id: int,
+        source_log_id: int,
+        replay_prompt: str,
+        source_metadata: dict,
+    ) -> tuple[int, int, str]:
+        """Use the native message-Edit fork and select its new UI branch."""
+
+        from starlette.requests import Request
+
+        from backend.api.chat import (
+            CodexForkRequest,
+            ForkAnchor,
+            _bind_pending_message_branch,
+            _canonical_message_branch_task,
+            fork_codex_task,
+        )
+        from backend.services.chat_event_identity import persisted_chat_event
+        from backend.services.codex_recovery import (
+            clear_active_quarantine,
+            with_native_goal_handoff,
+        )
+
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": f"/api/tasks/{task_id}/fork",
+            "raw_path": b"",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 0),
+            "server": ("127.0.0.1", 8000),
+        }
+        request = Request(scope)
+        request.state.user_role = "admin"
+        request.state.auth_type = "token"
+
+        async with self.db_factory() as db:
+            source = await db.get(Task, task_id)
+            if source is None:
+                raise RuntimeError("Blocked source task disappeared")
+            request.state.user_id = source.created_by
+            forked = await fork_codex_task(
+                task_id,
+                CodexForkRequest(
+                    anchor=ForkAnchor(
+                        type="user_message",
+                        id=source_log_id,
+                    ),
+                    message_branch=True,
+                ),
+                request,
+                db,
+            )
+            forked.metadata_ = with_native_goal_handoff(
+                clear_active_quarantine(forked.metadata_),
+                None,
+            )
+            canonical = await _canonical_message_branch_task(db, forked)
+            canonical.active_message_branch_task_id = forked.id
+
+            marker = LogEntry(
+                instance_id=None,
+                task_id=forked.id,
+                event_type="system_event",
+                role="system",
+                content=(
+                    "[Request blocked · Edited replay] CCM returned to the "
+                    "last user message and created a new editable branch."
+                ),
+                is_error=False,
+            )
+            db.add(marker)
+            await db.flush()
+
+            log_metadata = {
+                "raw_content": replay_prompt,
+                "request_blocked_edit_replay": True,
+                "replayed_from_log_id": source_log_id,
+            }
+            for key in ("attachments", "file_paths"):
+                if source_metadata.get(key):
+                    log_metadata[key] = source_metadata[key]
+            user_log = LogEntry(
+                instance_id=None,
+                task_id=forked.id,
+                event_type="user_message",
+                role="user",
+                content=replay_prompt,
+                raw_json=None,
+                is_error=False,
+            )
+            db.add(user_log)
+            await _bind_pending_message_branch(
+                db,
+                forked,
+                user_log,
+                log_metadata,
+            )
+            user_log.raw_json = json.dumps(log_metadata)
+            await db.commit()
+
+            replay_prefix = (forked.metadata_ or {}).get(
+                "fork_seed_replay_prefix"
+            ) or []
+            if (
+                replay_prefix
+                and isinstance(replay_prefix, list)
+                and all(
+                    isinstance(item, str) and item.strip()
+                    for item in replay_prefix
+                )
+            ):
+                replay_lines = "\n\n".join(
+                    f"{index}. {item.strip()}"
+                    for index, item in enumerate(replay_prefix, start=1)
+                )
+                model_prompt = (
+                    "这是从被编辑的中途注入所在 turn 开头重放的用户指令：\n"
+                    f"{replay_lines}\n\n"
+                    "下面是用户修改后的中途补充指令，请按它修正并继续：\n"
+                    f"{replay_prompt}"
+                )
+            else:
+                model_prompt = replay_prompt
+            file_paths = source_metadata.get("file_paths") or []
+            if isinstance(file_paths, list) and file_paths:
+                file_list = "\n".join(f"- {path}" for path in file_paths)
+                model_prompt += f"\n\n请用 Read 工具查看以下文件：\n{file_list}"
+
+            marker_event = persisted_chat_event(marker, {
+                "event_type": "system_event",
+                "role": "system",
+                "content": marker.content,
+                "is_error": False,
+            })
+            user_event = persisted_chat_event(user_log, {
+                "event_type": "user_message",
+                "role": "user",
+                "content": replay_prompt,
+                "raw_content": replay_prompt,
+            })
+
+        await self.broadcaster.broadcast(
+            f"task:{forked.id}", marker_event
+        )
+        await self.broadcaster.broadcast(
+            f"task:{forked.id}", user_event
+        )
+        await self.broadcaster.broadcast(
+            f"task:{canonical.id}",
+            {
+                "event_type": "message_branch_selected",
+                "selected_task_id": forked.id,
+            },
+        )
+        return forked.id, user_log.id, model_prompt
 
     async def _try_chat_transient_retry(
         self, instance_id: int, task_id: int, exit_code: int, stderr_text: str,

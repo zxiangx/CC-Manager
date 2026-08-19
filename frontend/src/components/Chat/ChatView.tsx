@@ -43,6 +43,7 @@ interface ChatViewProps {
 interface ChatRuntimeViewProps extends ChatViewProps {
   canonicalTask: Task;
   onInternalBranchSelected: (task: Task) => Promise<void>;
+  onAutomaticBranchSelected: () => Promise<void>;
 }
 
 interface UserMessageNavigationItem {
@@ -274,6 +275,15 @@ export function ChatView(props: ChatViewProps) {
     && canonicalTask.shared_from_id == null
   );
 
+  const restoreMessageBranch = useCallback(async () => {
+    if (!canRestoreMessageBranch) return;
+    const session = await api.getMessageBranchSession(canonicalTask.id);
+    setRuntimeSelection({
+      canonicalTaskId: session.canonical_task_id,
+      task: session.active_task,
+    });
+  }, [canonicalTask.id, canRestoreMessageBranch]);
+
   useEffect(() => {
     let cancelled = false;
     if (!canRestoreMessageBranch) return () => { cancelled = true; };
@@ -306,6 +316,7 @@ export function ChatView(props: ChatViewProps) {
       task={runtimeTask}
       canonicalTask={canonicalTask}
       onInternalBranchSelected={selectInternalBranch}
+      onAutomaticBranchSelected={restoreMessageBranch}
     />
   );
 }
@@ -318,6 +329,7 @@ function ChatRuntimeView({
   onTaskUpdated,
   onTaskForked,
   onInternalBranchSelected,
+  onAutomaticBranchSelected,
   inline,
 }: ChatRuntimeViewProps) {
   const projectName = useMemo(() => {
@@ -929,6 +941,13 @@ function ChatRuntimeView({
   // losing messages when React batches rapid state updates.
   const handleWsMessage = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
+    if (
+      msg.channel === `task:${canonicalTask.id}`
+      && msg.data?.event_type === 'message_branch_selected'
+    ) {
+      void onAutomaticBranchSelected();
+      return;
+    }
     // System channel: react to PTY mode toggling without a refresh
     if (msg.channel === 'system' && msg.data?.event === 'runtime_settings_changed') {
       // Manager broadcasts describe Manager capabilities only. Worker tasks
@@ -1400,7 +1419,13 @@ function ChatRuntimeView({
       syncLiveStreamCache(task.id, next);
       return next;
     });
-  }, [markAskUserResolved, task.id, task.worker_id]);
+  }, [
+    canonicalTask.id,
+    markAskUserResolved,
+    onAutomaticBranchSelected,
+    task.id,
+    task.worker_id,
+  ]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1540,7 +1565,12 @@ function ChatRuntimeView({
   }, [fetchHistory, task.id]);
 
   useWebSocket(
-    [`task:${task.id}`, 'system', 'tasks'],
+    Array.from(new Set([
+      `task:${task.id}`,
+      `task:${canonicalTask.id}`,
+      'system',
+      'tasks',
+    ])),
     handleWsMessage,
     handleReconnect,
     handleSubscribed,

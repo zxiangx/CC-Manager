@@ -1987,6 +1987,58 @@ describe('ChatView', () => {
       );
     });
 
+    it('switches to an automatically created blocked-request Edit branch', async () => {
+      const canonical = makeTask({
+        id: 51,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const edited = makeTask({
+        id: 52,
+        provider: 'codex',
+        status: 'executing',
+      });
+      (api.getMessageBranchSession as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({
+          canonical_task_id: canonical.id,
+          active_task: canonical,
+        });
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockImplementation(
+        async (taskId: number) => taskId === edited.id ? [{
+          id: 902,
+          event_type: 'user_message',
+          role: 'user',
+          content: 'replayed request on Edit branch',
+          is_error: false,
+          timestamp: null,
+        }] : [],
+      );
+
+      render(<ChatView task={canonical} projects={projects} onBack={onBack} />);
+      await waitFor(() => {
+        expect(api.getMessageBranchSession).toHaveBeenCalledWith(canonical.id);
+      });
+      (api.getMessageBranchSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        canonical_task_id: canonical.id,
+        active_task: edited,
+      });
+
+      await act(async () => {
+        capturedOnMessage?.({
+          channel: `task:${canonical.id}`,
+          data: {
+            event_type: 'message_branch_selected',
+            selected_task_id: edited.id,
+          },
+        });
+      });
+
+      expect(
+        await screen.findByText('replayed request on Edit branch'),
+      ).toBeInTheDocument();
+      expect(screen.getByText(`Task #${canonical.id}`)).toBeInTheDocument();
+    });
+
     it('does not add fork actions to assistant messages', async () => {
       const task = makeTask({
         id: 13,

@@ -11,13 +11,14 @@ QUARANTINED_SESSIONS_KEY = "codex_quarantined_sessions"
 REQUEST_BLOCKED_REASON = "request_blocked"
 NATIVE_GOAL_HANDOFF_KEY = "codex_native_goal_handoff"
 REQUEST_BLOCKED_REPLAY_HINT = (
-    "[提示：你之前已经做过一部分该工作，因为触发特殊原因被block了，"
-    "现在是我回过头让你重新执行]"
+    "[Note: You previously completed part of this work, but it was interrupted "
+    "because a special condition triggered a block. I have gone back and "
+    "asked you to execute it again.]"
 )
 
 
 def request_blocked_replay_prompt(message: object) -> str:
-    """Replay one human request in a clean thread, without prior turn output."""
+    """Replay one human request on an Edit branch with an explicit hint."""
 
     request = str(message or "").strip()
     if not request:

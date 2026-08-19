@@ -16,13 +16,24 @@ REQUEST_BLOCKED_RECOVERY_PROMPT = (
 )
 
 
+def _matches_request_blocked_message(message: object) -> bool:
+    normalized = " ".join(str(message or "").lower().split())
+    return (
+        "request blocked" in normalized
+        or (
+            "invalid prompt" in normalized
+            and "your prompt was flagged" in normalized
+        )
+        or "potentially violating our usage policy" in normalized
+    )
+
+
 def is_request_blocked(provider: str | None, message: object) -> bool:
     """Identify the provider terminal that poisons a resumable Codex thread."""
 
     if (provider or "").lower() != "codex":
         return False
-    normalized = " ".join(str(message or "").lower().split())
-    return "request blocked" in normalized
+    return _matches_request_blocked_message(message)
 
 
 def quarantine_metadata(
@@ -128,9 +139,7 @@ def has_request_blocked_quarantine(
     if isinstance(metadata, Mapping):
         if metadata.get(QUARANTINE_REASON_KEY) == REQUEST_BLOCKED_REASON:
             return True
-    return "request blocked" in " ".join(
-        str(error_message or "").lower().split()
-    )
+    return _matches_request_blocked_message(error_message)
 
 
 def clear_active_quarantine(

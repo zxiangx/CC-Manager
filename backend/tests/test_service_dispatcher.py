@@ -611,11 +611,20 @@ async def test_lifecycle_codex_context_error_compacts_before_retry(db_factory):
     """Fresh/mode turns recognize Codex's structured overflow code."""
 
     d = _make_dispatcher(db_factory)
+    d._resolve_resume_config_dir = AsyncMock(
+        return_value="/tmp/codex-goal-home"
+    )
     d._collect_failure_output = AsyncMock(return_value=(
         '{"type":"turn.failed","error":{"message":"request failed",'
         '"codexErrorInfo":"contextWindowExceeded"}}'
     ))
     d._compact_session = AsyncMock(return_value="preserved task context")
+    d.instance_manager.read_codex_thread_goal = AsyncMock(return_value={
+        "objective": "finish the autonomous task",
+        "status": "active",
+        "tokenBudget": 4000,
+        "tokensUsed": 750,
+    })
 
     async with db_factory() as db:
         inst = Instance(name="codex-context-worker")
@@ -646,6 +655,16 @@ async def test_lifecycle_codex_context_error_compacts_before_retry(db_factory):
         assert "preserved task context" in current.description
         assert "近期状态和结论优先" in current.description
         assert "continue implementation" not in current.description
+        assert current.metadata_["codex_native_goal_handoff"] == {
+            "objective": "finish the autonomous task",
+            "status": "active",
+            "source_thread_id": "codex-thread-1",
+            "token_budget": 3250,
+        }
+    d.instance_manager.read_codex_thread_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "codex-thread-1",
+    )
 
 
 @pytest.mark.asyncio
@@ -6914,6 +6933,12 @@ async def test_codex_precompact_uses_full_context_tokens(
     )
     msg.source_log_id = 321
     d._compact_session = AsyncMock(return_value="compact summary")
+    d.instance_manager.read_codex_thread_goal = AsyncMock(return_value={
+        "objective": "finish the retained goal",
+        "status": "active",
+        "tokenBudget": 1000,
+        "tokensUsed": 200,
+    })
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         task.provider = "codex"
@@ -6942,6 +6967,12 @@ async def test_codex_precompact_uses_full_context_tokens(
     assert "[基础当前消息 — 默认最高优先级]\nhi" in launch["prompt"]
     assert launch["current_message"] == "hi"
     assert launch["source_log_id"] == 321
+    assert launch["restore_native_goal"] == {
+        "objective": "finish the retained goal",
+        "status": "active",
+        "source_thread_id": "sess-1",
+        "token_budget": 800,
+    }
     async with db_factory() as db:
         marker = (
             await db.execute(
@@ -7001,6 +7032,11 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
             "codex_quarantine_reason": "request_blocked",
             "codex_quarantined_session_id": "sess-1",
             "codex_quarantined_sessions": ["sess-1"],
+            "codex_native_goal_handoff": {
+                "objective": "finish the durable objective",
+                "status": "active",
+                "source_thread_id": "sess-1",
+            },
         }
         await db.commit()
 
@@ -7014,6 +7050,11 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
     assert "bounded conversation summary" in launch["prompt"]
     assert launch["current_message"] == "hi"
     assert launch["request_blocked_recovery"] is True
+    assert launch["restore_native_goal"] == {
+        "objective": "finish the durable objective",
+        "status": "active",
+        "source_thread_id": "sess-1",
+    }
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         marker = (
@@ -7029,6 +7070,7 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
         assert task.metadata_["codex_quarantined_sessions"] == ["sess-1"]
         assert "codex_quarantine_reason" not in task.metadata_
         assert "codex_quarantined_session_id" not in task.metadata_
+        assert task.metadata_["codex_native_goal_handoff"]["status"] == "active"
         assert "quarantined Codex thread" in marker.content
 
 

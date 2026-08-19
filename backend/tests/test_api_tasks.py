@@ -411,6 +411,71 @@ async def test_resume_native_goal_uses_invisible_control_continuation(
 
 
 @pytest.mark.asyncio
+async def test_update_native_goal_objective_preserves_status(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    import backend.main
+
+    response = await client.post("/api/tasks", json={
+        "title": "Goal objective update",
+        "description": "d",
+        "provider": "codex",
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-goal-update"
+        await db.commit()
+
+    before = {
+        "threadId": "thread-goal-update",
+        "objective": "old objective",
+        "status": "paused",
+    }
+    updated = {
+        "threadId": "thread-goal-update",
+        "objective": "new objective",
+        "status": "paused",
+    }
+    with (
+        patch(
+            "backend.api.tasks._resolve_codex_thread_routing_home",
+            return_value="/tmp/codex-goal-home",
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "read_codex_thread_goal",
+            new_callable=AsyncMock,
+            side_effect=[before, updated],
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "update_codex_thread_goal",
+            new_callable=AsyncMock,
+            return_value=updated,
+        ) as update_goal,
+    ):
+        response = await client.patch(
+            f"/api/tasks/{task_id}/native-goal",
+            json={"objective": "new objective"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "goal": updated,
+        "accepted": True,
+        "queued": False,
+    }
+    update_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-update",
+        objective="new objective",
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_task_wakes_dispatcher_after_commit(client):
     """New work should not wait for the dispatcher's 2-second safety poll."""
     from backend.main import dispatcher

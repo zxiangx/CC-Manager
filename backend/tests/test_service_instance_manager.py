@@ -2884,6 +2884,7 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
             "stop_sub_agent",
             "ccm_pause_goal",
             "ccm_resume_goal",
+            "ccm_update_goal",
         }
 
 
@@ -3218,6 +3219,7 @@ async def test_codex_app_server_uses_passed_sub_agent_controller_specs(
         "stop_sub_agent",
         "ccm_pause_goal",
         "ccm_resume_goal",
+        "ccm_update_goal",
     }
     assert "create_monitor" not in specs[0].enabled_tools
     assert process.unsubscribe_on_terminal is True
@@ -4656,6 +4658,157 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         command_skills={"sub-agent": True},
         model_override="gpt-5.5",
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_goal_transient_retry_normalizes_blocked_and_resumes_goal(
+    db_factory, monkeypatch,
+):
+    import backend.services.claude_pool as claude_pool_module
+
+    async with db_factory() as db:
+        task = Task(
+            title="goal transient retry",
+            status="executing",
+            provider="codex",
+            session_id="thread-goal-transient",
+            last_cwd="/tmp",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    process = _make_mock_process(returncode=1)
+    process.following_native_goal = True
+    im.processes[7] = process
+    im._config_dirs[7] = "/tmp/codex-goal-home"
+    im._launch_params[7] = {
+        "provider": "codex",
+        "prompt": "continue the goal",
+        "model": "gpt-5.6-sol",
+    }
+    im.get_recent_log_contents = AsyncMock(return_value=[])
+    im.read_codex_thread_goal = AsyncMock(return_value={
+        "threadId": "thread-goal-transient",
+        "objective": "finish the work",
+        "status": "blocked",
+    })
+    im.pause_codex_thread_goal = AsyncMock(return_value={
+        "threadId": "thread-goal-transient",
+        "objective": "finish the work",
+        "status": "paused",
+    })
+    im.launch = AsyncMock(return_value=12345)
+    monkeypatch.setattr(
+        claude_pool_module, "transient_retry_delay", lambda *_args: 0,
+    )
+
+    launched = await im._try_chat_transient_retry(
+        7,
+        task.id,
+        1,
+        "stream disconnected before completion: transport error",
+    )
+
+    assert launched is True
+    im.pause_codex_thread_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-transient",
+    )
+    assert im.launch.await_args.kwargs["resume_native_goal"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_goal_transient_exhaustion_leaves_blocked_goal_paused(
+    db_factory, monkeypatch,
+):
+    from backend.config import settings
+
+    async with db_factory() as db:
+        task = Task(
+            title="goal transient exhaustion",
+            status="executing",
+            provider="codex",
+            session_id="thread-goal-exhausted",
+            last_cwd="/tmp",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    process = _make_mock_process(returncode=1)
+    process.following_native_goal = True
+    im.processes[7] = process
+    im._config_dirs[7] = "/tmp/codex-goal-home"
+    im._launch_params[7] = {
+        "provider": "codex",
+        "prompt": "continue the goal",
+    }
+    im._transient_attempts[7] = settings.transient_retry_max
+    im.get_recent_log_contents = AsyncMock(return_value=[])
+    im.read_codex_thread_goal = AsyncMock(return_value={
+        "threadId": "thread-goal-exhausted",
+        "objective": "finish the work",
+        "status": "blocked",
+    })
+    im.pause_codex_thread_goal = AsyncMock(return_value={
+        "threadId": "thread-goal-exhausted",
+        "objective": "finish the work",
+        "status": "paused",
+    })
+    im.launch = AsyncMock(return_value=12345)
+
+    launched = await im._try_chat_transient_retry(
+        7,
+        task.id,
+        1,
+        "stream disconnected before completion: transport error",
+    )
+
+    assert launched is False
+    im.pause_codex_thread_goal.assert_awaited_once_with(
+        "/tmp/codex-goal-home",
+        "thread-goal-exhausted",
+    )
+    im.launch.assert_not_awaited()
+    assert 7 not in im._transient_attempts
+
+
+@pytest.mark.asyncio
+async def test_accepted_goal_handoff_is_cleared_without_losing_other_metadata(
+    db_factory,
+):
+    restored = {
+        "objective": "finish the migration",
+        "status": "active",
+        "source_thread_id": "thread-old",
+        "token_budget": 1234,
+    }
+    async with db_factory() as db:
+        task = Task(
+            title="goal handoff cleanup",
+            status="executing",
+            provider="codex",
+            metadata_={
+                "codex_native_goal_handoff": restored,
+                "keep": "this value",
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    await im._clear_restored_native_goal_handoff(task_id, restored)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.metadata_ == {"keep": "this value"}
 
 
 @pytest.mark.asyncio
@@ -7798,6 +7951,72 @@ async def test_codex_request_blocked_auto_recovery_is_one_shot(db_factory):
     assert "自动恢复也被阻断" in task.error_message
     assert inst.status == "idle"
     manager.task_message_enqueuer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_request_blocked_snapshots_followed_goal_for_replacement(
+    db_factory,
+):
+    async with db_factory() as db:
+        inst = Instance(name="codex-goal-blocked-inst", status="running")
+        task = Task(
+            title="codex goal blocked task",
+            description="d",
+            status="executing",
+            provider="codex",
+            session_id="poisoned-goal-thread",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        inst.current_task_id = task.id
+        await db.commit()
+        inst_id, task_id = inst.id, task.id
+
+    process = _make_mock_process(returncode=0)
+    process.following_native_goal = True
+    process.thread_id = "poisoned-goal-thread"
+    output = iter([
+        json.dumps({
+            "type": "turn.failed",
+            "error": {"message": "Request blocked."},
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.task_message_enqueuer = AsyncMock(return_value=True)
+    manager.processes[inst_id] = process
+    manager._config_dirs[inst_id] = "/tmp/codex-goal-home"
+    manager.read_codex_thread_goal = AsyncMock(return_value={
+        "objective": "finish the durable objective",
+        "status": "blocked",
+        "tokenBudget": 1000,
+        "tokensUsed": 250,
+    })
+
+    await manager._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.metadata_["codex_native_goal_handoff"] == {
+        "objective": "finish the durable objective",
+        "status": "active",
+        "source_thread_id": "poisoned-goal-thread",
+        "token_budget": 750,
+    }
 
 
 @pytest.mark.asyncio

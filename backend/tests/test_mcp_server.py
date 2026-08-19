@@ -23,6 +23,7 @@ def test_mcp_server_tools_registered():
     assert "stop_monitor" in names
     assert "ccm_pause_goal" in names
     assert "ccm_resume_goal" in names
+    assert "ccm_update_goal" in names
 
 
 def test_goal_control_tools_are_removed_without_codex_launch_flag():
@@ -32,6 +33,7 @@ def test_goal_control_tools_are_removed_without_codex_launch_flag():
         mcp_mod._configure_goal_control_tools(False)
         assert "ccm_pause_goal" not in tools
         assert "ccm_resume_goal" not in tools
+        assert "ccm_update_goal" not in tools
     finally:
         tools.clear()
         tools.update(original)
@@ -85,6 +87,40 @@ async def test_goal_control_tools_call_task_scoped_endpoint(
         headers={},
         json=expected_json,
     )
+
+
+@pytest.mark.asyncio
+async def test_update_goal_tool_changes_objective_without_delete_capability():
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {
+        "goal": {"objective": "new objective", "status": "paused"},
+        "queued": False,
+    }
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.patch = AsyncMock(return_value=response)
+
+    with patch(
+        "backend.mcp.ccm_skills_server.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = json.loads(await mcp_mod.ccm_update_goal("new objective"))
+
+    assert result == {
+        "success": True,
+        "objective": "new objective",
+        "status": "paused",
+        "message": "Goal objective updated.",
+    }
+    client.patch.assert_awaited_once_with(
+        "http://localhost:9999/api/tasks/42/native-goal",
+        headers={},
+        json={"objective": "new objective"},
+    )
+    assert "ccm_clear_goal" not in mcp_mod.mcp._tool_manager._tools
+    assert "ccm_delete_goal" not in mcp_mod.mcp._tool_manager._tools
 
 
 def test_api_url():

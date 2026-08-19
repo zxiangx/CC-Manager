@@ -5970,6 +5970,18 @@ class GlobalDispatcher:
                 )
                 return
 
+            from backend.services.codex_recovery import (
+                get_native_goal_handoff,
+            )
+            restore_native_goal = (
+                get_native_goal_handoff(task.metadata_)
+                if (
+                    (task.provider or "claude").lower() == "codex"
+                    and task.session_id is None
+                )
+                else None
+            )
+
             await self.instance_manager.launch(
                 instance_id=instance_id,
                 prompt=full_prompt,
@@ -5986,6 +5998,7 @@ class GlobalDispatcher:
                 enable_workflows=task.enable_workflows,
                 enabled_skills=task.enabled_skills,
                 system_prompt_mode=task.system_prompt_mode,
+                restore_native_goal=restore_native_goal,
             )
 
             # Wait for process to finish (with timeout)
@@ -6111,6 +6124,52 @@ class GlobalDispatcher:
                                 )
                                 summary = await self._compact_session(task.id, t.session_id, db)
                                 if summary:
+                                    compacted_values: dict = {
+                                        "session_id": None,
+                                        "context_window_usage": None,
+                                        "status": "pending",
+                                        "instance_id": None,
+                                        "description": (
+                                            build_compacted_task_retry_prompt(
+                                                summary
+                                            )
+                                        ),
+                                    }
+                                    if (
+                                        task.provider or "claude"
+                                    ).lower() == "codex":
+                                        try:
+                                            retained_goal = await (
+                                                self.instance_manager.read_codex_thread_goal(
+                                                    pool_config_dir,
+                                                    t.session_id,
+                                                )
+                                            )
+                                            from backend.services.codex_recovery import (
+                                                native_goal_handoff,
+                                                with_native_goal_handoff,
+                                            )
+                                            handoff = native_goal_handoff(
+                                                retained_goal,
+                                                source_thread_id=t.session_id,
+                                                resume=True,
+                                            )
+                                            if handoff is not None:
+                                                compacted_values[
+                                                    "metadata_"
+                                                ] = with_native_goal_handoff(
+                                                    t.metadata_,
+                                                    handoff,
+                                                )
+                                        except Exception:
+                                            logger.exception(
+                                                "Could not snapshot native "
+                                                "Goal before autonomous "
+                                                "overflow replacement "
+                                                "task=%s thread=%s",
+                                                task.id,
+                                                t.session_id,
+                                            )
                                     compacted = await db.execute(
                                         update(Task)
                                         .where(
@@ -6119,15 +6178,7 @@ class GlobalDispatcher:
                                                 statuses=("executing",),
                                             )
                                         )
-                                        .values(
-                                            session_id=None,
-                                            context_window_usage=None,
-                                            status="pending",
-                                            instance_id=None,
-                                            description=build_compacted_task_retry_prompt(
-                                                summary
-                                            ),
-                                        )
+                                        .values(**compacted_values)
                                     )
                                     compact_notice = None
                                     if compacted.rowcount:
@@ -12213,6 +12264,39 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         exclude_log_entry_id=msg.source_log_id,
                     )
                     if summary:
+                        if (task.provider or "claude").lower() == "codex":
+                            try:
+                                retained_goal = await (
+                                    self.instance_manager.read_codex_thread_goal(
+                                        config_dir,
+                                        task.session_id,
+                                    )
+                                )
+                                from backend.services.codex_recovery import (
+                                    native_goal_handoff,
+                                    with_native_goal_handoff,
+                                )
+                                handoff = native_goal_handoff(
+                                    retained_goal,
+                                    source_thread_id=task.session_id,
+                                    resume=(
+                                        isinstance(retained_goal, dict)
+                                        and retained_goal.get("status")
+                                        == "active"
+                                    ),
+                                )
+                                if handoff is not None:
+                                    task.metadata_ = with_native_goal_handoff(
+                                        task.metadata_,
+                                        handoff,
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "Could not snapshot native Goal before "
+                                    "context replacement task=%s thread=%s",
+                                    task_id,
+                                    task.session_id,
+                                )
                         # 清空 session_id → 下次 launch 开新 session，prompt 带摘要
                         task.session_id = None
                         task.context_window_usage = None
@@ -12247,6 +12331,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         logger.info("Task %d compacted, new session will start with summary", task_id)
 
             # Capture launch params before closing DB session
+            from backend.services.codex_recovery import (
+                get_native_goal_handoff,
+            )
+            restore_native_goal = (
+                get_native_goal_handoff(task.metadata_)
+                if (
+                    (task.provider or "claude").lower() == "codex"
+                    and task.session_id is None
+                )
+                else None
+            )
             launch_kwargs = dict(
                 instance_id=inst.id,
                 prompt=_prepend_task_artifact_policy(task, msg.prompt),
@@ -12269,6 +12364,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 queue_timestamp=msg.timestamp,
                 resume_native_goal=msg.resume_native_goal,
                 request_blocked_recovery=msg.request_blocked_recovery,
+                restore_native_goal=restore_native_goal,
             )
             inst_id = inst.id
             task_provider = (task.provider or "claude").lower()

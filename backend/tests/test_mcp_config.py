@@ -56,6 +56,7 @@ EXPECTED_REGISTERED_MAIN_TOOLS = (
     *EXPECTED_MAIN_TOOLS,
     "ccm_pause_goal",
     "ccm_resume_goal",
+    "ccm_update_goal",
 )
 EXPECTED_MONITOR_TOOLS = (
     "report_status",
@@ -285,6 +286,7 @@ def test_sub_agent_controller_spec_is_narrow_and_required(monkeypatch):
         "stop_sub_agent",
         "ccm_pause_goal",
         "ccm_resume_goal",
+        "ccm_update_goal",
     )
     assert "create_monitor" not in spec.enabled_tools
     assert "--enable-goal-control" in spec.args
@@ -300,7 +302,11 @@ def test_goal_control_spec_is_available_without_full_main_mcp(monkeypatch):
 
     assert spec.required is True
     assert spec.enabled_tools == CCM_GOAL_CONTROL_TOOLS
-    assert spec.enabled_tools == ("ccm_pause_goal", "ccm_resume_goal")
+    assert spec.enabled_tools == (
+        "ccm_pause_goal",
+        "ccm_resume_goal",
+        "ccm_update_goal",
+    )
     assert "ccm_read_skill" not in spec.enabled_tools
     assert "create_monitor" not in spec.enabled_tools
     assert "--enable-goal-control" in spec.args

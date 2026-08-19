@@ -45,10 +45,12 @@ CCM_SKILLS_TOOLS = (
     "stop_sub_agent",
     "ccm_pause_goal",
     "ccm_resume_goal",
+    "ccm_update_goal",
 )
 CCM_GOAL_CONTROL_TOOLS = (
     "ccm_pause_goal",
     "ccm_resume_goal",
+    "ccm_update_goal",
 )
 CCM_MONITOR_AGENT_TOOLS = (
     "report_status",

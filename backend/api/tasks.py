@@ -971,7 +971,8 @@ def _require_native_goal_task(task: Task) -> tuple[str, str]:
 
 
 class NativeGoalStateRequest(BaseModel):
-    status: Literal["active", "paused"]
+    status: Literal["active", "paused"] | None = None
+    objective: str | None = None
     # Agent self-pause must let the MCP tool call and current answer finish.
     # User controls leave this false and stop the current Goal generation.
     finish_current_turn: bool = False
@@ -3557,7 +3558,13 @@ async def set_native_goal_state(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Pause or explicitly resume one retained Codex-native Goal."""
+    """Update, pause, or explicitly resume one retained native Goal."""
+
+    objective = body.objective.strip() if body.objective is not None else None
+    if body.status is None and not objective:
+        raise HTTPException(422, "status or a non-empty objective is required")
+    if objective is not None and len(objective) > 20000:
+        raise HTTPException(422, "Goal objective is too long")
 
     task = await db.get(Task, task_id)
     if task is None:
@@ -3567,7 +3574,11 @@ async def set_native_goal_state(
     await _require_not_pr_review_task_mutation(
         db,
         task_id,
-        action=f"set its native Goal {body.status}",
+        action=(
+            f"set its native Goal {body.status}"
+            if body.status is not None
+            else "updated its native Goal objective"
+        ),
     )
     worker_task = await _worker_task_or_none(db, task_id)
     if worker_task is not None:
@@ -3603,6 +3614,48 @@ async def set_native_goal_state(
             ) from exc
         if goal is None:
             raise HTTPException(409, "This Task does not currently have a Goal")
+
+        if objective is not None and goal.get("objective") != objective:
+            try:
+                updated = await instance_manager.update_codex_thread_goal(
+                    codex_home,
+                    thread_id,
+                    objective=objective,
+                )
+                goal = await instance_manager.read_codex_thread_goal(
+                    codex_home,
+                    thread_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Could not update native Goal objective "
+                    "task=%s thread=%s error=%s",
+                    task_id,
+                    thread_id,
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    409,
+                    "CCM could not prove that the native Goal objective was updated",
+                ) from exc
+            if (
+                updated.get("objective") != objective
+                or not isinstance(goal, dict)
+                or goal.get("objective") != objective
+            ):
+                raise HTTPException(
+                    409,
+                    "The native Goal objective did not remain updated",
+                )
+
+        if body.status is None:
+            return {
+                "goal": goal,
+                "accepted": objective is not None,
+                "queued": False,
+            }
 
         if body.status == "paused":
             if goal.get("status") == "paused":

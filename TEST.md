@@ -590,6 +590,10 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
 | `test_codex_app_server.py::test_explicit_goal_control_reactivates_paused_goal_before_steering` | 显式 Goal-control continuation 先注册 CCM owner，再恢复 retained Goal，等待精确 `turn/started` 并把不可见控制输入 steer 到该 turn |
 | `test_codex_app_server.py::test_standard_resume_keeps_inactive_goal_status` | 普通 Standard 消息不恢复 `paused`、`blocked`、usage/budget limited、complete Goal；这些状态与无 Goal 均保持原状态并使用普通 `turn/start` 语义 |
+| `test_codex_app_server.py::test_update_thread_goal_changes_objective_without_status_mutation` | Agent 修改 retained Goal 的 objective 后再次权威读取，状态保持不变且不允许借更新执行 clear/delete |
+| `test_codex_app_server.py::test_fresh_thread_restores_active_goal_before_steering` / `test_fresh_thread_restores_paused_goal_without_resuming_it` | replacement thread 先把 Task-level handoff 安全种成 paused；原 active Goal 走 owner-first 恢复并 steer，原 paused Goal 保持 paused 并走普通 turn |
+| `test_service_instance_manager.py::test_codex_goal_transient_retry_normalizes_blocked_and_resumes_goal` / `test_codex_goal_transient_exhaustion_leaves_blocked_goal_paused` | 仅有 exact Goal generation 证据的短暂断流才把 Codex 技术性 blocked 规范化为 paused；重试显式恢复，耗尽则保留 paused |
+| `test_service_dispatcher.py::test_lifecycle_codex_context_error_compacts_before_retry` / `test_codex_precompact_uses_full_context_tokens` / `test_request_blocked_codex_task_starts_from_safe_recovery_summary` | context overflow、预压缩和 request-block 安全换 thread 都保存并恢复仍可继续的 Goal handoff |
 | `test_codex_app_server.py::test_todo_list_updates_are_forwarded_with_exact_turn_identity` | 当前 app-server `turn/plan/updated` 权威快照转换成结构化 `todo_list`，保留 exact turn identity |
 | `test_service_instance_manager.py::test_codex_todo_updates_replace_one_durable_snapshot` | 同一 turn 的计划更新删除旧 snapshot、以新 log id 持久化最新版本，数据库只留一条且不会掉出最新历史页 |
 | `test_chat_timestamp.py::test_chat_history_exposes_structured_codex_todo_snapshot` | HTTP 历史返回稳定 `todo_id`、explanation 和规范化的三态 items |

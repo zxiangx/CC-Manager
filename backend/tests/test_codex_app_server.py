@@ -24,6 +24,7 @@ from backend.services.codex_app_server import (
     CodexThreadHomeMismatchError,
     CodexThreadNotIdleError,
     CodexTurnProcess,
+    _TurnContext,
     _format_process_exit,
     codex_project_trust_target,
     codex_untrusted_project_config,
@@ -3884,6 +3885,218 @@ async def test_explicit_goal_control_reactivates_paused_goal_before_steering():
             "status": "completed",
             "error": None,
         },
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_update_thread_goal_changes_objective_without_status_mutation():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    requests: list[tuple[str, dict]] = []
+
+    async def request(method, params):
+        requests.append((method, params))
+        if method == "thread/goal/get":
+            return {
+                "goal": {
+                    "threadId": "thread-update-goal",
+                    "objective": "new objective",
+                    "status": "paused",
+                },
+            }
+        if method == "thread/goal/set":
+            return {
+                "goal": {
+                    "threadId": "thread-update-goal",
+                    "objective": "new objective",
+                    "status": "paused",
+                },
+            }
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    goal = await server.update_thread_goal(
+        "thread-update-goal",
+        objective="new objective",
+    )
+
+    assert goal["objective"] == "new objective"
+    assert goal["status"] == "paused"
+    assert requests == [
+        (
+            "thread/goal/set",
+            {
+                "threadId": "thread-update-goal",
+                "objective": "new objective",
+            },
+        ),
+        ("thread/goal/get", {"threadId": "thread-update-goal"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_followed_native_goal_is_visible_on_process_generation():
+    server = CodexAppServer("codex")
+    process = CodexTurnProcess(4321, AsyncMock(), thread_id="thread-goal")
+    context = _TurnContext(
+        thread_id="thread-goal",
+        process=process,
+        launch_started=0,
+        task_id=44,
+    )
+
+    server._mark_following_native_goal(context)
+
+    assert context.following_native_goal is True
+    assert process.following_native_goal is True
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_restores_active_goal_before_steering():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    requests: list[tuple[str, dict]] = []
+
+    async def request(method, params):
+        requests.append((method, params))
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-restored-goal",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": None,
+            }
+        if method == "thread/goal/set" and params["status"] == "paused":
+            assert params == {
+                "threadId": "thread-restored-goal",
+                "objective": "finish restored work",
+                "status": "paused",
+                "tokenBudget": 500,
+            }
+            return {
+                "goal": {
+                    "objective": "finish restored work",
+                    "status": "paused",
+                },
+            }
+        if method == "thread/goal/set" and params["status"] == "active":
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/started",
+                {
+                    "threadId": "thread-restored-goal",
+                    "turn": {"id": "turn-restored-goal"},
+                },
+            )
+            return {"goal": {"status": "active"}}
+        if method == "turn/steer":
+            return {"turnId": "turn-restored-goal"}
+        if method == "thread/goal/get":
+            return {"goal": {"status": "complete"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="continue from the safe summary",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=44,
+        restore_native_goal={
+            "objective": "finish restored work",
+            "status": "active",
+            "token_budget": 500,
+        },
+    )
+
+    assert thread_id == "thread-restored-goal"
+    assert process.following_native_goal is True
+    assert process.admitted_turn_id == "turn-restored-goal"
+    assert [method for method, _ in requests[:4]] == [
+        "thread/start",
+        "thread/goal/set",
+        "thread/goal/set",
+        "turn/steer",
+    ]
+    assert requests[3][1]["input"] == [
+        {"type": "text", "text": "continue from the safe summary"},
+    ]
+
+    server._handle_notification("thread/goal/updated", {
+        "threadId": thread_id,
+        "goal": {"status": "complete"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-restored-goal", "status": "completed"},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_restores_paused_goal_without_resuming_it():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    requests: list[tuple[str, dict]] = []
+
+    async def request(method, params):
+        requests.append((method, params))
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-restored-paused-goal",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": None,
+            }
+        if method == "thread/goal/set":
+            return {
+                "goal": {
+                    "objective": "wait for approval",
+                    "status": "paused",
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-ordinary"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="answer this ordinary question",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=45,
+        restore_native_goal={
+            "objective": "wait for approval",
+            "status": "paused",
+        },
+    )
+
+    assert thread_id == "thread-restored-paused-goal"
+    assert process.following_native_goal is False
+    assert [method for method, _ in requests] == [
+        "thread/start",
+        "thread/goal/set",
+        "turn/start",
+    ]
+    assert not any(
+        method == "thread/goal/set" and params.get("status") == "active"
+        for method, params in requests
+    )
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-ordinary", "status": "completed"},
     })
     assert await asyncio.wait_for(process.wait(), timeout=1) == 0
 

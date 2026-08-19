@@ -518,6 +518,11 @@ class CodexTurnProcess:
         # Notifications can temporarily use another active-turn alias, so the
         # admission response is persisted separately for safe fork mapping.
         self.admitted_turn_id: str | None = None
+        # Immutable generation evidence for retry handling. Codex may rewrite
+        # an active Goal to ``blocked`` when the provider stream disconnects;
+        # InstanceManager must distinguish that technical transition from an
+        # unrelated ordinary turn beside an intentionally blocked Goal.
+        self.following_native_goal = False
         self.unsubscribe_on_terminal = False
         # Filled at terminal publication before the native context detaches.
         # InstanceManager uses the immutable snapshot to unload every
@@ -1824,6 +1829,7 @@ class CodexAppServer:
         if context.following_native_goal:
             return
         context.following_native_goal = True
+        context.process.following_native_goal = True
         context.process.feed({
             "type": "system_event",
             "content": "Codex 原生 Goal 仍在运行，CCM 将继续跟踪后续回合",
@@ -2623,6 +2629,7 @@ class CodexAppServer:
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
         explicit_resume_native_goal: bool = False,
+        restore_native_goal: Mapping[str, Any] | None = None,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -3027,6 +3034,42 @@ class CodexAppServer:
             # particular, Monitor uses this hook to survive a process crash
             # between thread/start and turn/start without guessing a rollout.
             await on_thread_started(thread_id)
+        restored_goal_status: str | None = None
+        if restore_native_goal is not None:
+            if resume_session_id:
+                raise CodexAppServerError(
+                    "A native Goal handoff can only seed a fresh thread"
+                )
+            objective = str(
+                restore_native_goal.get("objective") or ""
+            ).strip()
+            intended_status = restore_native_goal.get("status")
+            if not objective or intended_status not in {"active", "paused"}:
+                raise CodexAppServerError("Invalid native Goal handoff")
+            set_params: dict[str, Any] = {
+                "threadId": thread_id,
+                "objective": objective,
+                # Seed without starting autonomous work before CCM owns the
+                # replacement thread. Active handoffs resume below through the
+                # existing owner-first set-active + steer path.
+                "status": "paused",
+            }
+            token_budget = restore_native_goal.get("token_budget")
+            if type(token_budget) is int and token_budget > 0:
+                set_params["tokenBudget"] = token_budget
+            restored = await self._request("thread/goal/set", set_params)
+            restored_goal = (
+                restored.get("goal") if isinstance(restored, dict) else None
+            )
+            if (
+                not isinstance(restored_goal, dict)
+                or restored_goal.get("objective") != objective
+                or restored_goal.get("status") != "paused"
+            ):
+                raise CodexAppServerError(
+                    "Codex did not accept the replacement thread Goal"
+                )
+            restored_goal_status = str(intended_status)
         # A native Goal can continue after an older CCM version detached its
         # process adapter. Standard chat may recover that exact Goal by
         # preparing a new CCM owner and steering the pending user input into
@@ -3034,7 +3077,7 @@ class CodexAppServer:
         # non-Goal active work remain fail-closed.
         thread_status_type = self._thread_status_type(thread.get("status"))
         adopt_active_goal = False
-        resume_native_goal = False
+        resume_native_goal = restored_goal_status == "active"
         if thread_status_type != "idle":
             if (
                 resume_session_id
@@ -3098,6 +3141,13 @@ class CodexAppServer:
                     task_id,
                     thread_id,
                 )
+        elif restored_goal_status == "paused":
+            logger.info(
+                "Restored paused native Goal on replacement thread "
+                "task=%s thread=%s",
+                task_id,
+                thread_id,
+            )
         if (
             resume_session_id
             and service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -4045,6 +4095,39 @@ class CodexAppServer:
             context.goal_descendant_gate_lock = lock
         async with lock:
             return await _pause()
+
+    async def update_thread_goal(
+        self,
+        thread_id: str,
+        *,
+        objective: str,
+    ) -> dict[str, Any]:
+        """Update a retained Goal objective without changing its status."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        objective = objective.strip()
+        if not objective:
+            raise ValueError("objective is required")
+        await self.ensure_started()
+        response = await self._request(
+            "thread/goal/set",
+            {"threadId": thread_id, "objective": objective},
+        )
+        goal = response.get("goal") if isinstance(response, dict) else None
+        if not isinstance(goal, dict) or goal.get("objective") != objective:
+            raise CodexAppServerError(
+                "thread/goal/set did not confirm the updated objective"
+            )
+        authoritative = await self._read_thread_goal(thread_id)
+        if (
+            not isinstance(authoritative, dict)
+            or authoritative.get("objective") != objective
+        ):
+            raise CodexAppServerError(
+                f"Codex Goal objective was not updated for {thread_id}"
+            )
+        return authoritative
 
     async def clear_thread_goal(
         self,
@@ -5890,13 +5973,14 @@ class CodexAppServerRegistry:
         *,
         clear: bool,
         pause: bool = False,
+        objective: str | None = None,
     ) -> dict[str, Any] | None | bool:
         """Reserve a native thread for one Goal snapshot or clear RPC."""
 
         if not thread_id:
             raise ValueError("thread_id is required")
-        if clear and pause:
-            raise ValueError("Goal operation cannot clear and pause together")
+        if sum((bool(clear), bool(pause), objective is not None)) > 1:
+            raise ValueError("Goal operation accepts only one mutation")
         home = normalize_codex_home(codex_home)
         token = object()
         reserved_owner = False
@@ -5936,7 +6020,14 @@ class CodexAppServerRegistry:
                 else (
                     await server.pause_thread_goal(thread_id)
                     if pause
-                    else await server.read_thread_goal(thread_id)
+                    else (
+                        await server.update_thread_goal(
+                            thread_id,
+                            objective=objective,
+                        )
+                        if objective is not None
+                        else await server.read_thread_goal(thread_id)
+                    )
                 )
             )
             succeeded = True
@@ -5982,6 +6073,25 @@ class CodexAppServerRegistry:
         if not isinstance(result, dict):
             raise CodexAppServerError(
                 f"Codex Goal pause returned invalid data for {thread_id}"
+            )
+        return result
+
+    async def update_thread_goal(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+        *,
+        objective: str,
+    ) -> dict[str, Any]:
+        result = await self._thread_goal_operation(
+            codex_home,
+            thread_id,
+            clear=False,
+            objective=objective,
+        )
+        if not isinstance(result, dict):
+            raise CodexAppServerError(
+                f"Codex Goal update returned invalid data for {thread_id}"
             )
         return result
 

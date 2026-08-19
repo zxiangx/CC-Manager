@@ -836,6 +836,7 @@ class InstanceManager:
         codex_service_tier: str = "default",
         resume_native_goal: bool = False,
         request_blocked_recovery: bool = False,
+        restore_native_goal: dict | None = None,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -926,6 +927,7 @@ class InstanceManager:
                                 request_blocked_recovery=(
                                     request_blocked_recovery
                                 ),
+                                restore_native_goal=restore_native_goal,
                             )
                     except BaseException:
                         current_process = (
@@ -1005,6 +1007,7 @@ class InstanceManager:
         codex_service_tier: str = "default",
         resume_native_goal: bool = False,
         request_blocked_recovery: bool = False,
+        restore_native_goal: dict | None = None,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -1342,6 +1345,7 @@ class InstanceManager:
                         request_blocked_recovery=(
                             request_blocked_recovery
                         ),
+                        restore_native_goal=restore_native_goal,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -2032,7 +2036,7 @@ class InstanceManager:
                 )
 
     async def read_codex_thread_goal(
-        self, codex_home: str, thread_id: str,
+        self, codex_home: str | None, thread_id: str,
     ) -> dict | None:
         """Read the persisted native Goal for one exact Codex thread."""
 
@@ -2044,7 +2048,7 @@ class InstanceManager:
                 return await registry.read_thread_goal(home, thread_id)
 
     async def pause_codex_thread_goal(
-        self, codex_home: str, thread_id: str,
+        self, codex_home: str | None, thread_id: str,
     ) -> dict:
         """Persist a manual pause while preserving the native Goal."""
 
@@ -2054,6 +2058,69 @@ class InstanceManager:
             async with self.codex_home_app_server_guard(codex_home) as home:
                 registry = self._ensure_codex_app_server_registry()
                 return await registry.pause_thread_goal(home, thread_id)
+
+    async def update_codex_thread_goal(
+        self,
+        codex_home: str | None,
+        thread_id: str,
+        *,
+        objective: str,
+    ) -> dict:
+        """Update a retained native Goal objective without clearing it."""
+
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.update_thread_goal(
+                    home,
+                    thread_id,
+                    objective=objective,
+                )
+
+    async def _clear_restored_native_goal_handoff(
+        self,
+        task_id: int,
+        restored: dict,
+    ) -> None:
+        """Clear only the exact handoff accepted by a replacement thread."""
+
+        from backend.services.codex_recovery import (
+            get_native_goal_handoff,
+            with_native_goal_handoff,
+        )
+
+        for _attempt in range(3):
+            async with self.db_factory() as db:
+                task = await db.get(Task, task_id)
+                if task is None:
+                    return
+                observed_metadata = dict(task.metadata_ or {})
+                current = get_native_goal_handoff(observed_metadata)
+                if current != restored:
+                    return
+                cleared_metadata = with_native_goal_handoff(
+                    observed_metadata,
+                    None,
+                )
+                cleared = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.metadata_ == observed_metadata,
+                    )
+                    .values(metadata_=cleared_metadata)
+                )
+                if cleared.rowcount:
+                    await db.commit()
+                    return
+                await db.rollback()
+        logger.warning(
+            "Native Goal handoff cleanup lost repeated metadata races "
+            "task=%s",
+            task_id,
+        )
 
     async def clear_codex_thread_goal(
         self, codex_home: str, thread_id: str,
@@ -2221,6 +2288,7 @@ class InstanceManager:
         tools_disabled: bool = False,
         resume_native_goal: bool = False,
         request_blocked_recovery: bool = False,
+        restore_native_goal: dict | None = None,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -2244,6 +2312,7 @@ class InstanceManager:
             disable_autonomous_features=disable_autonomous_features,
             tools_disabled=tools_disabled,
             explicit_resume_native_goal=resume_native_goal,
+            restore_native_goal=restore_native_goal,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -2274,11 +2343,13 @@ class InstanceManager:
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
                 "codex_service_tier": codex_service_tier,
+                "resume_native_goal": resume_native_goal,
                 "request_blocked_recovery": request_blocked_recovery,
+                "restore_native_goal": restore_native_goal,
             }
 
         try:
-            return await self._persist_and_track_launch(
+            pid = await self._persist_and_track_launch(
                 instance_id=instance_id,
                 task_id=task_id,
                 process=process,
@@ -2289,6 +2360,23 @@ class InstanceManager:
                 task_retry_count=task_retry_count,
                 source_log_id=source_log_id,
             )
+            if task_id is not None and restore_native_goal is not None:
+                try:
+                    await self._clear_restored_native_goal_handoff(
+                        task_id,
+                        restore_native_goal,
+                    )
+                except Exception:
+                    # The real turn is already owned and consuming output.
+                    # Keep the bounded handoff for later cleanup instead of
+                    # misreporting a live launch as failed.
+                    logger.exception(
+                        "Could not clear accepted native Goal handoff "
+                        "task=%s thread=%s",
+                        task_id,
+                        _thread_id,
+                    )
+            return pid
         except (InstanceNotFoundError, LaunchSupersededError):
             raise
         except Exception as exc:
@@ -6323,16 +6411,69 @@ class InstanceManager:
                                     )
                                     if expected_retry_count is not None:
                                         compact_generation_predicates.append(
-                                            Task.retry_count
-                                            == expected_retry_count
+                                        Task.retry_count
+                                        == expected_retry_count
+                                    )
+                                compacted_values: dict = {
+                                    "session_id": None,
+                                    "context_window_usage": None,
+                                }
+                                if provider == "codex":
+                                    try:
+                                        retained_goal = await (
+                                            self.read_codex_thread_goal(
+                                                self._config_dirs.get(
+                                                    instance_id
+                                                ),
+                                                compacted_session_id,
+                                            )
+                                        )
+                                        from backend.services.codex_recovery import (
+                                            native_goal_handoff,
+                                            with_native_goal_handoff,
+                                        )
+                                        handoff = native_goal_handoff(
+                                            retained_goal,
+                                            source_thread_id=(
+                                                compacted_session_id
+                                            ),
+                                            resume=bool(
+                                                getattr(
+                                                    process,
+                                                    "following_native_goal",
+                                                    False,
+                                                )
+                                                or (
+                                                    isinstance(
+                                                        retained_goal,
+                                                        dict,
+                                                    )
+                                                    and retained_goal.get(
+                                                        "status"
+                                                    )
+                                                    == "active"
+                                                )
+                                            ),
+                                        )
+                                        if handoff is not None:
+                                            compacted_values["metadata_"] = (
+                                                with_native_goal_handoff(
+                                                    task.metadata_,
+                                                    handoff,
+                                                )
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "Could not snapshot native Goal "
+                                            "before overflow replacement "
+                                            "task=%s thread=%s",
+                                            task_id,
+                                            compacted_session_id,
                                         )
                                 compacted = await db.execute(
                                     update(Task)
                                     .where(*compact_generation_predicates)
-                                    .values(
-                                        session_id=None,
-                                        context_window_usage=None,
-                                    )
+                                    .values(**compacted_values)
                                 )
                                 if not compacted.rowcount:
                                     await db.rollback()
@@ -6478,6 +6619,32 @@ class InstanceManager:
         request_blocked_recovery_already_attempted = bool(
             launch_params.get("request_blocked_recovery")
         )
+        blocked_goal_handoff = None
+        if (
+            recoverable_codex_block
+            and getattr(process, "following_native_goal", False)
+        ):
+            blocked_thread_id = getattr(process, "thread_id", None)
+            try:
+                blocked_goal = await self.read_codex_thread_goal(
+                    self._config_dirs.get(instance_id),
+                    blocked_thread_id,
+                )
+                from backend.services.codex_recovery import (
+                    native_goal_handoff,
+                )
+                blocked_goal_handoff = native_goal_handoff(
+                    blocked_goal,
+                    source_thread_id=blocked_thread_id,
+                    resume=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not snapshot native Goal before quarantining "
+                    "task=%s thread=%s",
+                    task_id,
+                    blocked_thread_id,
+                )
         # A provider-level rejection does not mean the reusable CCM worker is
         # unhealthy. Keep the slot available while the Task records a failed,
         # quarantined turn for safe next-message recovery.
@@ -6571,6 +6738,7 @@ class InstanceManager:
                                 metadata_=quarantine_metadata(
                                     current_task_generation.metadata_,
                                     current_task_generation.session_id,
+                                    goal_handoff=blocked_goal_handoff,
                                 ),
                             )
                     task_update = await db.execute(
@@ -7000,13 +7168,10 @@ class InstanceManager:
                 return False
 
             attempt = self._transient_attempts.get(instance_id, 0) + 1
-            if not capacity_retry and attempt > _settings.transient_retry_max:
-                logger.warning(
-                    "Chat task %d transient retries exhausted (%d) — failing turn",
-                    task_id, _settings.transient_retry_max,
-                )
-                self._transient_attempts.pop(instance_id, None)
-                return False
+            retry_exhausted = bool(
+                not capacity_retry
+                and attempt > _settings.transient_retry_max
+            )
 
             if not params:
                 return False
@@ -7024,6 +7189,58 @@ class InstanceManager:
                 task_service_tier = task.codex_service_tier
 
             config_dir = self._config_dirs.get(instance_id)
+            failed_process = self.processes.get(instance_id)
+            retry_native_goal = bool(
+                provider == "codex"
+                and (
+                    params.get("resume_native_goal") is True
+                    or getattr(
+                        failed_process,
+                        "following_native_goal",
+                        False,
+                    )
+                )
+            )
+            if retry_native_goal:
+                # Codex currently writes `blocked` when a Goal turn ends on a
+                # transient provider stream failure. Normalize that technical
+                # state to a recoverable pause before either retrying or
+                # exhausting the retry budget. An ordinary turn beside a
+                # deliberately blocked Goal has no process-generation marker
+                # and therefore never enters this branch.
+                try:
+                    goal = await self.read_codex_thread_goal(
+                        config_dir,
+                        session_id,
+                    )
+                    if (
+                        isinstance(goal, dict)
+                        and goal.get("status") == "blocked"
+                    ):
+                        await self.pause_codex_thread_goal(
+                            config_dir,
+                            session_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not normalize transient native Goal to paused "
+                        "task=%s thread=%s",
+                        task_id,
+                        session_id,
+                    )
+                params = dict(params)
+                params["resume_native_goal"] = True
+
+            if retry_exhausted:
+                logger.warning(
+                    "Chat task %d transient retries exhausted (%d) — "
+                    "leaving any followed Goal paused",
+                    task_id,
+                    _settings.transient_retry_max,
+                )
+                self._transient_attempts.pop(instance_id, None)
+                return False
+
             capacity_attempt = attempt
             if capacity_retry:
                 pool = self.codex_pool

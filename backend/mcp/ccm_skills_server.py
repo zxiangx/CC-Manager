@@ -18,7 +18,11 @@ mcp = FastMCP("ccm-skills", instructions="CCM task skill tools")
 _TASK_ID: int = 0
 _API_BASE: str = "http://localhost:8000"
 _AUTH_TOKEN: str = ""
-_GOAL_CONTROL_TOOL_NAMES = ("ccm_pause_goal", "ccm_resume_goal")
+_GOAL_CONTROL_TOOL_NAMES = (
+    "ccm_pause_goal",
+    "ccm_resume_goal",
+    "ccm_update_goal",
+)
 
 
 def _api_url(path: str) -> str:
@@ -529,6 +533,40 @@ async def ccm_resume_goal() -> str:
                 if data.get("queued")
                 else "Goal 已经处于运行状态。"
             ),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "error": str(exc)},
+            ensure_ascii=False,
+        )
+
+
+@mcp.tool()
+async def ccm_update_goal(objective: str) -> str:
+    """Update the current Task's retained Codex Goal objective.
+
+    This preserves the Goal status, progress, and usage. Use create_goal when
+    no Goal exists, and ccm_resume_goal separately when a paused or blocked
+    Goal should continue. This tool never clears or deletes a Goal.
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.patch(
+                _api_url("/native-goal"),
+                headers=_headers(),
+                json={"objective": objective},
+            )
+            response.raise_for_status()
+            data = response.json()
+        goal = data.get("goal") if isinstance(data, dict) else None
+        return json.dumps({
+            "success": True,
+            "objective": (
+                goal.get("objective") if isinstance(goal, dict) else objective
+            ),
+            "status": goal.get("status") if isinstance(goal, dict) else None,
+            "message": "Goal objective updated.",
         }, ensure_ascii=False)
     except Exception as exc:
         return json.dumps(

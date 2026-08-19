@@ -252,16 +252,13 @@ async def _runtime_retirement_fence(account, store):
                         "API account acquired a runtime user before disable "
                         "completed; retry deletion",
                     )
-                # Shared-project containers are a Claude-only execution path.
-                # ApexRouter has never exposed a Claude route, so no CCM
-                # container can mount its account root. CloudRouter must scan
-                # even if a later model refresh removed all Claude models,
+                # Every API provider can now own Claude containers. Scan even
+                # if the latest model refresh no longer advertises Claude,
                 # because an older idle container may retain the mount.
-                if account.api_provider != "apex":
-                    await (
-                        runtime.instance_manager
-                        .detach_api_account_containers(account)
-                    )
+                await (
+                    runtime.instance_manager
+                    .detach_api_account_containers(account)
+                )
             finally:
                 if maintenance_started:
                     await (

@@ -2884,11 +2884,10 @@ class InstanceManager:
                         )
                     )
                 ).scalars().all()
-                relevant_providers = (
-                    {"codex"}
-                    if getattr(account, "api_provider", None) == "apex"
-                    else {"claude", "codex"}
-                )
+                # Every managed API provider can own both Claude and Codex
+                # runtimes. Durable recovery must therefore verify both sides
+                # even when an older account catalog was Codex-only.
+                relevant_providers = {"claude", "codex"}
 
                 # An active task explicitly bound to this id blocks even in
                 # the pre-spawn preparation window.

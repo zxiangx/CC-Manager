@@ -500,7 +500,7 @@ describe('PoolDrawer', () => {
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
     });
 
-    it('adds an ApexRouter key as a Codex-only API account', async () => {
+    it('adds an ApexRouter key as a Claude and Codex API account', async () => {
       vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
         ...apiAccount,
         id: 'apex-1',
@@ -542,8 +542,8 @@ describe('PoolDrawer', () => {
       await user.selectOptions(screen.getByLabelText('API 渠道'), 'apex');
 
       expect(screen.getByLabelText('ApexRouter API Key')).toBeInTheDocument();
-      expect(screen.getByText(/ApexRouter 仅用于 Codex/)).toBeInTheDocument();
-      expect(screen.getByText(/通过 \/v1\/models 验证 Key/)).toBeInTheDocument();
+      expect(screen.getByText(/自动识别该 Key 可用于 Claude、Codex 或两者/)).toBeInTheDocument();
+      expect(screen.getByText(/ApexRouter \/v1\/models/)).toBeInTheDocument();
       expect(screen.getByText(/额度通过 \/v1\/usage 获取/)).toBeInTheDocument();
       expect(screen.getByText(/剩余、上限与并发限制由同组 Key 共享/)).toBeInTheDocument();
       expect(screen.getByText(/当前不返回到期时间/)).toBeInTheDocument();

@@ -35,9 +35,23 @@ CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
 MODELS_URL = f"{CODEX_BASE_URL}/models"
 USAGE_URL = f"{CODEX_BASE_URL}/usage"
-APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
+APEX_CLAUDE_BASE_URL = "https://api.apexin.ai"
 APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
 APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
+LEGACY_APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+LEGACY_APEX_ENDPOINTS = {
+    "claude_base_url": None,
+    "codex_base_url": LEGACY_APEX_CODEX_BASE_URL,
+    "models_url": f"{LEGACY_APEX_CODEX_BASE_URL}/models",
+    "usage_url": f"{LEGACY_APEX_CODEX_BASE_URL}/usage",
+}
+LEGACY_APEX_CODEX_ONLY_ENDPOINTS = {
+    "claude_base_url": None,
+    "codex_base_url": APEX_CODEX_BASE_URL,
+    "models_url": APEX_MODELS_URL,
+    "usage_url": APEX_USAGE_URL,
+}
 # Keep this aligned with the Codex CLI version pinned by scripts/setup.sh and
 # WorkerProvisioner.  Apex exposes the native Codex model catalog endpoint,
 # which requires the caller version in order to filter compatible models.
@@ -94,6 +108,7 @@ API_PROVIDER_SPECS = {
         label="ApexRouter",
         account_prefix="apex",
         codex_provider=APEX_CODEX_PROVIDER,
+        claude_base_url=APEX_CLAUDE_BASE_URL,
         codex_base_url=APEX_CODEX_BASE_URL,
         models_url=APEX_MODELS_URL,
         usage_url=APEX_USAGE_URL,
@@ -642,28 +657,36 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
 
 
 def _normalise_apex_models(payload: Any) -> dict[str, Any]:
-    """Normalise Apex's native Codex model catalog response.
+    """Normalise Apex's native or OpenAI-compatible model catalog response."""
 
-    Unlike an OpenAI-compatible ``/models`` response (``data[].id``), the
-    Codex client endpoint returns ``models[].slug`` plus visibility and API
-    support flags.  Hidden/internal and explicitly unsupported models must not
-    become selectable CCM API models.
-    """
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+    if not isinstance(payload, dict):
         raise CloudRouterUpstreamError("invalid_models_response")
-    items = payload["models"]
+    if "models" in payload:
+        items = payload["models"]
+        model_id_field = "slug"
+        native_shape = True
+    elif "data" in payload:
+        items = payload["data"]
+        model_id_field = "id"
+        native_shape = False
+    else:
+        raise CloudRouterUpstreamError("invalid_models_response")
+    if not isinstance(items, list):
+        raise CloudRouterUpstreamError("invalid_models_response")
     if len(items) > MAX_DISCOVERED_MODELS:
         raise CloudRouterUpstreamError("too_many_models")
-    models: list[str] = []
+    result: dict[str, Any] = {"claude": [], "codex": []}
     service_tiers: dict[str, list[str]] = {}
     seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
-        if item.get("supported_in_api") is False or item.get("visibility") == "hide":
+        if native_shape and (
+            item.get("supported_in_api") is False
+            or item.get("visibility") == "hide"
+        ):
             continue
-        model_id = item.get("slug")
+        model_id = item.get(model_id_field)
         if not isinstance(model_id, str):
             continue
         model_id = model_id.strip()
@@ -673,40 +696,38 @@ def _normalise_apex_models(payload: Any) -> dict[str, Any]:
             or any(character.isspace() for character in model_id)
         ):
             raise CloudRouterUpstreamError("invalid_models_response")
-        if _provider_for_model(model_id) != "codex" or model_id in seen:
+        provider = _provider_for_model(model_id)
+        if provider is None or model_id in seen:
             continue
-        raw_tiers = item.get("service_tiers", [])
-        if not isinstance(raw_tiers, list):
-            raise CloudRouterUpstreamError("invalid_models_response")
-        if len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL:
-            raise CloudRouterUpstreamError("invalid_models_response")
         tier_ids: set[str] = set()
-        for tier in raw_tiers:
-            tier_id = tier.get("id") if isinstance(tier, dict) else None
-            if not isinstance(tier_id, str):
+        if provider == "codex":
+            raw_tiers = item.get("service_tiers", [])
+            if not isinstance(raw_tiers, list):
                 raise CloudRouterUpstreamError("invalid_models_response")
-            tier_id = tier_id.strip()
-            if (
-                not tier_id
-                or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
-                or any(character.isspace() for character in tier_id)
-            ):
+            if len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL:
                 raise CloudRouterUpstreamError("invalid_models_response")
-            tier_ids.add(tier_id)
+            for tier in raw_tiers:
+                tier_id = tier.get("id") if isinstance(tier, dict) else None
+                if not isinstance(tier_id, str):
+                    raise CloudRouterUpstreamError("invalid_models_response")
+                tier_id = tier_id.strip()
+                if (
+                    not tier_id
+                    or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
+                    or any(character.isspace() for character in tier_id)
+                ):
+                    raise CloudRouterUpstreamError("invalid_models_response")
+                tier_ids.add(tier_id)
         seen.add(model_id)
-        models.append(model_id)
+        result[provider].append(model_id)
         if tier_ids:
             service_tiers[model_id] = sorted(tier_ids)
-    models.sort()
-    if not models:
+    for models in result.values():
+        models.sort()
+    if not any(result.values()):
         raise CloudRouterUpstreamError("no_supported_models")
-    return {
-        "claude": [],
-        "codex": models,
-        # This internal probe field is split into a top-level metadata field
-        # before persistence; it never changes the public ``models`` shape.
-        "service_tiers": service_tiers,
-    }
+    result["service_tiers"] = service_tiers
+    return result
 
 
 def _normalise_service_tiers(
@@ -1580,7 +1601,22 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Mismatched API provider metadata: {account_id}"
             )
-        if data.get("endpoints") != spec.endpoints:
+        migrate_legacy_apex_endpoints = (
+            api_provider == API_PROVIDER_APEX
+            and data.get("endpoints") == LEGACY_APEX_ENDPOINTS
+        )
+        migrate_apex_claude_runtime = (
+            api_provider == API_PROVIDER_APEX
+            and data.get("endpoints") in (
+                LEGACY_APEX_ENDPOINTS,
+                LEGACY_APEX_CODEX_ONLY_ENDPOINTS,
+            )
+        )
+        if (
+            data.get("endpoints") != spec.endpoints
+            and not migrate_legacy_apex_endpoints
+            and not migrate_apex_claude_runtime
+        ):
             raise CloudRouterUnsafePathError(f"Modified fixed endpoints: {account_id}")
         name = data.get("name")
         models = data.get("models")
@@ -1593,12 +1629,10 @@ class CloudRouterAccountStore:
             })
             for provider in ("claude", "codex")
         }
-        if api_provider == API_PROVIDER_APEX:
-            # Only the Codex-compatible Apex route has been supplied.  Never
-            # project a coincidentally named Claude model into an unconfigured
-            # CLAUDE_CONFIG_DIR.
-            normalised_models["claude"] = []
-        elif data.get("service_tiers") not in (None, {}):
+        if (
+            api_provider != API_PROVIDER_APEX
+            and data.get("service_tiers") not in (None, {})
+        ):
             raise CloudRouterUnsafePathError(
                 f"Unexpected service tier metadata: {account_id}"
             )
@@ -1646,6 +1680,20 @@ class CloudRouterAccountStore:
                 ("account.json", 0o600), ("api.key", 0o600), ("key-helper", 0o700),
             ):
                 _require_owned_regular(path / file_name, expected_mode)
+            _require_owned_regular(path / "codex" / "config.toml", 0o600)
+            if migrate_apex_claude_runtime:
+                # Validate every existing artifact before the first write so a
+                # rejected legacy account cannot be left half-migrated.
+                self._migrate_apex_claude_runtime(
+                    account,
+                    write_missing=False,
+                )
+                self._validate_runtime_configuration(
+                    account,
+                    validate_claude=False,
+                    apply_migrations=False,
+                )
+                self._migrate_apex_claude_runtime(account)
             if spec.claude_base_url is not None:
                 _require_owned_regular(
                     path / "claude" / "settings.json", 0o600
@@ -1654,9 +1702,64 @@ class CloudRouterAccountStore:
                 _converge_cli_mutable_private_file(
                     path / "claude" / ".claude.json",
                 )
-            _require_owned_regular(path / "codex" / "config.toml", 0o600)
             self._validate_runtime_configuration(account)
+        if migrate_legacy_apex_endpoints or migrate_apex_claude_runtime:
+            data["endpoints"] = dict(spec.endpoints)
+            try:
+                _atomic_private_json(
+                    metadata_path,
+                    data,
+                    maximum=MAX_METADATA_BYTES,
+                )
+            except CloudRouterAccountError:
+                raise
+            except OSError as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Could not migrate fixed endpoints: {account_id}",
+                ) from exc
         return account
+
+    @staticmethod
+    def _migrate_apex_claude_runtime(
+        account: CloudRouterAccount,
+        *,
+        write_missing: bool = True,
+    ) -> None:
+        """Materialize Claude runtime files for an exact legacy Apex account."""
+
+        if account.api_provider != API_PROVIDER_APEX:
+            raise CloudRouterUnsafePathError(
+                f"Invalid Apex Claude migration: {account.id}",
+            )
+        expected_files = {
+            account.root / "claude" / "settings.json": {
+                "env": {"ANTHROPIC_BASE_URL": APEX_CLAUDE_BASE_URL},
+                "apiKeyHelper": _claude_helper_command(account.root),
+                CLAUDE_SKIP_DANGEROUS_PROMPT: True,
+            },
+            account.root / "claude" / ".claude.json": {
+                "hasCompletedOnboarding": True,
+            },
+        }
+        for path, expected in expected_files.items():
+            if path.exists() or path.is_symlink():
+                _require_owned_regular(path, 0o600)
+                try:
+                    current = json.loads(_open_regular_nofollow(
+                        path,
+                        maximum=MAX_METADATA_BYTES,
+                    ).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise CloudRouterUnsafePathError(
+                        f"Invalid legacy Apex Claude config: {account.id}",
+                    ) from exc
+                if current != expected:
+                    raise CloudRouterUnsafePathError(
+                        f"Modified legacy Apex Claude config: {account.id}",
+                    )
+                continue
+            if write_missing:
+                _atomic_private_json(path, expected)
 
     @staticmethod
     def _converge_claude_runtime_settings(
@@ -1683,7 +1786,11 @@ class CloudRouterAccountStore:
             ) from exc
         if (
             not isinstance(settings, dict)
-            or settings.get("env") != {"ANTHROPIC_BASE_URL": CLAUDE_BASE_URL}
+            or settings.get("env") != {
+                "ANTHROPIC_BASE_URL": API_PROVIDER_SPECS[
+                    account.api_provider
+                ].claude_base_url
+            }
             or settings.get("apiKeyHelper")
             != _claude_helper_command(account.root)
         ):
@@ -1695,7 +1802,12 @@ class CloudRouterAccountStore:
             _atomic_private_json(settings_path, settings)
 
     @staticmethod
-    def _validate_runtime_configuration(account: CloudRouterAccount) -> None:
+    def _validate_runtime_configuration(
+        account: CloudRouterAccount,
+        *,
+        validate_claude: bool = True,
+        apply_migrations: bool = True,
+    ) -> None:
         """Fail closed if a CLI config could redirect or replace API auth."""
 
         helper_path = account.root / "key-helper"
@@ -1713,7 +1825,7 @@ class CloudRouterAccountStore:
             )
 
         spec = API_PROVIDER_SPECS[account.api_provider]
-        if spec.claude_base_url is not None:
+        if spec.claude_base_url is not None and validate_claude:
             try:
                 settings = json.loads(_open_regular_nofollow(
                     account.root / "claude" / "settings.json",
@@ -1784,12 +1896,36 @@ class CloudRouterAccountStore:
             "model_providers": expected_providers,
         }
         legacy_apex_codex = None
+        legacy_apex_endpoint_codex = None
+        legacy_apex_endpoint_legacy_codex = None
         if account.api_provider == API_PROVIDER_APEX:
             legacy_apex_codex = {
                 "model_provider": LEGACY_APEX_CODEX_PROVIDER,
                 "model_providers": {
                     LEGACY_APEX_CODEX_PROVIDER: {
                         **expected_provider,
+                        "name": LEGACY_APEX_LABEL,
+                    },
+                },
+            }
+            legacy_endpoint_provider = {
+                **expected_provider,
+                "base_url": LEGACY_APEX_CODEX_BASE_URL,
+            }
+            legacy_apex_endpoint_codex = {
+                "model_provider": spec.codex_provider,
+                "model_providers": {
+                    spec.codex_provider: legacy_endpoint_provider,
+                    LEGACY_APEX_CODEX_PROVIDER: {
+                        **legacy_endpoint_provider,
+                    },
+                },
+            }
+            legacy_apex_endpoint_legacy_codex = {
+                "model_provider": LEGACY_APEX_CODEX_PROVIDER,
+                "model_providers": {
+                    LEGACY_APEX_CODEX_PROVIDER: {
+                        **legacy_endpoint_provider,
                         "name": LEGACY_APEX_LABEL,
                     },
                 },
@@ -1821,11 +1957,29 @@ class CloudRouterAccountStore:
             legacy_apex_codex is not None
             and codex == legacy_apex_codex
         )
-        if codex != expected_codex and not migrate_legacy_apex:
+        migrate_legacy_apex_endpoint = (
+            (
+                legacy_apex_endpoint_codex is not None
+                and codex == legacy_apex_endpoint_codex
+            )
+            or (
+                legacy_apex_endpoint_legacy_codex is not None
+                and codex == legacy_apex_endpoint_legacy_codex
+            )
+        )
+        if (
+            codex != expected_codex
+            and not migrate_legacy_apex
+            and not migrate_legacy_apex_endpoint
+        ):
             raise CloudRouterUnsafePathError(
                 f"Modified Codex API routing: {account.id}",
             )
-        if projects is not None or migrate_legacy_apex:
+        if apply_migrations and (
+            projects is not None
+            or migrate_legacy_apex
+            or migrate_legacy_apex_endpoint
+        ):
             try:
                 _atomic_private_write(
                     account.root / "codex" / "config.toml",

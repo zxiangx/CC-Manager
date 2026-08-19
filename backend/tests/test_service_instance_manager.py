@@ -112,6 +112,39 @@ async def test_api_account_delete_blocks_db_only_unknown_live_binding(
 
 
 @pytest.mark.asyncio
+async def test_apex_account_delete_checks_durable_claude_binding(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="Apex Claude owner",
+            status="in_progress",
+            provider="claude",
+            metadata_={"claude_account_id": "apex-1"},
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="recovered Apex Claude",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path, api_provider="apex")
+    )
+
+    assert any(f"task {task.id}" in blocker for blocker in blockers)
+
+
+@pytest.mark.asyncio
 async def test_api_account_delete_accepts_explicit_other_account_binding(
     db_factory, tmp_path,
 ):

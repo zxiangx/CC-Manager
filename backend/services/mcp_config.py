@@ -52,6 +52,13 @@ CCM_GOAL_CONTROL_TOOLS = (
     "ccm_resume_goal",
     "ccm_update_goal",
 )
+CCM_CHATGPT_BROWSER_TOOLS = (
+    "chatgpt_status",
+    "chatgpt_open_conversation",
+    "chatgpt_send_message",
+    "chatgpt_wait_for_reply",
+    "chatgpt_conversation_url",
+)
 CCM_MONITOR_AGENT_TOOLS = (
     "report_status",
     "mark_complete",
@@ -256,6 +263,51 @@ def build_goal_control_mcp_server_specs(
             ),
             enabled_tools=CCM_GOAL_CONTROL_TOOLS,
             api_base=api_base,
+        ),
+    )
+
+
+def build_chatgpt_browser_mcp_server_specs(
+    profile_dir: str | os.PathLike[str],
+    *,
+    executable_path: str | os.PathLike[str] | None = None,
+    headless: bool = True,
+) -> tuple[McpServerSpec, ...]:
+    """Build the opt-in prototype MCP for one persistent ChatGPT profile.
+
+    This builder is intentionally not called by ``build_mcp_server_specs``;
+    ordinary CCM Tasks must not receive browser authority implicitly.
+    """
+
+    profile = Path(profile_dir).expanduser()
+    if not profile.is_absolute():
+        raise ValueError("ChatGPT browser profile_dir must be absolute")
+    args = [
+        "-m",
+        "backend.mcp.ccm_chatgpt_browser_server",
+        "--profile-dir",
+        str(profile),
+        "--headless" if headless else "--headed",
+    ]
+    if executable_path is not None:
+        executable = Path(executable_path).expanduser()
+        if not executable.is_absolute():
+            raise ValueError("ChatGPT browser executable_path must be absolute")
+        args.extend(("--executable-path", str(executable)))
+    return (
+        McpServerSpec(
+            name="ccm_chatgpt_browser",
+            command=_VENV_PYTHON,
+            args=tuple(args),
+            cwd=_CCM_ROOT,
+            required=True,
+            enabled_tools=CCM_CHATGPT_BROWSER_TOOLS,
+            # Sending a web message is an external side effect.  Production
+            # callers must keep approval visible; isolated tests may override
+            # this explicitly after the user authorizes the nonce message.
+            default_tools_approval_mode="prompt",
+            startup_timeout_sec=30.0,
+            tool_timeout_sec=1800.0,
         ),
     )
 

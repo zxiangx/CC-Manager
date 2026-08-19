@@ -2,6 +2,13 @@
 
 > **重要：Claude 必须自主维护本文件。** 每次完成重要改动或遇到问题后，在对应章节记录。每条记录必须附上 git commit ID。
 
+## 2026-08-19：Codex Goal 的误 blocked 恢复与跨 thread 交接
+
+- **根因与恢复（commit `95e153c2`）**：Codex provider stream 短暂断开时会把正在跟随的原生 Goal 写成 `blocked`。CCM 现在用 exact process-generation 标记区分技术性中断与本来就 blocked 的旁路 Goal：前者先规范化为 `paused`，重试时通过显式 Goal-control continuation 恢复；重试耗尽仍保留 paused，不把可恢复目标永久卡死。
+- **Task 级持久性（commit `95e153c2`）**：request-block 隔离、自动 compact 和 context overflow 必须在替换原生 thread 前把 active/paused/blocked Goal 的 objective、预期状态和剩余 token budget 保存为 Task metadata handoff。fresh thread 先安全种成 paused，CCM 建立 owner 后才恢复原 active Goal；已接受的 handoff 在真实 turn 被跟踪后以 CAS 清理，避免重复或丢并发 metadata。
+- **Agent 权限（commit `95e153c2`）**：新增 task-scoped `ccm_update_goal`，可修改 retained Goal objective 且权威复读确认状态未被隐式改变；创建仍走 Codex 原生 `create_goal`，暂停/恢复继续使用 `ccm_pause_goal` / `ccm_resume_goal`，未给 Agent 暴露 clear/delete。普通用户消息仍不暗中恢复 Goal。
+- **验证（commit `95e153c2`）**：App-server/MCP 组合 284 passed、Dispatcher 完整文件 242 passed、Goal API/恢复/InstanceManager 专项全绿，Python compile、`git diff --check` 与前端 production build 通过。后端全量在 macOS 跑到 2633 passed 后因 Linux `/proc` 专用测试长等待手动中止；当时剩余失败为既有 macOS 路径/上传/邮箱环境差异，及两处本次工具清单旧断言（已更新并专项复测通过）。
+
 ## 2026-08-17：Codex 原生 Goal 可保留暂停并显式恢复
 
 - **功能（commit `9d322849`）**：Goal 面板新增“暂停 / 启用 / 删除”三种明确操作。用户暂停先终止当前 Goal turn、保留 objective/进度/用量；启用通过不可见的 task-scoped control continuation 恢复 exact native Goal，不生成伪用户消息；删除仍是唯一永久清除操作。

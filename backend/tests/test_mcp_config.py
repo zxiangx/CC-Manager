@@ -14,7 +14,6 @@ from backend.mcp import (
 )
 from backend.services import mcp_config
 from backend.services.mcp_config import (
-    CCM_CHATGPT_BROWSER_TOOLS,
     CCM_GOAL_CONTROL_TOOLS,
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
@@ -22,7 +21,6 @@ from backend.services.mcp_config import (
     CCM_SUB_AGENT_TOOLS,
     McpServerSpec,
     build_goal_control_mcp_server_specs,
-    build_chatgpt_browser_mcp_server_specs,
     build_mcp_server_specs,
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
@@ -71,14 +69,6 @@ EXPECTED_SUB_AGENT_TOOLS = (
     "report_progress",
     "submit_result",
     "get_context",
-)
-
-EXPECTED_CHATGPT_BROWSER_TOOLS = (
-    "chatgpt_status",
-    "chatgpt_open_conversation",
-    "chatgpt_send_message",
-    "chatgpt_wait_for_reply",
-    "chatgpt_conversation_url",
 )
 
 
@@ -320,37 +310,6 @@ def test_goal_control_spec_is_available_without_full_main_mcp(monkeypatch):
     assert "ccm_read_skill" not in spec.enabled_tools
     assert "create_monitor" not in spec.enabled_tools
     assert "--enable-goal-control" in spec.args
-
-
-def test_chatgpt_browser_spec_is_explicit_and_not_in_main_tools(monkeypatch):
-    _set_spec_snapshot_runtime(monkeypatch)
-
-    (spec,) = build_chatgpt_browser_mcp_server_specs(
-        "/srv/ccm-private/chatgpt/profile",
-        executable_path="/usr/bin/google-chrome",
-    )
-
-    assert spec == McpServerSpec(
-        name="ccm_chatgpt_browser",
-        command="/srv/ccm/.venv/bin/python3",
-        args=(
-            "-m",
-            "backend.mcp.ccm_chatgpt_browser_server",
-            "--profile-dir",
-            "/srv/ccm-private/chatgpt/profile",
-            "--headless",
-            "--executable-path",
-            "/usr/bin/google-chrome",
-        ),
-        cwd="/srv/ccm",
-        required=True,
-        enabled_tools=EXPECTED_CHATGPT_BROWSER_TOOLS,
-        default_tools_approval_mode="prompt",
-        startup_timeout_sec=30.0,
-        tool_timeout_sec=1800.0,
-    )
-    assert CCM_CHATGPT_BROWSER_TOOLS == EXPECTED_CHATGPT_BROWSER_TOOLS
-    assert not set(CCM_CHATGPT_BROWSER_TOOLS) & set(CCM_SKILLS_TOOLS)
 
 
 @pytest.mark.parametrize(

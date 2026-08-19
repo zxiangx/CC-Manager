@@ -33,6 +33,13 @@ def _maintenance_app() -> FastAPI:
     async def status(request: Request):
         return {"auth_type": request.state.auth_type}
 
+    @app.post(
+        "/api/system/deploy",
+        dependencies=[Depends(require_admin)],
+    )
+    async def deploy(request: Request):
+        return {"auth_type": request.state.auth_type}
+
     @app.get("/api/system/health")
     async def health():
         return {"status": "ok", "commit": "controlled"}
@@ -135,6 +142,25 @@ async def test_maintenance_update_accepts_legacy_admin_token_without_db(
     ) as client:
         response = await client.get(
             "/api/system/update/status",
+            headers={"Authorization": "Bearer legacy-secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["auth_type"] == "token"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_local_deploy_accepts_legacy_admin_token_without_db(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_token", "legacy-secret")
+    app = _maintenance_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/system/deploy",
             headers={"Authorization": "Bearer legacy-secret"},
         )
 

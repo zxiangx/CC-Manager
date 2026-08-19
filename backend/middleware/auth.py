@@ -46,6 +46,7 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
     def _is_deployment_maintenance_path(path: str) -> bool:
         return (
             path == "/api/system/health"
+            or path == "/api/system/deploy"
             or path == "/api/system/update"
             or path.startswith("/api/system/update/")
             or path == "/api/system/restart"

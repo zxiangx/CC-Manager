@@ -335,6 +335,81 @@ async def test_legacy_codex_only_apex_rejects_existing_claude_redirect(
 
 
 @pytest.mark.asyncio
+async def test_retired_account_accepts_exact_shared_codex_projection(
+    tmp_path, monkeypatch,
+):
+    shared = tmp_path / "codex-state"
+    (shared / "sessions").mkdir(parents=True, mode=0o700)
+    (shared / "archived_sessions").mkdir(mode=0o700)
+    store = CloudRouterAccountStore(
+        tmp_path / "accounts",
+        codex_shared_state_dir=shared,
+    )
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({
+        "enabled": False,
+        "retired": True,
+        "cleanup_pending": True,
+    })
+    metadata_path.write_text(json.dumps(metadata))
+    (account.root / "codex" / "sessions").symlink_to(shared / "sessions")
+    (account.root / "codex" / "archived_sessions").symlink_to(
+        shared / "archived_sessions"
+    )
+
+    reloaded = store.reload()[0]
+
+    assert reloaded.retired is True
+    assert reloaded.cleanup_pending is True
+
+
+@pytest.mark.asyncio
+async def test_retired_account_rejects_redirected_codex_projection(
+    tmp_path, monkeypatch,
+):
+    shared = tmp_path / "codex-state"
+    (shared / "sessions").mkdir(parents=True, mode=0o700)
+    redirected = tmp_path / "redirected"
+    redirected.mkdir(mode=0o700)
+    store = CloudRouterAccountStore(
+        tmp_path / "accounts",
+        codex_shared_state_dir=shared,
+    )
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({
+        "enabled": False,
+        "retired": True,
+        "cleanup_pending": True,
+    })
+    metadata_path.write_text(json.dumps(metadata))
+    (account.root / "codex" / "sessions").symlink_to(redirected)
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="link points elsewhere",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
 async def test_legacy_apex_gateway_config_migrates_with_resume_alias(
     tmp_path, monkeypatch,
 ):

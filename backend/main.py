@@ -79,7 +79,14 @@ if settings.codex_shared_state_enabled:
     instance_manager.codex_shared_state_dir = str(
         Path(settings.codex_shared_state_dir).expanduser()
     )
-cloudrouter_store = CloudRouterAccountStore(settings.cloudrouter_accounts_dir)
+cloudrouter_store = CloudRouterAccountStore(
+    settings.cloudrouter_accounts_dir,
+    codex_shared_state_dir=(
+        settings.codex_shared_state_dir
+        if settings.codex_shared_state_enabled
+        else None
+    ),
+)
 instance_manager.cloudrouter_store = cloudrouter_store
 
 shared_relay = None

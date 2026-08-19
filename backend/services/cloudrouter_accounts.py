@@ -1451,6 +1451,7 @@ class CloudRouterAccountStore:
         self,
         root: str | os.PathLike[str],
         *,
+        codex_shared_state_dir: str | os.PathLike[str] | None = None,
         quota_cache_ttl: float = DEFAULT_QUOTA_CACHE_TTL,
         http_timeout: httpx.Timeout | float = DEFAULT_HTTP_TIMEOUT,
     ):
@@ -1468,6 +1469,15 @@ class CloudRouterAccountStore:
             os.close(root_fd)
         self._quota_cache_ttl = max(0.0, float(quota_cache_ttl))
         self._http_timeout = http_timeout
+        self._codex_shared_state_dir = (
+            Path(
+                os.path.expandvars(
+                    os.path.expanduser(os.fspath(codex_shared_state_dir))
+                )
+            ).absolute()
+            if codex_shared_state_dir is not None
+            else None
+        )
         self._accounts: dict[str, CloudRouterAccount] = {}
         self._quota_cache: dict[str, dict[str, Any]] = {}
         self._quota_cached_at: dict[str, float] = {}
@@ -1482,6 +1492,35 @@ class CloudRouterAccountStore:
         # never removes a credential while it is still being used.
         self._credential_users: dict[str, int] = {}
         self.reload()
+
+    def _validate_retired_codex_projection(self, path: Path) -> None:
+        """Accept only the exact CCM-owned shared Codex state projection."""
+
+        if not path.is_symlink():
+            _ensure_private_directory(path, create=False)
+            return
+        shared_root = self._codex_shared_state_dir
+        if shared_root is None:
+            raise CloudRouterUnsafePathError(
+                f"Unexpected managed directory symlink: {path}",
+            )
+        metadata = path.lstat()
+        if metadata.st_uid != os.getuid():
+            raise CloudRouterUnsafePathError(
+                f"Unsafe managed directory owner: {path}",
+            )
+        expected = shared_root / path.name
+        raw_target = Path(os.readlink(path))
+        actual = (
+            raw_target
+            if raw_target.is_absolute()
+            else path.parent / raw_target
+        ).absolute()
+        if os.path.normpath(actual) != os.path.normpath(expected):
+            raise CloudRouterUnsafePathError(
+                f"Managed Codex state link points elsewhere: {path}",
+            )
+        _ensure_private_directory(expected, create=False)
 
     def _open_store_root_fd(self) -> int:
         try:
@@ -1669,12 +1708,13 @@ class CloudRouterAccountStore:
         for directory in (path / "claude", path / "codex"):
             _ensure_private_directory(directory, create=False)
         if account.retired:
-            for preserved in (
-                path / "claude" / "projects",
-                path / "codex" / "sessions",
-            ):
+            claude_projects = path / "claude" / "projects"
+            if claude_projects.exists() or claude_projects.is_symlink():
+                _ensure_private_directory(claude_projects, create=False)
+            for name in ("sessions", "archived_sessions"):
+                preserved = path / "codex" / name
                 if preserved.exists() or preserved.is_symlink():
-                    _ensure_private_directory(preserved, create=False)
+                    self._validate_retired_codex_projection(preserved)
         else:
             for file_name, expected_mode in (
                 ("account.json", 0o600), ("api.key", 0o600), ("key-helper", 0o700),

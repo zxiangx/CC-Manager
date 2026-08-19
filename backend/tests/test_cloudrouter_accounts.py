@@ -371,6 +371,15 @@ async def test_retired_account_accepts_exact_shared_codex_projection(
     assert reloaded.retired is True
     assert reloaded.cleanup_pending is True
 
+    shared_rollout = shared / "sessions" / "rollout.jsonl"
+    shared_rollout.write_text("keep shared history")
+    completed = await store.finalize_retirement(account.id)
+
+    assert completed.cleanup_pending is False
+    assert shared_rollout.read_text() == "keep shared history"
+    assert (account.root / "codex" / "sessions").is_symlink()
+    assert not (account.root / "api.key").exists()
+
 
 @pytest.mark.asyncio
 async def test_retired_account_rejects_redirected_codex_projection(

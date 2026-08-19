@@ -2637,6 +2637,7 @@ class CloudRouterAccountStore:
         account_fd: int,
         runtime_name: str,
         preserved_name: str,
+        account_root: Path,
     ) -> None:
         """Remove only direct children of one proven managed runtime dir.
 
@@ -2687,6 +2688,29 @@ class CloudRouterAccountStore:
                     name, dir_fd=descriptor, follow_symlinks=False,
                 )
                 if name == preserved_name:
+                    if (
+                        runtime_name == "codex"
+                        and preserved_name == "sessions"
+                        and stat.S_ISLNK(metadata.st_mode)
+                    ):
+                        shared_root = self._codex_shared_state_dir
+                        if shared_root is None or metadata.st_uid != os.getuid():
+                            raise CloudRouterUnsafePathError(
+                                "Unsafe preserved account directory",
+                            )
+                        raw_target = Path(os.readlink(name, dir_fd=descriptor))
+                        actual = (
+                            raw_target
+                            if raw_target.is_absolute()
+                            else account_root / runtime_name / raw_target
+                        ).absolute()
+                        expected = (shared_root / preserved_name).absolute()
+                        if os.path.normpath(actual) != os.path.normpath(expected):
+                            raise CloudRouterUnsafePathError(
+                                "Unsafe preserved account directory",
+                            )
+                        _ensure_private_directory(expected, create=False)
+                        continue
                     if (
                         not stat.S_ISDIR(metadata.st_mode)
                         or stat.S_ISLNK(metadata.st_mode)
@@ -2874,6 +2898,7 @@ class CloudRouterAccountStore:
                     account_fd,
                     "claude",
                     "projects",
+                    account.root,
                 )
                 self._assert_account_fd_current(
                     root_fd, account_fd, account.id,
@@ -2882,6 +2907,7 @@ class CloudRouterAccountStore:
                     account_fd,
                     "codex",
                     "sessions",
+                    account.root,
                 )
                 self._assert_account_fd_current(
                     root_fd, account_fd, account.id,

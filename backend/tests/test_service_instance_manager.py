@@ -7847,9 +7847,7 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
 async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     db_factory,
 ):
-    from backend.services.codex_recovery import (
-        REQUEST_BLOCKED_RECOVERY_PROMPT,
-    )
+    from backend.services.codex_recovery import request_blocked_replay_prompt
     from backend.services.dispatcher import PRIORITY_USER
 
     async with db_factory() as db:
@@ -7863,9 +7861,19 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
         )
         db.add_all([inst, task])
         await db.flush()
+        source_log = LogEntry(
+            instance_id=inst.id,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="[Admin] exact user request",
+            raw_json=json.dumps({"raw_content": "exact user request"}),
+        )
+        db.add(source_log)
+        await db.flush()
         inst.current_task_id = task.id
         await db.commit()
-        inst_id, task_id = inst.id, task.id
+        inst_id, task_id, source_log_id = inst.id, task.id, source_log.id
 
     process = _make_mock_process(returncode=0)
     output = iter([
@@ -7892,6 +7900,8 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     manager._launch_params[inst_id] = {
         "model": "gpt-5.6-sol",
         "enabled_skills": {"sub-agent": True},
+        "source_log_id": source_log_id,
+        "current_message": "contaminated fallback prompt",
         "request_blocked_recovery": False,
     }
 
@@ -7911,17 +7921,18 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     assert task.metadata_["codex_quarantine_reason"] == "request_blocked"
     assert task.metadata_["codex_quarantined_session_id"] == "poisoned-thread"
     assert task.metadata_["codex_quarantined_sessions"] == ["poisoned-thread"]
-    assert "正在从安全摘要" in task.error_message
+    assert "自动重发上一条请求" in task.error_message
     assert inst.status == "idle"
     assert inst.current_task_id is None
     manager.task_message_enqueuer.assert_awaited_once_with(
         task_id=task_id,
-        prompt=REQUEST_BLOCKED_RECOVERY_PROMPT,
+        prompt=request_blocked_replay_prompt("exact user request"),
         priority=PRIORITY_USER,
         source="harness:request-blocked-recovery",
-        current_message=REQUEST_BLOCKED_RECOVERY_PROMPT,
+        current_message=request_blocked_replay_prompt("exact user request"),
         allow_new_session=True,
         request_blocked_recovery=True,
+        source_log_id=source_log_id,
         command_skills={"sub-agent": True},
         model_override="gpt-5.6-sol",
     )

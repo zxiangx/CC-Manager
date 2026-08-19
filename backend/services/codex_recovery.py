@@ -10,10 +10,19 @@ QUARANTINED_SESSION_KEY = "codex_quarantined_session_id"
 QUARANTINED_SESSIONS_KEY = "codex_quarantined_sessions"
 REQUEST_BLOCKED_REASON = "request_blocked"
 NATIVE_GOAL_HANDOFF_KEY = "codex_native_goal_handoff"
-REQUEST_BLOCKED_RECOVERY_PROMPT = (
-    "The content returned by your previous request caused a Request blocked "
-    "error. Please use a different approach and continue."
+REQUEST_BLOCKED_REPLAY_HINT = (
+    "[提示：你之前已经做过一部分该工作，因为触发特殊原因被block了，"
+    "现在是我回过头让你重新执行]"
 )
+
+
+def request_blocked_replay_prompt(message: object) -> str:
+    """Replay one human request in a clean thread, without prior turn output."""
+
+    request = str(message or "").strip()
+    if not request:
+        return REQUEST_BLOCKED_REPLAY_HINT
+    return f"{request}\n\n{REQUEST_BLOCKED_REPLAY_HINT}"
 
 
 def _matches_request_blocked_message(message: object) -> bool:

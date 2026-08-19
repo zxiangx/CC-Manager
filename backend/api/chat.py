@@ -1016,15 +1016,6 @@ def _codex_fork_home(
                 )
             return codex_pool.canonical_home(home), str(account_id)
         matches = codex_pool.locate_session_homes(target_session_id)
-        if target_session_id != task.session_id:
-            if len(matches) > 1:
-                raise HTTPException(
-                    409,
-                    "Historical Codex session has multiple rollout copies",
-                )
-            if len(matches) == 1:
-                home = matches[0]
-                return home, codex_pool.account_id_for_home(home)
         if account_id:
             home = codex_pool.home_for_account(str(account_id))
             if not home:
@@ -1039,6 +1030,12 @@ def _codex_fork_home(
                     "The bound Codex account does not contain this session",
                 )
             return canonical, str(account_id)
+        if target_session_id != task.session_id and len(matches) > 1:
+            raise HTTPException(
+                409,
+                "Historical Codex session has multiple rollout copies "
+                "without an account binding",
+            )
         if len(matches) > 1:
             raise HTTPException(
                 409,

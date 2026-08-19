@@ -5,6 +5,7 @@ from backend.services.codex_recovery import (
     has_request_blocked_quarantine,
     is_request_blocked,
     native_goal_handoff,
+    request_blocked_replay_prompt,
     with_native_goal_handoff,
 )
 
@@ -68,4 +69,12 @@ def test_non_codex_or_unrelated_invalid_prompt_is_not_quarantined():
             error_message="Invalid prompt: missing input",
         )
         is False
+    )
+
+
+def test_request_blocked_replay_contains_only_request_and_hint():
+    assert request_blocked_replay_prompt("  do the work  ") == (
+        "do the work\n\n"
+        "[提示：你之前已经做过一部分该工作，因为触发特殊原因被block了，"
+        "现在是我回过头让你重新执行]"
     )

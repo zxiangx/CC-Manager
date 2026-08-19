@@ -7010,7 +7010,7 @@ async def test_failed_codex_task_reuses_present_native_thread(db_factory, monkey
 
 
 @pytest.mark.asyncio
-async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
+async def test_request_blocked_codex_task_replays_without_prior_context(
     db_factory, monkeypatch,
 ):
     """A poisoned Codex rollout must never be resumed on the next message."""
@@ -7043,35 +7043,29 @@ async def test_request_blocked_codex_task_starts_from_safe_recovery_summary(
     await d._process_queued_message(task_id, msg)
 
     clone.assert_not_awaited()
-    d._compact_session.assert_awaited_once()
+    d._compact_session.assert_not_awaited()
     launch = d.instance_manager.launch.await_args.kwargs
     assert launch["resume_session_id"] is None
-    assert "CCM 安全恢复说明" in launch["prompt"]
-    assert "bounded conversation summary" in launch["prompt"]
+    assert launch["prompt"].endswith("hi")
+    assert "bounded conversation summary" not in launch["prompt"]
     assert launch["current_message"] == "hi"
     assert launch["request_blocked_recovery"] is True
-    assert launch["restore_native_goal"] == {
-        "objective": "finish the durable objective",
-        "status": "active",
-        "source_thread_id": "sess-1",
-    }
+    assert launch["restore_native_goal"] is None
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         marker = (
             await db.execute(
                 select(LogEntry).where(
                     LogEntry.task_id == task_id,
-                    LogEntry.content.like(
-                        "[Context compacted · Safe recovery]%"
-                    ),
+                    LogEntry.content.like("[Context reset · Request replay]%"),
                 )
             )
         ).scalar_one()
         assert task.metadata_["codex_quarantined_sessions"] == ["sess-1"]
         assert "codex_quarantine_reason" not in task.metadata_
         assert "codex_quarantined_session_id" not in task.metadata_
-        assert task.metadata_["codex_native_goal_handoff"]["status"] == "active"
-        assert "quarantined Codex thread" in marker.content
+        assert "codex_native_goal_handoff" not in task.metadata_
+        assert "only the previous user request" in marker.content
 
 
 @pytest.mark.asyncio

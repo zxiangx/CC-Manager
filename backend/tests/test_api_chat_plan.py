@@ -928,6 +928,32 @@ def test_codex_fork_home_uses_current_account_binding_without_global_scan(
     pool.locate_session_homes.assert_not_called()
 
 
+def test_codex_fork_home_uses_bound_historical_rollout_among_copies(tmp_path):
+    from types import SimpleNamespace
+    from backend.api.chat import _codex_fork_home
+
+    bound_home = str((tmp_path / "codex-bound").resolve())
+    other_home = str((tmp_path / "codex-other").resolve())
+    pool = SimpleNamespace(
+        home_for_account=MagicMock(return_value=bound_home),
+        canonical_home=MagicMock(return_value=bound_home),
+        locate_session_homes=MagicMock(return_value=[other_home, bound_home]),
+        account_id_for_home=MagicMock(),
+    )
+    task = SimpleNamespace(
+        session_id="thread-current",
+        metadata_={"codex_account_id": "codex-bound"},
+    )
+
+    with patch("backend.main.codex_pool", pool):
+        assert _codex_fork_home(task, "thread-historical") == (
+            bound_home,
+            "codex-bound",
+        )
+
+    pool.locate_session_homes.assert_called_once_with("thread-historical")
+
+
 @pytest.mark.asyncio
 async def test_codex_fork_legacy_copied_anchor_uses_native_parent_lineage(
     client,

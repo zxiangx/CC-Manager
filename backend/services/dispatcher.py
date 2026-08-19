@@ -5393,7 +5393,7 @@ class GlobalDispatcher:
                 task_values.update(
                     error_message=(
                         "Request blocked. CCM 已隔离该 Codex thread；"
-                        "下一条消息会从安全摘要自动创建新 thread。"
+                        "请重发上一条请求以创建干净的新 thread。"
                     ),
                     metadata_=quarantine_metadata(
                         task.metadata_,
@@ -11939,6 +11939,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 recovered_context_usage = task.context_window_usage
                 recovered_prompt = msg.prompt
                 recovery_compaction_notice = None
+                summary = None
                 if cloned:
                     recovered_session_id = cloned["session_id"]
                     logger.info(
@@ -11947,17 +11948,41 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         recovered_session_id,
                     )
                 elif not keep_codex_session:
-                    # JSONL file missing, fall back to compact summary
-                    logger.warning("Task %d JSONL not found, falling back to compact summary", task_id)
-                    summary = await self._compact_session(
-                        task_id,
-                        recovery_session_id,
-                        db,
-                        exclude_log_entry_id=msg.source_log_id,
-                    )
                     recovered_session_id = None
                     recovered_context_usage = None
-                    if summary:
+                    if quarantined_codex_session and msg.request_blocked_recovery:
+                        # A provider safety block may have been caused by any
+                        # model/tool output in the native rollout.  Do not
+                        # summarize or restore that output (or its Goal) into
+                        # the replacement.  The queued prompt is the original
+                        # human request plus a short replay hint.
+                        recovery_compaction_notice = (
+                            "[Context reset · Request replay] CCM isolated the "
+                            "blocked Codex thread and started a clean session "
+                            "with only the previous user request."
+                        )
+                        logger.warning(
+                            "Task %d Request blocked; starting a clean thread "
+                            "with only the original user request",
+                            task_id,
+                        )
+                    else:
+                        # A genuinely missing session still needs a bounded
+                        # summary so an ordinary crash can continue.
+                        logger.warning(
+                            "Task %d JSONL not found, falling back to compact summary",
+                            task_id,
+                        )
+                        summary = await self._compact_session(
+                            task_id,
+                            recovery_session_id,
+                            db,
+                            exclude_log_entry_id=msg.source_log_id,
+                        )
+                    if not (
+                        quarantined_codex_session
+                        and msg.request_blocked_recovery
+                    ) and summary:
                         recovery_compaction_notice = context_compaction_notice(
                             "Safe recovery",
                             (
@@ -12082,6 +12107,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     current.metadata_ = clear_active_quarantine(
                         current.metadata_
                     )
+                    if msg.request_blocked_recovery:
+                        from backend.services.codex_recovery import (
+                            with_native_goal_handoff,
+                        )
+                        current.metadata_ = with_native_goal_handoff(
+                            current.metadata_,
+                            None,
+                        )
                 if recovery_compaction_notice:
                     db.add(LogEntry(
                         instance_id=recovery_instance_id,

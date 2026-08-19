@@ -6729,8 +6729,7 @@ class InstanceManager:
                                         "自动恢复也被阻断，请发送新指令后重试。"
                                         if request_blocked_recovery_already_attempted
                                         else (
-                                            "正在从安全摘要自动创建新 thread "
-                                            "继续执行。"
+                                            "正在新 thread 中自动重发上一条请求。"
                                         )
                                     )
                                 ),
@@ -7069,7 +7068,7 @@ class InstanceManager:
         task_id: int,
         launch_params: dict,
     ) -> bool:
-        """Queue one safe replacement turn after a poisoned Codex response."""
+        """Replay the blocked turn's human request in one clean Codex thread."""
 
         enqueuer = self.task_message_enqueuer
         if enqueuer is None:
@@ -7079,20 +7078,55 @@ class InstanceManager:
                 task_id,
             )
             return False
-        from backend.services.codex_recovery import (
-            REQUEST_BLOCKED_RECOVERY_PROMPT,
-        )
+        from backend.services.codex_recovery import request_blocked_replay_prompt
         from backend.services.dispatcher import PRIORITY_USER
+
+        replay_message = None
+        source_log_id = launch_params.get("source_log_id")
+        if type(source_log_id) is int:
+            try:
+                async with self.db_factory() as db:
+                    source_log = await db.get(LogEntry, source_log_id)
+                    if (
+                        source_log is not None
+                        and source_log.task_id == task_id
+                        and source_log.role == "user"
+                        and source_log.event_type == "user_message"
+                    ):
+                        raw = json.loads(source_log.raw_json or "{}")
+                        if isinstance(raw, dict):
+                            replay_message = raw.get("raw_content")
+                        replay_message = replay_message or source_log.content
+            except Exception:
+                logger.exception(
+                    "Could not load the original user request for blocked "
+                    "task %d",
+                    task_id,
+                )
+        if not isinstance(replay_message, str) or not replay_message.strip():
+            replay_message = launch_params.get("current_message")
+        if not isinstance(replay_message, str) or not replay_message.strip():
+            replay_message = launch_params.get("prompt")
+        if not isinstance(replay_message, str) or not replay_message.strip():
+            logger.error(
+                "Task %d hit Request blocked but its original request is "
+                "unavailable; refusing to invent a recovery prompt",
+                task_id,
+            )
+            return False
+        replay_prompt = request_blocked_replay_prompt(replay_message)
 
         kwargs = {
             "task_id": task_id,
-            "prompt": REQUEST_BLOCKED_RECOVERY_PROMPT,
+            "prompt": replay_prompt,
             "priority": PRIORITY_USER,
             "source": "harness:request-blocked-recovery",
-            "current_message": REQUEST_BLOCKED_RECOVERY_PROMPT,
+            "current_message": replay_prompt,
             "allow_new_session": True,
             "request_blocked_recovery": True,
         }
+        if type(source_log_id) is int:
+            kwargs["source_log_id"] = source_log_id
         if isinstance(launch_params.get("enabled_skills"), dict):
             kwargs["command_skills"] = dict(
                 launch_params["enabled_skills"]
@@ -7110,8 +7144,8 @@ class InstanceManager:
             return False
         if enqueued:
             logger.warning(
-                "Task %d Request blocked; enqueued one-shot safe-session "
-                "recovery",
+                "Task %d Request blocked; enqueued one-shot clean-thread "
+                "request replay",
                 task_id,
             )
         return bool(enqueued)

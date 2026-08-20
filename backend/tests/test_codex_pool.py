@@ -1332,6 +1332,20 @@ class TestCloudRouterCodexProjection:
 
         assert pool.select(model="gpt-5.6-sol") == str(native_home.resolve())
 
+    def test_glm_model_never_falls_back_to_native_chatgpt(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "apex-glm")
+        account.id = "apex-glm"
+        account.auth_kind = "apex_api"
+        account.api_provider = "apex"
+        account.models = {"claude": [], "codex": ["glm-5.3"]}
+        pool, native_home = self._mixed_pool(tmp_path, account)
+        assert pool.set_global_account("native-1") is True
+
+        assert not pool.supports_model_for_home(native_home, "glm-5.3")
+        assert pool.select_session(model="glm-5.3") == str(
+            Path(account.codex_home).resolve()
+        )
+
     def test_exhausted_api_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
         snapshot = {

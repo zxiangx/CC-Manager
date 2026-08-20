@@ -9,6 +9,8 @@ performing a bounded, model-gated conversion at CCM's existing loopback proxy.
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import time
 from typing import Any
 
@@ -23,6 +25,7 @@ MAX_TEXT_BYTES = 32 * 1024 * 1024
 # its default catalog even when a turn never asks for it, so omit that one
 # known hosted capability while preserving every local harness tool.
 UNSUPPORTED_HOSTED_TOOL_TYPES = frozenset({"web_search"})
+_ANTHROPIC_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 class CodexGlmAdapterError(RuntimeError):
@@ -105,6 +108,19 @@ def _tool_definition(tool: dict[str, Any]) -> tuple[dict[str, Any], str]:
     }, result_kind)
 
 
+def _namespace_tool_name(namespace: str, name: str) -> str:
+    """Build a bounded Anthropic name while retaining a reversible route map."""
+
+    if not namespace or len(namespace) > 128 or not name or len(name) > 128:
+        raise CodexGlmAdapterError("Invalid Codex namespace tool name")
+    readable = _ANTHROPIC_TOOL_NAME_RE.sub("_", f"{namespace}__{name}")
+    if len(readable) <= 128:
+        return readable
+    digest = hashlib.sha256(f"{namespace}\0{name}".encode()).hexdigest()[:16]
+    suffix = _ANTHROPIC_TOOL_NAME_RE.sub("_", name)[-96:]
+    return f"namespace_{digest}__{suffix}"[:128]
+
+
 def _tool_input(item: dict[str, Any], kind: str) -> dict[str, Any]:
     if kind == "custom":
         return {"input": _bounded_text(item.get("input", ""), field="custom tool input")}
@@ -136,11 +152,49 @@ def responses_request_to_anthropic(
     if not isinstance(raw_tools, list) or len(raw_tools) > MAX_TOOLS:
         raise CodexGlmAdapterError("Invalid Codex tools")
     tools: list[dict[str, Any]] = []
-    tool_kinds: dict[str, str] = {}
+    tool_kinds: dict[str, Any] = {}
     for raw_tool in raw_tools:
         if not isinstance(raw_tool, dict):
             raise CodexGlmAdapterError("Invalid Codex tool")
         if raw_tool.get("type") in UNSUPPORTED_HOSTED_TOOL_TYPES:
+            continue
+        if raw_tool.get("type") == "namespace":
+            namespace = raw_tool.get("name")
+            namespace_description = raw_tool.get("description") or ""
+            nested_tools = raw_tool.get("tools")
+            if (
+                not isinstance(namespace, str)
+                or not isinstance(namespace_description, str)
+                or not isinstance(nested_tools, list)
+            ):
+                raise CodexGlmAdapterError("Invalid Codex tool namespace")
+            for nested_tool in nested_tools:
+                if not isinstance(nested_tool, dict):
+                    raise CodexGlmAdapterError("Invalid Codex namespace tool")
+                converted, kind = _tool_definition(nested_tool)
+                if kind != "function":
+                    raise CodexGlmAdapterError(
+                        "Unsupported Codex namespace tool type"
+                    )
+                original_name = converted["name"]
+                upstream_name = _namespace_tool_name(namespace, original_name)
+                if upstream_name in tool_kinds:
+                    raise CodexGlmAdapterError("Duplicate Codex tool name")
+                description_parts = [
+                    part
+                    for part in (namespace_description, converted["description"])
+                    if part
+                ]
+                converted["name"] = upstream_name
+                converted["description"] = "\n\n".join(description_parts)
+                tool_kinds[upstream_name] = {
+                    "kind": "function",
+                    "namespace": namespace,
+                    "name": original_name,
+                }
+                tools.append(converted)
+                if len(tools) > MAX_TOOLS:
+                    raise CodexGlmAdapterError("Too many Codex namespace tools")
             continue
         converted, kind = _tool_definition(raw_tool)
         if converted["name"] in tool_kinds:
@@ -184,10 +238,22 @@ def responses_request_to_anthropic(
         if item_type in {"function_call", "custom_tool_call"}:
             kind = "custom" if item_type == "custom_tool_call" else "function"
             name = item.get("name")
+            namespace = item.get("namespace")
             call_id = item.get("call_id") or item.get("id")
-            if not isinstance(name, str) or name not in tool_kinds:
+            lookup_name = (
+                _namespace_tool_name(namespace, name)
+                if (
+                    kind == "function"
+                    and isinstance(namespace, str)
+                    and isinstance(name, str)
+                )
+                else name
+            )
+            route = tool_kinds.get(lookup_name) if isinstance(lookup_name, str) else None
+            route_kind = route.get("kind") if isinstance(route, dict) else route
+            if not isinstance(name, str) or route is None:
                 raise CodexGlmAdapterError("Unknown tool call name")
-            if tool_kinds[name] != kind:
+            if route_kind != kind:
                 raise CodexGlmAdapterError("Tool call type mismatch")
             if not isinstance(call_id, str) or not call_id:
                 raise CodexGlmAdapterError("Invalid tool call id")
@@ -195,7 +261,7 @@ def responses_request_to_anthropic(
             _append_message(messages, "assistant", [{
                 "type": "tool_use",
                 "id": call_id,
-                "name": name,
+                "name": lookup_name,
                 "input": _tool_input(item, kind),
             }])
             continue
@@ -285,7 +351,7 @@ def _sse(events: list[dict[str, Any]]) -> bytes:
 def anthropic_message_to_responses_sse(
     message: dict[str, Any],
     *,
-    tool_kinds: dict[str, str],
+    tool_kinds: dict[str, Any],
 ) -> bytes:
     """Convert one complete Apex Messages response to Responses SSE."""
 
@@ -401,7 +467,8 @@ def anthropic_message_to_responses_sse(
                 or not isinstance(tool_input, dict)
             ):
                 raise CodexGlmAdapterError("Invalid Apex tool_use block")
-            kind = tool_kinds[name]
+            route = tool_kinds[name]
+            kind = route.get("kind") if isinstance(route, dict) else route
             if kind == "custom":
                 raw_input = tool_input.get("input")
                 if not isinstance(raw_input, str):
@@ -430,14 +497,19 @@ def anthropic_message_to_responses_sse(
                 final_item = {**initial, "status": "completed", "input": raw_input}
             else:
                 arguments = _compact_json(tool_input)
+                output_name = (
+                    route.get("name") if isinstance(route, dict) else name
+                )
                 initial = {
                     "id": call_id,
                     "type": "function_call",
                     "status": "in_progress",
                     "call_id": call_id,
-                    "name": name,
+                    "name": output_name,
                     "arguments": "",
                 }
+                if isinstance(route, dict) and route.get("namespace"):
+                    initial["namespace"] = route["namespace"]
                 emit("response.output_item.added", output_index=output_index, item=initial)
                 emit(
                     "response.function_call_arguments.delta",
@@ -449,7 +521,7 @@ def anthropic_message_to_responses_sse(
                     "response.function_call_arguments.done",
                     item_id=call_id,
                     output_index=output_index,
-                    name=name,
+                    name=output_name,
                     arguments=arguments,
                 )
                 final_item = {

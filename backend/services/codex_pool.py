@@ -418,6 +418,14 @@ class CodexPoolAccount:
         })
 
     def supports_model(self, model: str | None) -> bool:
+        requested = str(model or "").strip().lower()
+        # GLM is exposed by Apex as an API-gateway model. Native ChatGPT Codex
+        # credentials cannot serve it even though their catalog is otherwise
+        # treated as open-ended for forward-compatible OpenAI model launches.
+        # Reject it before account grouping so a fresh GLM task is bound to the
+        # matching API projection on its very first turn.
+        if requested.startswith("glm-") and not _is_api_auth_kind(self.auth_kind):
+            return False
         if not _is_api_auth_kind(self.auth_kind):
             return True
         try:

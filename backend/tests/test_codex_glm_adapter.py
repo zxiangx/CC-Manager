@@ -83,6 +83,82 @@ def test_omits_openai_hosted_web_search_but_keeps_local_tools():
     assert tool_kinds == {"exec_command": "function"}
 
 
+def test_flattens_namespace_tools_and_restores_namespace_on_response():
+    payload, tool_kinds = responses_request_to_anthropic(_request(tools=[{
+        "type": "namespace",
+        "name": "mcp__ccm_skills",
+        "description": "CCM task tools",
+        "tools": [{
+            "type": "function",
+            "name": "ccm_command_help",
+            "description": "Read command help",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": False,
+        }],
+    }]))
+
+    upstream_name = "mcp__ccm_skills__ccm_command_help"
+    assert payload["tools"][0]["name"] == upstream_name
+    assert tool_kinds[upstream_name] == {
+        "kind": "function",
+        "namespace": "mcp__ccm_skills",
+        "name": "ccm_command_help",
+    }
+
+    response = anthropic_message_to_responses_sse({
+        "id": "msg-namespace",
+        "model": "glm-5.3",
+        "stop_reason": "tool_use",
+        "content": [{
+            "type": "tool_use",
+            "id": "call-namespace",
+            "name": upstream_name,
+            "input": {},
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    }, tool_kinds=tool_kinds)
+    item = _events(response)[-1]["response"]["output"][0]
+
+    assert item["type"] == "function_call"
+    assert item["name"] == "ccm_command_help"
+    assert item["namespace"] == "mcp__ccm_skills"
+
+
+def test_replays_namespace_tool_call_and_result():
+    payload, _ = responses_request_to_anthropic(_request(
+        tools=[{
+            "type": "namespace",
+            "name": "mcp__ccm_skills",
+            "description": "CCM task tools",
+            "tools": [{
+                "type": "function",
+                "name": "ccm_command_help",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+        }],
+        input_items=[
+            {"type": "message", "role": "user", "content": "Help"},
+            {
+                "type": "function_call",
+                "namespace": "mcp__ccm_skills",
+                "name": "ccm_command_help",
+                "call_id": "call-1",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "Available commands",
+            },
+        ],
+    ))
+
+    assert payload["messages"][1]["content"][0]["name"] == (
+        "mcp__ccm_skills__ccm_command_help"
+    )
+    assert payload["messages"][2]["content"][0]["tool_use_id"] == "call-1"
+
+
 def test_reconstructs_prior_tool_call_and_result_for_next_turn():
     payload, tool_kinds = responses_request_to_anthropic(_request(
         tools=[{

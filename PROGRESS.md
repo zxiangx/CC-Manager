@@ -1086,3 +1086,8 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **Goal 根因与修复**：CCM 把普通 Standard 消息视为 paused/blocked Goal 的恢复指令，先执行 `thread/goal/set active` 再 steer 用户输入；问题回答完后，原生 Goal 继续创建新 turn，于是数据库真实写入大量“仍处于 blocked”的重复提醒。现在普通消息只走独立 `turn/start`，持久 Goal 保持 paused/blocked，面板将 blocked 明确显示为“已阻塞”。
 - **本地部署入口**：远端更新关闭时，管理员顶栏新增“部署本地版本”。`POST /api/system/deploy` 不访问远端，只复用 `start_repair` 的工作树、活动任务、数据库快照/迁移和受控重启保护；前端经 WS 与 health/status 轮询展示步骤并在可验证完成后提示刷新。
 - **验证**：Goal 与 System API 定向回归通过；前端全量 `44 files / 576 tests`、TypeScript 与 production build 通过。macOS 本机无法运行依赖 Linux `/proc`/systemd 身份的 15 个更新脚本测试，AWS 部署后另做真实 service/health 验证。
+## 2026-08-20 Request blocked 工具输出脱敏恢复
+
+- 问题：request-block 自动 Edit replay 会重放原用户请求，但最近工具输出（pytest traceback、协议源码、巨型 rollout）可能再次触发远端 policy block。
+- 解决：新增 GLM-5.3 独立 sanitizer，读取最后一段未被 assistant/user 消费的连续 tool result batch，生成带 log ID/hash 的脱敏摘要并附加到一次性 Edit replay；本地后过滤密钥，失败则回退原恢复逻辑。Codex 原生 fork 只能切 completed turn，不能伪造 turn 内 tool result，这是本方案的协议边界。
+- 预防：以后 policy 恢复不得把原始大输出直接放回主模型； sanitizer 输入必须仅限 tool outputs，并在输出后本地过滤密钥。Commit: `26248bded`.

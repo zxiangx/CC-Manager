@@ -7869,7 +7869,9 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
 async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
     db_factory,
 ):
-    from backend.services.codex_recovery import request_blocked_replay_prompt
+    from backend.services.codex_recovery import (
+        request_blocked_replay_prompt_with_summary,
+    )
     from backend.services.dispatcher import PRIORITY_USER
 
     async with db_factory() as db:
@@ -7918,8 +7920,18 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
         MagicMock(broadcast=AsyncMock()),
     )
     manager.task_message_enqueuer = AsyncMock(return_value=True)
-    replay_prompt = request_blocked_replay_prompt("exact user request")
-    manager._create_request_blocked_edit_branch = AsyncMock(
+    sanitized_summary = (
+        "[CCM sanitized tool-output summary]\n"
+        "One command failed at fixture.py:77."
+    )
+    replay_prompt = request_blocked_replay_prompt_with_summary(
+        "exact user request",
+        sanitized_summary,
+    )
+    manager._request_blocked_tool_summary = AsyncMock(
+        return_value=sanitized_summary,
+    )
+    manager._create_request_blocked_edit_branch_with_summary = AsyncMock(
         return_value=(987, 654, replay_prompt),
     )
     manager.processes[inst_id] = process
@@ -7962,7 +7974,7 @@ async def test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle(
         command_skills={"sub-agent": True},
         model_override="gpt-5.6-sol",
     )
-    manager._create_request_blocked_edit_branch.assert_awaited_once_with(
+    manager._create_request_blocked_edit_branch_with_summary.assert_awaited_once_with(
         task_id,
         source_log_id,
         replay_prompt,

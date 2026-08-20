@@ -246,6 +246,41 @@ describe('ChatView', () => {
       expect(screen.queryByRole('button', { name: /Codex activity/ })).not.toBeInTheDocument();
     });
 
+    it('keeps earlier turns folded while a later retry is still running', async () => {
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 703,
+          role: 'assistant',
+          event_type: 'thinking',
+          content: 'Earlier attempt',
+          phase: 'commentary',
+          turn_id: 'turn-failed',
+          persisted: true,
+          is_error: false,
+          timestamp: null,
+        },
+        {
+          id: 704,
+          role: 'assistant',
+          event_type: 'thinking',
+          content: 'Current retry',
+          phase: 'commentary',
+          turn_id: 'turn-current',
+          persisted: true,
+          is_error: false,
+          timestamp: null,
+        },
+      ]);
+
+      render(<ChatView task={makeTask({ provider: 'codex', status: 'executing' })} projects={projects} onBack={onBack} />);
+
+      expect(await screen.findByText('Current retry')).toBeInTheDocument();
+      expect(screen.queryByText('Earlier attempt')).not.toBeInTheDocument();
+      const activities = screen.getAllByRole('button', { name: /Codex activity/ });
+      expect(activities).toHaveLength(1);
+      expect(activities[0]).toHaveTextContent('1 steps');
+    });
+
     it('starts Codex native compaction from the composer toolbar', async () => {
       render(
         <ChatView

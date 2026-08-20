@@ -175,6 +175,11 @@ function groupMessages(messages: ChatMessage[], keepTrailingActivityOpen = false
   const groups: MessageGroup[] = [];
   let toolBuf: ChatMessage[] = [];
   let activityBuf: ChatMessage[] = [];
+  // A task can have several Codex turns (for example after a transient
+  // retry).  The task-level running flag only describes the latest turn; it
+  // must not cause activity from an earlier, already-finished turn to become
+  // expanded again when the task is revisited.
+  let activityTurnId: string | null | undefined;
 
   const flushTools = () => {
     if (toolBuf.length > 0) {
@@ -200,6 +205,7 @@ function groupMessages(messages: ChatMessage[], keepTrailingActivityOpen = false
     if (collapsed) groups.push({ type: 'activity-group', messages: [...activityBuf] });
     else pushLegacy(activityBuf);
     activityBuf = [];
+    activityTurnId = undefined;
   };
 
   for (const msg of messages) {
@@ -209,7 +215,20 @@ function groupMessages(messages: ChatMessage[], keepTrailingActivityOpen = false
       msg.event_type === 'system_event'
       && (msg.content || '').startsWith('[Context compacted')
     );
-    if (isProcess) activityBuf.push(msg);
+    if (isProcess) {
+      // A new native turn is a hard boundary.  Close the previous turn's
+      // activity even if the overall task is still executing a retry.
+      if (
+        activityBuf.length > 0
+        && msg.turn_id != null
+        && activityTurnId != null
+        && msg.turn_id !== activityTurnId
+      ) {
+        flushActivity(true);
+      }
+      if (activityBuf.length === 0) activityTurnId = msg.turn_id;
+      activityBuf.push(msg);
+    }
     else {
       flushActivity(!keepTrailingActivityOpen);
       pushLegacy([msg]);

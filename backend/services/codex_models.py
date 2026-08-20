@@ -58,7 +58,7 @@ CODEX_MODEL_EFFORTS: dict[str, list[str]] = {
 # context_window per model（~/.codex/models_cache.json 实测，2026-07-19：
 # gpt-5.6-* / gpt-5.5 / gpt-5.4 / gpt-5.4-mini 均 272000，gpt-5.3-codex-spark 128000）
 CODEX_CONTEXT_WINDOWS: dict[str, int] = {
-    "glm-5.3": 204_800,
+    "glm-5.3": 1_000_000,
     "glm-5.2": 204_800,
     "glm-5.1": 204_800,
     "glm-5-turbo": 204_800,

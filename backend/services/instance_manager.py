@@ -5602,6 +5602,13 @@ class InstanceManager:
                 ])
             if model and model != "default":
                 cmd.extend(["--model", model])
+            if isinstance(model, str) and model.lower().startswith("glm-"):
+                from backend.services.codex_models import codex_context_window
+
+                cmd.extend([
+                    "-c",
+                    f"model_context_window={codex_context_window(model)}",
+                ])
             codex_effort = clamp_codex_effort(model, effort_level)
             if codex_effort:
                 cmd.extend(["-c", f'model_reasoning_effort="{codex_effort}"'])

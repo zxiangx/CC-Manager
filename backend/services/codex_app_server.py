@@ -2718,6 +2718,14 @@ class CodexAppServer:
                     },
                 },
             )
+        if isinstance(model, str) and model.lower().startswith("glm-"):
+            # Custom providers are absent from Codex's native model catalog,
+            # so app-server otherwise assigns its generic 258,400-token
+            # window. Keep Codex's own meter and auto-compaction boundary in
+            # sync with CCM's selected GLM capability.
+            from backend.services.codex_models import codex_context_window
+
+            thread_config["model_context_window"] = codex_context_window(model)
         if disable_project_config:
             _deep_merge_config(
                 thread_config,

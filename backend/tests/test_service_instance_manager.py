@@ -10902,6 +10902,18 @@ async def test_process_event_cannot_borrow_replacement_consumer_generation(
 # === GPT-5.6 per-model effort in codex command ===
 
 
+def test_build_command_codex_glm_passes_context_window_override():
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="codex",
+        prompt="hi",
+        model="glm-5.3",
+        resume_session_id=None,
+        effort_level=None,
+    )
+    assert "model_context_window=1000000" in cmd
+
+
 def test_build_command_codex_gpt56_passes_max_effort():
     # 旧代码把 max 一律丢弃（"codex 无 max"），但 gpt-5.6-sol 支持 max
     im = InstanceManager(MagicMock(), MagicMock())
@@ -11213,10 +11225,10 @@ async def test_process_event_glm_overrides_generic_codex_context_window(db_facto
         and call[0][1].get("event_type") == "context_usage"
     ]
     assert len(ctx_calls) == 1
-    assert ctx_calls[0][0][1]["context_window"] == 204_800
+    assert ctx_calls[0][0][1]["context_window"] == 1_000_000
     async with db_factory() as db:
         stored = await db.get(Task, task_id)
-        assert stored.context_window_usage["context_window"] == 204_800
+        assert stored.context_window_usage["context_window"] == 1_000_000
 
 
 @pytest.mark.asyncio

@@ -98,11 +98,13 @@ def test_streams_text_deltas_before_message_completion():
     response = completed[-1]["response"]
     assert response["output"][0]["content"][0]["text"] == "GLM ready"
     assert response["usage"] == {
-        "input_tokens": 11,
+        # Anthropic reports uncached input and cache reads separately, while
+        # Responses reports cached tokens as a subset of total input.
+        "input_tokens": 14,
         "input_tokens_details": {"cached_tokens": 3},
         "output_tokens": 2,
         "output_tokens_details": {"reasoning_tokens": 0},
-        "total_tokens": 13,
+        "total_tokens": 16,
     }
 
 
@@ -368,7 +370,11 @@ def test_converts_text_message_to_complete_responses_sse():
         "model": "glm-5.3",
         "stop_reason": "end_turn",
         "content": [{"type": "text", "text": "Done."}],
-        "usage": {"input_tokens": 10, "output_tokens": 4},
+        "usage": {
+            "input_tokens": 10,
+            "cache_read_input_tokens": 3,
+            "output_tokens": 4,
+        },
     }, tool_kinds={})
     events = _events(payload)
 
@@ -382,7 +388,13 @@ def test_converts_text_message_to_complete_responses_sse():
     assert completed["type"] == "response.completed"
     assert completed["response"]["status"] == "completed"
     assert completed["response"]["output"][0]["content"][0]["text"] == "Done."
-    assert completed["response"]["usage"]["total_tokens"] == 14
+    assert completed["response"]["usage"] == {
+        "input_tokens": 13,
+        "input_tokens_details": {"cached_tokens": 3},
+        "output_tokens": 4,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 17,
+    }
 
 
 def test_converts_function_and_custom_tool_use_blocks():

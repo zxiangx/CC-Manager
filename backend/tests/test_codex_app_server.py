@@ -540,6 +540,38 @@ async def test_standard_turn_remains_available_without_actual_tier_route():
 
 
 @pytest.mark.asyncio
+async def test_glm_turn_uses_model_context_window_in_thread_config():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-glm-context",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+        },
+        {"turn": {"id": "turn-glm-context"}},
+    ])
+
+    await server.start_turn(
+        prompt="long GLM turn",
+        cwd="/tmp",
+        model="glm-5.3",
+        effort=None,
+        resume_session_id=None,
+        git_env=None,
+        task_id=905,
+        codex_service_tier="default",
+    )
+
+    thread_call, _turn_call = server._request.await_args_list
+    assert thread_call.args[0] == "thread/start"
+    assert thread_call.args[1]["config"]["model_context_window"] == 1_000_000
+
+
+@pytest.mark.asyncio
 async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
     server = CodexAppServer(
         "codex",

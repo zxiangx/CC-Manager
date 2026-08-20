@@ -382,12 +382,16 @@ class AnthropicMessagesStreamAdapter:
         return value
 
     def _usage(self) -> dict[str, Any]:
+        # Anthropic's input_tokens excludes cache reads. Responses defines
+        # cached_tokens as a subset of input_tokens, so translate the usage
+        # semantics instead of forwarding the two counters verbatim.
+        total_input_tokens = self.input_tokens + self.cached_tokens
         return {
-            "input_tokens": self.input_tokens,
+            "input_tokens": total_input_tokens,
             "input_tokens_details": {"cached_tokens": self.cached_tokens},
             "output_tokens": self.output_tokens,
             "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": self.input_tokens + self.output_tokens,
+            "total_tokens": total_input_tokens + self.output_tokens,
         }
 
     def _require_active(self) -> None:
@@ -795,12 +799,13 @@ def anthropic_message_to_responses_sse(
     input_tokens = int(usage_raw.get("input_tokens") or 0)
     output_tokens = int(usage_raw.get("output_tokens") or 0)
     cached_tokens = int(usage_raw.get("cache_read_input_tokens") or 0)
+    total_input_tokens = input_tokens + cached_tokens
     usage = {
-        "input_tokens": input_tokens,
+        "input_tokens": total_input_tokens,
         "input_tokens_details": {"cached_tokens": cached_tokens},
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": 0},
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": total_input_tokens + output_tokens,
     }
     events: list[dict[str, Any]] = []
     sequence = 0

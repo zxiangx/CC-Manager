@@ -166,8 +166,8 @@ class TestCodexContextWindow:
         assert codex_context_window("gpt-9000") == DEFAULT_CODEX_CONTEXT_WINDOW
 
     def test_glm_context_windows(self):
+        assert codex_context_window("glm-5.3") == 1_000_000
         for model in (
-            "glm-5.3",
             "glm-5.2",
             "glm-5.1",
             "glm-5-turbo",

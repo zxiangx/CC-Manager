@@ -104,6 +104,7 @@ class CodexTierProxyRoute:
     provider_aliases: tuple[str, ...] = ()
     built_in_openai: bool = True
     label: str = "OpenAI"
+    glm_models: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         _validate_upstream_base_url(self.upstream_base_url)
@@ -117,6 +118,13 @@ class CodexTierProxyRoute:
                 )
             ):
                 raise CodexTierProxyError("Unsafe Codex model provider id")
+        if any(
+            not isinstance(model, str)
+            or not model.lower().startswith("glm-")
+            or len(model) > 256
+            for model in self.glm_models
+        ):
+            raise CodexTierProxyError("Unsafe GLM model route")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1250,6 +1258,37 @@ class CodexActualTierProxy:
                         "Actual service-tier proxy became unavailable"
                     )
                 return
+            try:
+                request_body = json.loads(body) if body else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CodexTierProofError("Invalid Responses JSON") from exc
+            requested_model = (
+                request_body.get("model")
+                if isinstance(request_body, dict)
+                else None
+            )
+            if self.route.glm_models and relative_path == "/responses":
+                logger.info(
+                    "Codex GLM adapter route model=%s enabled=%s",
+                    requested_model,
+                    requested_model in self.route.glm_models,
+                )
+            if requested_model in self.route.glm_models:
+                if identity is None:
+                    raise CodexTierProofError(
+                        "GLM Responses adaptation requires a Codex turn identity"
+                    )
+                if identity.expected_tier != CODEX_TIER_DEFAULT:
+                    raise CodexTierProofError(
+                        "Apex GLM supports only the Standard service tier"
+                    )
+                await self._forward_glm_messages_response(
+                    writer,
+                    client,
+                    headers,
+                    request_body,
+                )
+                return
             upstream_url = (
                 f"{self.route.upstream_base_url.rstrip('/')}"
                 f"{relative_path}"
@@ -1292,6 +1331,83 @@ class CodexActualTierProxy:
             if request_active:
                 assert identity is not None
                 self._end_request(identity)
+
+    async def _forward_glm_messages_response(
+        self,
+        writer: asyncio.StreamWriter,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        request_body: dict[str, Any],
+    ) -> None:
+        """Serve one GLM Codex turn through Apex's Anthropic endpoint."""
+
+        from backend.services.codex_glm_adapter import (
+            CodexGlmAdapterError,
+            anthropic_message_to_responses_sse,
+            responses_request_to_anthropic,
+        )
+
+        authorization = headers.get("authorization", "")
+        scheme, separator, api_key = authorization.partition(" ")
+        if (
+            separator != " "
+            or scheme.lower() != "bearer"
+            or not api_key
+            or len(api_key.encode("utf-8")) > _MAX_AUTH_BYTES
+        ):
+            raise CodexGlmAdapterError("Missing Apex bearer credential")
+        payload, tool_kinds = responses_request_to_anthropic(request_body)
+        upstream_url = f"{self.route.upstream_base_url.rstrip('/')}/messages"
+        request = client.build_request(
+            "POST",
+            upstream_url,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "accept-encoding": "identity",
+            },
+            content=json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        upstream = await client.send(request, stream=True)
+        try:
+            raw = bytearray()
+            async for chunk in _iter_response_raw(upstream):
+                raw.extend(chunk)
+                if len(raw) > _MAX_ERROR_BODY_BYTES:
+                    raise CodexGlmAdapterError("Apex GLM response is too large")
+            if upstream.status_code < 200 or upstream.status_code >= 300:
+                await self._send_response(
+                    writer,
+                    upstream.status_code,
+                    list(_filter_response_headers(upstream.headers)),
+                    bytes(raw),
+                )
+                return
+            try:
+                message = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CodexGlmAdapterError("Invalid Apex GLM response") from exc
+            converted = anthropic_message_to_responses_sse(
+                message,
+                tool_kinds=tool_kinds,
+            )
+            await self._send_response(
+                writer,
+                200,
+                [
+                    ("Content-Type", "text/event-stream; charset=utf-8"),
+                    ("Cache-Control", "no-cache"),
+                ],
+                converted,
+            )
+        finally:
+            await upstream.aclose()
 
     async def _read_body(
         self,

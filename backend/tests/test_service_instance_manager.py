@@ -67,7 +67,7 @@ def test_codex_main_mcp_capability_defaults_on():
     assert Settings.model_fields["codex_main_mcp_enabled"].default is True
 
 
-def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
+def _api_account_stub(tmp_path, *, api_provider="cloudrouter", models=None):
     root = tmp_path / "api-account"
     return types.SimpleNamespace(
         id=f"{api_provider}-1",
@@ -75,7 +75,29 @@ def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
         root=root,
         claude_config_dir=str(root / "claude"),
         codex_home=str(root / "codex"),
+        models=models or {"claude": [], "codex": []},
     )
+
+
+def test_apex_glm_models_enable_codex_messages_adapter(db_factory, tmp_path):
+    im = InstanceManager(db_factory, MagicMock())
+    account = _api_account_stub(
+        tmp_path,
+        api_provider="apex",
+        models={
+            "claude": [],
+            "codex": ["glm-5.3", "glm-5.2", "gpt-5.6-sol"],
+        },
+    )
+    store = MagicMock()
+    store.account_for_codex_home.return_value = account
+    im.cloudrouter_store = store
+
+    route = im._codex_actual_tier_route_for_home(account.codex_home)
+
+    assert route is not None
+    assert route.provider_id == "apexrouter"
+    assert route.glm_models == frozenset({"glm-5.3", "glm-5.2"})
 
 
 @pytest.mark.asyncio

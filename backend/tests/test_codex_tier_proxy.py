@@ -17,6 +17,7 @@ from backend.services.codex_tier_proxy import (
 
 def _request_body(
     *,
+    model: str = "gpt-test",
     thread_id: str = "thread-1",
     turn_id: str = "turn-1",
     tier: str | None = "priority",
@@ -36,7 +37,7 @@ def _request_body(
         metadata["x-codex-parent-thread-id"] = parent_thread_id
         metadata["x-codex-turn-metadata"] = json.dumps(turn_metadata)
     body = {
-        "model": "gpt-test",
+        "model": model,
         "stream": True,
         "input": [],
         "client_metadata": metadata,
@@ -71,6 +72,106 @@ async def _running_proxy(handler):
     )
     await proxy.start()
     return proxy
+
+
+@pytest.mark.asyncio
+async def test_apex_glm_route_translates_responses_to_messages():
+    seen = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "msg-glm",
+            "model": "glm-5.3",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "GLM ready"}],
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        })
+
+    proxy = CodexActualTierProxy(
+        CodexTierProxyRoute(
+            "https://api.apexin.ai/v1",
+            provider_id="apexrouter",
+            built_in_openai=False,
+            glm_models=frozenset({"glm-5.3"}),
+        ),
+        http_transport=httpx.MockTransport(handler),
+    )
+    await proxy.start()
+    proxy.set_thread_tier("thread-1", "default")
+    try:
+        body = _request_body(model="glm-5.3", tier=None)
+        body["instructions"] = "Use tools carefully."
+        body["input"] = [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}],
+        }]
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.post(
+                f"{proxy.local_base_url}/responses",
+                headers={
+                    "x-client-request-id": "thread-1",
+                    "authorization": "Bearer apex-secret",
+                },
+                json=body,
+            )
+        assert response.status_code == 200
+        assert b"response.output_text.delta" in response.content
+        assert b"GLM ready" in response.content
+        assert seen["url"] == "https://api.apexin.ai/v1/messages"
+        assert seen["headers"]["x-api-key"] == "apex-secret"
+        assert "authorization" not in seen["headers"]
+        assert seen["headers"]["anthropic-version"] == "2023-06-01"
+        assert seen["body"]["stream"] is False
+        assert seen["body"]["model"] == "glm-5.3"
+    finally:
+        await proxy.close()
+
+
+@pytest.mark.asyncio
+async def test_apex_glm_route_does_not_translate_other_models():
+    seen = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(tier="default"),
+        )
+
+    proxy = CodexActualTierProxy(
+        CodexTierProxyRoute(
+            "https://api.apexin.ai/v1",
+            provider_id="apexrouter",
+            built_in_openai=False,
+            glm_models=frozenset({"glm-5.3"}),
+        ),
+        http_transport=httpx.MockTransport(handler),
+    )
+    await proxy.start()
+    proxy.set_thread_tier("thread-1", "default")
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.post(
+                f"{proxy.local_base_url}/responses",
+                headers={
+                    "x-client-request-id": "thread-1",
+                    "authorization": "Bearer apex-secret",
+                },
+                json=_request_body(model="gpt-5.4", tier=None),
+            )
+        assert response.status_code == 200
+        assert seen == {
+            "url": "https://api.apexin.ai/v1/responses",
+            "authorization": "Bearer apex-secret",
+        }
+    finally:
+        await proxy.close()
 
 
 @pytest.mark.asyncio

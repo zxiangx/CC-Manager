@@ -1801,6 +1801,12 @@ class InstanceManager:
                     ),
                     built_in_openai=False,
                     label=spec.label,
+                    glm_models=frozenset(
+                        model
+                        for model in (account.models or {}).get("codex", [])
+                        if account.api_provider == API_PROVIDER_APEX
+                        and model.lower().startswith("glm-")
+                    ),
                 )
             return resolve_native_codex_tier_route(codex_home)
         except (CodexTierProxyError, OSError):

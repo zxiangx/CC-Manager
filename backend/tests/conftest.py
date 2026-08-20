@@ -53,7 +53,7 @@ os.environ.update({
     "PORT": "0",
     # Host shell/.env settings must not make baseline tests nondeterministic.
     "DEFAULT_PROVIDER": "codex",
-    "DEFAULT_CODEX_MODEL": "gpt-5.6-sol",
+    "DEFAULT_CODEX_MODEL": "glm-5.3",
 })
 
 import pytest

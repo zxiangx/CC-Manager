@@ -621,7 +621,7 @@ def _provider_for_model(model: str) -> str | None:
     value = _normalise_model(model).lower()
     if value.startswith("claude-"):
         return "claude"
-    if value.startswith(("gpt-", "o1", "o3", "o4", "codex-")):
+    if value.startswith(("gpt-", "o1", "o3", "o4", "codex-", "glm-")):
         return "codex"
     return None
 

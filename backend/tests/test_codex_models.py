@@ -17,6 +17,17 @@ from backend.services.codex_models import (
 )
 
 GPT56_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+GLM_MODELS = [
+    "glm-5.3",
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5-turbo",
+    "glm-5",
+    "glm-4.7",
+    "glm-4.6",
+    "glm-4.5",
+    "glm-4.5-air",
+]
 
 
 def _option_list() -> list[str]:
@@ -32,6 +43,12 @@ def test_codex_model_options_contain_all_three_gpt56_models():
 def test_codex_model_options_have_no_bare_gpt56():
     # 裸 "gpt-5.6" 不是有效的 Codex 模型 ID（服务端只有 -sol/-terra/-luna）
     assert "gpt-5.6" not in _option_list()
+
+
+def test_glm_models_are_codex_options_and_glm53_is_default():
+    options = _option_list()
+    assert settings.default_codex_model == "glm-5.3"
+    assert all(model in options for model in GLM_MODELS)
 
 
 def test_gpt56_sol_terra_support_max_and_ultra():
@@ -96,6 +113,8 @@ def test_fast_service_tier_capabilities_match_catalog():
     assert supported_codex_service_tiers("gpt-5.4-mini") == ["default"]
     assert supported_codex_service_tiers("gpt-5.3-codex-spark") == ["default"]
     assert supported_codex_service_tiers("future-model") == ["default"]
+    for model in GLM_MODELS:
+        assert supported_codex_service_tiers(model) == ["default"]
 
 
 def test_default_model_service_tier_uses_configured_model():
@@ -145,6 +164,20 @@ class TestCodexContextWindow:
 
     def test_unknown_model_falls_back_to_default(self):
         assert codex_context_window("gpt-9000") == DEFAULT_CODEX_CONTEXT_WINDOW
+
+    def test_glm_context_windows(self):
+        for model in (
+            "glm-5.3",
+            "glm-5.2",
+            "glm-5.1",
+            "glm-5-turbo",
+            "glm-5",
+            "glm-4.7",
+            "glm-4.6",
+        ):
+            assert codex_context_window(model) == 204_800
+        assert codex_context_window("glm-4.5") == 131_072
+        assert codex_context_window("glm-4.5-air") == 131_072
 
     def test_none_and_default_use_configured_default_model(self):
         from backend.config import settings

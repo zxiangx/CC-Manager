@@ -29,6 +29,15 @@ CODEX_SERVICE_TIERS = (
 # Runtime account/model discovery remains authoritative because API routers can
 # expose a different catalog; this map is the request-time/UI safety gate.
 CODEX_MODEL_SERVICE_TIERS: dict[str, list[str]] = {
+    "glm-5.3": ["default"],
+    "glm-5.2": ["default"],
+    "glm-5.1": ["default"],
+    "glm-5-turbo": ["default"],
+    "glm-5": ["default"],
+    "glm-4.7": ["default"],
+    "glm-4.6": ["default"],
+    "glm-4.5": ["default"],
+    "glm-4.5-air": ["default"],
     "gpt-5.6-sol": ["default", "priority"],
     "gpt-5.6-terra": ["default", "priority"],
     "gpt-5.6-luna": ["default", "priority"],
@@ -49,6 +58,15 @@ CODEX_MODEL_EFFORTS: dict[str, list[str]] = {
 # context_window per model（~/.codex/models_cache.json 实测，2026-07-19：
 # gpt-5.6-* / gpt-5.5 / gpt-5.4 / gpt-5.4-mini 均 272000，gpt-5.3-codex-spark 128000）
 CODEX_CONTEXT_WINDOWS: dict[str, int] = {
+    "glm-5.3": 204_800,
+    "glm-5.2": 204_800,
+    "glm-5.1": 204_800,
+    "glm-5-turbo": 204_800,
+    "glm-5": 204_800,
+    "glm-4.7": 204_800,
+    "glm-4.6": 204_800,
+    "glm-4.5": 131_072,
+    "glm-4.5-air": 131_072,
     "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,

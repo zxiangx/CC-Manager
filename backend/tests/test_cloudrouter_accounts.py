@@ -1473,6 +1473,36 @@ async def test_apex_model_probe_accepts_openai_compatible_response(
 
 
 @pytest.mark.asyncio
+async def test_apex_model_probe_projects_glm_models_into_codex(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "object": "list",
+            "data": [
+                {"id": "glm-5.3"},
+                {"id": "glm-5.2"},
+                {"id": "glm-4.5-air"},
+            ],
+        }),
+    )
+
+    models = await store.probe_models(
+        "lck-test-secret",
+        api_provider="apex",
+    )
+
+    assert models == {
+        "claude": [],
+        "codex": ["glm-4.5-air", "glm-5.2", "glm-5.3"],
+        "service_tiers": {},
+    }
+
+
+@pytest.mark.asyncio
 async def test_apex_service_tiers_are_persisted_and_reloaded(
     tmp_path, monkeypatch,
 ):

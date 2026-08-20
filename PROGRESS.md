@@ -1091,3 +1091,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - 问题：request-block 自动 Edit replay 会重放原用户请求，但最近工具输出（pytest traceback、协议源码、巨型 rollout）可能再次触发远端 policy block。
 - 解决：新增 GLM-5.3 独立 sanitizer，读取最后一段未被 assistant/user 消费的连续 tool result batch，生成带 log ID/hash 的脱敏摘要并附加到一次性 Edit replay；本地后过滤密钥，失败则回退原恢复逻辑。Codex 原生 fork 只能切 completed turn，不能伪造 turn 内 tool result，这是本方案的协议边界。
 - 预防：以后 policy 恢复不得把原始大输出直接放回主模型； sanitizer 输入必须仅限 tool outputs，并在输出后本地过滤密钥。Commit: `26248bded`.
+
+## 2026-08-20 Codex Side 对话、过程折叠与选中文本询问
+
+- **问题**：长会话的 commentary/thinking/tool/compact 输出持续占据主时间线；调查某个历史回答只能改动主分支或完整复制最新上下文；选中回复文本后缺少就地追问入口。
+- **解决**：提交 `b558839b` 增加助手回复 exact completed-turn Fork，Side Task 以 archived metadata 隐藏并在悬浮 ChatView 中独立运行、恢复、最小化和删除；完成后的执行过程聚合为可展开 Activity，活跃 turn 和注入用户消息保持可见；助手文本选择可作为 Markdown quote 写入 composer。
+- **预防**：历史 Fork 必须依赖持久化 native `turn_id` 并由 app-server 再验证终态，禁止按消息顺序猜测或把转录文本拼成伪上下文。纯 UI 临时分支仍使用正常 Task 生命周期，但必须从所有普通 Task 查询中隐藏。

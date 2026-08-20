@@ -7084,7 +7084,9 @@ class InstanceManager:
                 task_id,
             )
             return False
-        from backend.services.codex_recovery import request_blocked_replay_prompt
+        from backend.services.codex_recovery import (
+            request_blocked_replay_prompt_with_summary,
+        )
         from backend.services.dispatcher import PRIORITY_USER
 
         replay_message = None
@@ -7133,14 +7135,25 @@ class InstanceManager:
                 task_id,
             )
             return False
-        replay_prompt = request_blocked_replay_prompt(replay_message)
+
+        sanitized_output = await self._request_blocked_tool_summary(task_id)
+        if sanitized_output is None:
+            logger.warning(
+                "Task %d Request blocked without a usable tool-output batch; "
+                "falling back to the plain Edit replay",
+                task_id,
+            )
+        replay_prompt = request_blocked_replay_prompt_with_summary(
+            replay_message,
+            sanitized_output,
+        )
 
         try:
             (
                 recovery_task_id,
                 recovery_log_id,
                 model_prompt,
-            ) = await self._create_request_blocked_edit_branch(
+            ) = await self._create_request_blocked_edit_branch_with_summary(
                 task_id,
                 source_log_id,
                 replay_prompt,
@@ -7185,6 +7198,142 @@ class InstanceManager:
                 task_id,
             )
         return bool(enqueued)
+
+    async def _request_blocked_tool_summary(self, task_id: int) -> str | None:
+        """Summarize the final tool batch without exposing its raw text again."""
+
+        try:
+            async with self.db_factory() as db:
+                rows = (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.task_id == task_id,
+                            LogEntry.event_type == "tool_result",
+                            LogEntry.role == "tool",
+                        )
+                        .order_by(LogEntry.id.desc())
+                        .limit(20)
+                    )
+                ).scalars().all()
+                if not rows:
+                    return None
+                # Find the last contiguous result batch; if a model message or
+                # another user turn consumed it, its raw text is no longer the
+                # obvious trigger. Stay one-shot and do not guess in that case.
+                contiguous: list[LogEntry] = []
+                for row in rows:
+                    if contiguous and row.id != contiguous[-1].id - 1:
+                        break
+                    contiguous.append(row)
+                contiguous.reverse()
+                source_ids = {row.id for row in contiguous}
+                if source_ids:
+                    later = (
+                        await db.execute(
+                            select(LogEntry.id)
+                            .where(
+                                LogEntry.task_id == task_id,
+                                LogEntry.id > max(source_ids),
+                                LogEntry.id.not_in(source_ids),
+                                LogEntry.event_type.in_({
+                                    "user_message", "message", "tool_result"
+                                }),
+                            )
+                            .order_by(LogEntry.id)
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    if later is not None:
+                        return None
+                raw_rows = [
+                    {
+                        "id": row.id,
+                        "tool_input": row.tool_input,
+                        "tool_output": row.tool_output,
+                        "is_error": row.is_error,
+                    }
+                    for row in contiguous
+                ]
+        except Exception:
+            logger.exception(
+                "Could not load the final tool batch for blocked task %d",
+                task_id,
+            )
+            return None
+
+        sanitized = await self._summarize_blocked_tool_outputs(raw_rows)
+        if sanitized is None:
+            return None
+        return sanitized.content
+
+    async def _create_request_blocked_edit_branch_with_summary(
+        self,
+        task_id: int,
+        source_log_id: int,
+        replay_prompt: str,
+        source_metadata: dict,
+    ):
+        """Compatibility wrapper used by focused recovery tests."""
+
+        return await self._create_request_blocked_edit_branch(
+            task_id,
+            source_log_id,
+            replay_prompt,
+            source_metadata,
+        )
+    async def _summarize_blocked_tool_outputs(self, rows: list[dict]):
+        """Call the GLM sanitizer through one exact enabled Apex account."""
+
+        from backend.services.cloudrouter_accounts import (
+            API_PROVIDER_APEX,
+            API_PROVIDER_SPECS,
+        )
+        from backend.services.codex_tool_sanitizer import (
+            CodexToolSanitizerError,
+            summarize_tool_outputs_with_glm,
+        )
+
+        store = self.cloudrouter_store
+        if store is None:
+            return None
+        try:
+            candidates = [
+                account
+                for account in store.visible_accounts()
+                if account.enabled
+                and not account.retired
+                and account.api_provider == API_PROVIDER_APEX
+                and "glm-5.3" in account.models.get("codex", [])
+            ]
+        except Exception:
+            logger.exception("Could not enumerate GLM sanitizer accounts")
+            return None
+        if not candidates:
+            logger.warning("No enabled Apex GLM account supports glm-5.3")
+            return None
+        account = sorted(candidates, key=lambda item: item.id)[0]
+        try:
+            account_id = account.id
+            api_key = store._read_api_key(account)
+            spec = API_PROVIDER_SPECS[account.api_provider]
+            base_url = spec.codex_base_url
+        except Exception as exc:
+            logger.warning(
+                "Could not load GLM sanitizer account %s: %s",
+                account_id,
+                exc,
+            )
+            return None
+        try:
+            return await summarize_tool_outputs_with_glm(
+                rows,
+                base_url=base_url,
+                api_key=api_key,
+            )
+        except CodexToolSanitizerError as exc:
+            logger.warning("GLM sanitizer failed for blocked task: %s", exc)
+            return None
 
     async def _create_request_blocked_edit_branch(
         self,

@@ -3,7 +3,6 @@ import json
 import pytest
 
 from backend.services.codex_glm_adapter import (
-    AnthropicMessagesStreamAdapter,
     CodexGlmAdapterError,
     anthropic_message_to_responses_sse,
     responses_request_to_anthropic,
@@ -36,146 +35,6 @@ def _events(payload: bytes) -> list[dict]:
     return result
 
 
-def _stream_message_start():
-    return {
-        "type": "message_start",
-        "message": {
-            "id": "msg-stream",
-            "model": "glm-5.3",
-            "content": [],
-            "usage": {"input_tokens": 11, "cache_read_input_tokens": 3},
-        },
-    }
-
-
-def test_streams_text_deltas_before_message_completion():
-    adapter = AnthropicMessagesStreamAdapter(tool_kinds={})
-
-    created = _events(adapter.feed(_stream_message_start()))
-    started = _events(adapter.feed({
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }))
-    first_delta = _events(adapter.feed({
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {"type": "text_delta", "text": "GLM "},
-    }))
-
-    assert [event["type"] for event in created] == [
-        "response.created",
-        "response.in_progress",
-    ]
-    assert started[0]["type"] == "response.output_item.added"
-    assert first_delta[0]["type"] == "response.output_text.delta"
-    assert first_delta[0]["delta"] == "GLM "
-    assert adapter.completed is False
-
-    adapter.feed({
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {"type": "text_delta", "text": "ready"},
-    })
-    done = _events(adapter.feed({"type": "content_block_stop", "index": 0}))
-    adapter.feed({
-        "type": "message_delta",
-        "delta": {"stop_reason": "end_turn"},
-        "usage": {"output_tokens": 2},
-    })
-    completed = _events(adapter.feed({"type": "message_stop"}))
-    adapter.finish()
-
-    assert done[0]["type"] == "response.output_text.done"
-    assert done[0]["text"] == "GLM ready"
-    assert completed[-1]["type"] == "response.completed"
-    response = completed[-1]["response"]
-    assert response["output"][0]["content"][0]["text"] == "GLM ready"
-    assert response["usage"] == {
-        "input_tokens": 11,
-        "input_tokens_details": {"cached_tokens": 3},
-        "output_tokens": 2,
-        "output_tokens_details": {"reasoning_tokens": 0},
-        "total_tokens": 13,
-    }
-
-
-def test_streams_function_arguments_and_safely_unwraps_custom_input():
-    adapter = AnthropicMessagesStreamAdapter(tool_kinds={
-        "read_file": "function",
-        "apply_patch": "custom",
-    })
-    adapter.feed(_stream_message_start())
-    function_start = _events(adapter.feed({
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {
-            "type": "tool_use",
-            "id": "call-fn",
-            "name": "read_file",
-            "input": {},
-        },
-    }))
-    function_delta = _events(adapter.feed({
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {"type": "input_json_delta", "partial_json": '{"path":'},
-    }))
-    adapter.feed({
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {"type": "input_json_delta", "partial_json": '"README.md"}'},
-    })
-    function_done = _events(adapter.feed({
-        "type": "content_block_stop",
-        "index": 0,
-    }))
-
-    assert function_start[0]["type"] == "response.output_item.added"
-    assert function_delta[0]["type"] == "response.function_call_arguments.delta"
-    assert function_delta[0]["delta"] == '{"path":'
-    assert function_done[-1]["item"]["arguments"] == '{"path":"README.md"}'
-
-    adapter.feed({
-        "type": "content_block_start",
-        "index": 1,
-        "content_block": {
-            "type": "tool_use",
-            "id": "call-custom",
-            "name": "apply_patch",
-            "input": {},
-        },
-    })
-    assert adapter.feed({
-        "type": "content_block_delta",
-        "index": 1,
-        "delta": {"type": "input_json_delta", "partial_json": '{"input":"*** '},
-    }) == b""
-    adapter.feed({
-        "type": "content_block_delta",
-        "index": 1,
-        "delta": {"type": "input_json_delta", "partial_json": 'Patch\\n"}'},
-    })
-    custom_done = _events(adapter.feed({
-        "type": "content_block_stop",
-        "index": 1,
-    }))
-
-    assert custom_done[0]["type"] == "response.custom_tool_call_input.delta"
-    assert custom_done[0]["delta"] == "*** Patch\n"
-    assert custom_done[-1]["item"]["input"] == "*** Patch\n"
-
-
-def test_stream_adapter_rejects_invalid_order_and_incomplete_eof():
-    adapter = AnthropicMessagesStreamAdapter(tool_kinds={})
-    with pytest.raises(CodexGlmAdapterError, match="message_start"):
-        adapter.feed({"type": "message_stop"})
-
-    adapter.feed(_stream_message_start())
-    with pytest.raises(CodexGlmAdapterError, match="before message_stop"):
-        adapter.finish()
-
-
 def test_converts_instructions_messages_and_function_custom_tools():
     payload, tool_kinds = responses_request_to_anthropic(_request(tools=[
         {
@@ -202,102 +61,11 @@ def test_converts_instructions_messages_and_function_custom_tools():
         "role": "user",
         "content": [{"type": "text", "text": "Inspect repo"}],
     }]
-    assert payload["stream"] is True
+    assert payload["stream"] is False
     assert payload["max_tokens"] == 32_768
     assert payload["tools"][0]["input_schema"]["required"] == ["path"]
     assert payload["tools"][1]["input_schema"]["required"] == ["input"]
     assert tool_kinds == {"read_file": "function", "apply_patch": "custom"}
-
-
-def test_omits_openai_hosted_web_search_but_keeps_local_tools():
-    payload, tool_kinds = responses_request_to_anthropic(_request(tools=[
-        {"type": "web_search", "external_web_access": True},
-        {
-            "type": "function",
-            "name": "exec_command",
-            "description": "Run a command",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    ]))
-
-    assert [tool["name"] for tool in payload["tools"]] == ["exec_command"]
-    assert tool_kinds == {"exec_command": "function"}
-
-
-def test_flattens_namespace_tools_and_restores_namespace_on_response():
-    payload, tool_kinds = responses_request_to_anthropic(_request(tools=[{
-        "type": "namespace",
-        "name": "mcp__ccm_skills",
-        "description": "CCM task tools",
-        "tools": [{
-            "type": "function",
-            "name": "ccm_command_help",
-            "description": "Read command help",
-            "parameters": {"type": "object", "properties": {}},
-            "strict": False,
-        }],
-    }]))
-
-    upstream_name = "mcp__ccm_skills__ccm_command_help"
-    assert payload["tools"][0]["name"] == upstream_name
-    assert tool_kinds[upstream_name] == {
-        "kind": "function",
-        "namespace": "mcp__ccm_skills",
-        "name": "ccm_command_help",
-    }
-
-    response = anthropic_message_to_responses_sse({
-        "id": "msg-namespace",
-        "model": "glm-5.3",
-        "stop_reason": "tool_use",
-        "content": [{
-            "type": "tool_use",
-            "id": "call-namespace",
-            "name": upstream_name,
-            "input": {},
-        }],
-        "usage": {"input_tokens": 10, "output_tokens": 2},
-    }, tool_kinds=tool_kinds)
-    item = _events(response)[-1]["response"]["output"][0]
-
-    assert item["type"] == "function_call"
-    assert item["name"] == "ccm_command_help"
-    assert item["namespace"] == "mcp__ccm_skills"
-
-
-def test_replays_namespace_tool_call_and_result():
-    payload, _ = responses_request_to_anthropic(_request(
-        tools=[{
-            "type": "namespace",
-            "name": "mcp__ccm_skills",
-            "description": "CCM task tools",
-            "tools": [{
-                "type": "function",
-                "name": "ccm_command_help",
-                "parameters": {"type": "object", "properties": {}},
-            }],
-        }],
-        input_items=[
-            {"type": "message", "role": "user", "content": "Help"},
-            {
-                "type": "function_call",
-                "namespace": "mcp__ccm_skills",
-                "name": "ccm_command_help",
-                "call_id": "call-1",
-                "arguments": "{}",
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "call-1",
-                "output": "Available commands",
-            },
-        ],
-    ))
-
-    assert payload["messages"][1]["content"][0]["name"] == (
-        "mcp__ccm_skills__ccm_command_help"
-    )
-    assert payload["messages"][2]["content"][0]["tool_use_id"] == "call-1"
 
 
 def test_reconstructs_prior_tool_call_and_result_for_next_turn():

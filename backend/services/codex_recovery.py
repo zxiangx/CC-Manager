@@ -26,6 +26,23 @@ def request_blocked_replay_prompt(message: object) -> str:
     return f"{request}\n\n{REQUEST_BLOCKED_REPLAY_HINT}"
 
 
+def request_blocked_replay_prompt_with_summary(
+    message: object,
+    sanitized_summary: object,
+) -> str:
+    """Replay a request with a separately sanitized tool-output summary."""
+
+    request = str(message or "").strip()
+    summary = str(sanitized_summary or "").strip()
+    if not request and not summary:
+        return REQUEST_BLOCKED_REPLAY_HINT
+    if not summary:
+        return request_blocked_replay_prompt(request)
+    if not request:
+        return summary
+    return f"{request}\n\n{summary}\n\n{REQUEST_BLOCKED_REPLAY_HINT}"
+
+
 def _matches_request_blocked_message(message: object) -> bool:
     normalized = " ".join(str(message or "").lower().split())
     return (

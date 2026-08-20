@@ -1342,8 +1342,8 @@ class CodexActualTierProxy:
         """Serve one GLM Codex turn through Apex's Anthropic endpoint."""
 
         from backend.services.codex_glm_adapter import (
+            AnthropicMessagesStreamAdapter,
             CodexGlmAdapterError,
-            anthropic_message_to_responses_sse,
             responses_request_to_anthropic,
         )
 
@@ -1365,7 +1365,7 @@ class CodexActualTierProxy:
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
-                "accept": "application/json",
+                "accept": "text/event-stream",
                 "accept-encoding": "identity",
             },
             content=json.dumps(
@@ -1376,12 +1376,14 @@ class CodexActualTierProxy:
         )
         upstream = await client.send(request, stream=True)
         try:
-            raw = bytearray()
-            async for chunk in _iter_response_raw(upstream):
-                raw.extend(chunk)
-                if len(raw) > _MAX_ERROR_BODY_BYTES:
-                    raise CodexGlmAdapterError("Apex GLM response is too large")
             if upstream.status_code < 200 or upstream.status_code >= 300:
+                raw = bytearray()
+                async for chunk in _iter_response_raw(upstream):
+                    raw.extend(chunk)
+                    if len(raw) > _MAX_ERROR_BODY_BYTES:
+                        raise CodexGlmAdapterError(
+                            "Apex GLM error response is too large"
+                        )
                 await self._send_response(
                     writer,
                     upstream.status_code,
@@ -1389,23 +1391,47 @@ class CodexActualTierProxy:
                     bytes(raw),
                 )
                 return
-            try:
-                message = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise CodexGlmAdapterError("Invalid Apex GLM response") from exc
-            converted = anthropic_message_to_responses_sse(
-                message,
-                tool_kinds=tool_kinds,
-            )
-            await self._send_response(
-                writer,
-                200,
-                [
-                    ("Content-Type", "text/event-stream; charset=utf-8"),
-                    ("Cache-Control", "no-cache"),
-                ],
-                converted,
-            )
+            encoding = upstream.headers.get("content-encoding", "identity").lower()
+            if encoding not in {"", "identity"}:
+                raise CodexGlmAdapterError(
+                    "Compressed Apex GLM stream cannot be translated"
+                )
+            content_type = upstream.headers.get("content-type", "").lower()
+            if "text/event-stream" not in content_type:
+                raise CodexGlmAdapterError(
+                    "Apex GLM did not return an SSE stream"
+                )
+
+            adapter = AnthropicMessagesStreamAdapter(tool_kinds=tool_kinds)
+            parse_buffer = bytearray()
+            committed = False
+            async for chunk in _iter_response_raw(upstream):
+                parse_buffer.extend(chunk)
+                if len(parse_buffer) > _MAX_FIRST_EVENT_BYTES:
+                    raise CodexGlmAdapterError("Apex GLM SSE event is too large")
+                records, parse_buffer = _split_sse_events(parse_buffer)
+                for record in records:
+                    event = _parse_sse_json(record)
+                    if event is None:
+                        continue
+                    converted = adapter.feed(event)
+                    if not converted:
+                        continue
+                    if not committed:
+                        await self._send_stream_headers(
+                            writer,
+                            200,
+                            [
+                                ("Content-Type", "text/event-stream; charset=utf-8"),
+                                ("Cache-Control", "no-cache"),
+                            ],
+                        )
+                        committed = True
+                    writer.write(converted)
+                    await writer.drain()
+            if parse_buffer and bytes(parse_buffer).strip():
+                raise CodexGlmAdapterError("Incomplete Apex GLM SSE event")
+            adapter.finish()
         finally:
             await upstream.aclose()
 

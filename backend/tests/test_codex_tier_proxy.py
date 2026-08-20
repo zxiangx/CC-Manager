@@ -65,6 +65,37 @@ def _sse(*, tier: str | None, response_id: str = "resp-1") -> bytes:
     ).encode()
 
 
+def _anthropic_sse(*events: dict) -> bytes:
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+        for event in events
+    ).encode()
+
+
+def _glm_message_start() -> dict:
+    return {
+        "type": "message_start",
+        "message": {
+            "id": "msg-glm",
+            "model": "glm-5.3",
+            "content": [],
+            "usage": {"input_tokens": 5},
+        },
+    }
+
+
+class _GatedAnthropicStream(httpx.AsyncByteStream):
+    def __init__(self, first: bytes, second: bytes, release: asyncio.Event):
+        self.first = first
+        self.second = second
+        self.release = release
+
+    async def __aiter__(self):
+        yield self.first
+        await self.release.wait()
+        yield self.second
+
+
 async def _running_proxy(handler):
     proxy = CodexActualTierProxy(
         CodexTierProxyRoute("https://upstream.example/v1"),
@@ -82,13 +113,30 @@ async def test_apex_glm_route_translates_responses_to_messages():
         seen["url"] = str(request.url)
         seen["headers"] = dict(request.headers)
         seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={
-            "id": "msg-glm",
-            "model": "glm-5.3",
-            "stop_reason": "end_turn",
-            "content": [{"type": "text", "text": "GLM ready"}],
-            "usage": {"input_tokens": 5, "output_tokens": 2},
-        })
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_anthropic_sse(
+                _glm_message_start(),
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "GLM ready"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 2},
+                },
+                {"type": "message_stop"},
+            ),
+        )
 
     proxy = CodexActualTierProxy(
         CodexTierProxyRoute(
@@ -125,9 +173,95 @@ async def test_apex_glm_route_translates_responses_to_messages():
         assert seen["headers"]["x-api-key"] == "apex-secret"
         assert "authorization" not in seen["headers"]
         assert seen["headers"]["anthropic-version"] == "2023-06-01"
-        assert seen["body"]["stream"] is False
+        assert seen["body"]["stream"] is True
         assert seen["body"]["model"] == "glm-5.3"
+        assert seen["headers"]["accept"] == "text/event-stream"
     finally:
+        await proxy.close()
+
+
+@pytest.mark.asyncio
+async def test_apex_glm_route_forwards_delta_before_upstream_completion():
+    release = asyncio.Event()
+    first = _anthropic_sse(
+        _glm_message_start(),
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "first"},
+        },
+    )
+    second = _anthropic_sse(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": " second"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 2},
+        },
+        {"type": "message_stop"},
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_GatedAnthropicStream(first, second, release),
+        )
+
+    proxy = CodexActualTierProxy(
+        CodexTierProxyRoute(
+            "https://api.apexin.ai/v1",
+            provider_id="apexrouter",
+            built_in_openai=False,
+            glm_models=frozenset({"glm-5.3"}),
+        ),
+        http_transport=httpx.MockTransport(handler),
+    )
+    await proxy.start()
+    proxy.set_thread_tier("thread-1", "default")
+    try:
+        body = _request_body(model="glm-5.3", tier=None)
+        body["input"] = [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}],
+        }]
+        async with httpx.AsyncClient(trust_env=False) as client:
+            async with client.stream(
+                "POST",
+                f"{proxy.local_base_url}/responses",
+                headers={
+                    "x-client-request-id": "thread-1",
+                    "authorization": "Bearer apex-secret",
+                },
+                json=body,
+            ) as response:
+                iterator = response.aiter_bytes()
+                initial_parts = []
+                while b'response.output_text.delta' not in b"".join(initial_parts):
+                    initial_parts.append(
+                        await asyncio.wait_for(anext(iterator), timeout=1)
+                    )
+                initial = b"".join(initial_parts)
+                assert b'response.output_text.delta' in initial
+                assert b'"delta":"first"' in initial
+                assert b'response.completed' not in initial
+                release.set()
+                remainder = b"".join([chunk async for chunk in iterator])
+                assert b'"delta":" second"' in remainder
+                assert b'response.completed' in remainder
+    finally:
+        release.set()
         await proxy.close()
 
 

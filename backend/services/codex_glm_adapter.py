@@ -18,6 +18,11 @@ MAX_MAX_TOKENS = 131_072
 MAX_ITEMS = 4096
 MAX_TOOLS = 256
 MAX_TEXT_BYTES = 32 * 1024 * 1024
+# Apex's Anthropic-compatible endpoint accepts client-defined tools, but it
+# cannot execute OpenAI-hosted Responses tools.  Codex includes web_search in
+# its default catalog even when a turn never asks for it, so omit that one
+# known hosted capability while preserving every local harness tool.
+UNSUPPORTED_HOSTED_TOOL_TYPES = frozenset({"web_search"})
 
 
 class CodexGlmAdapterError(RuntimeError):
@@ -135,6 +140,8 @@ def responses_request_to_anthropic(
     for raw_tool in raw_tools:
         if not isinstance(raw_tool, dict):
             raise CodexGlmAdapterError("Invalid Codex tool")
+        if raw_tool.get("type") in UNSUPPORTED_HOSTED_TOOL_TYPES:
+            continue
         converted, kind = _tool_definition(raw_tool)
         if converted["name"] in tool_kinds:
             raise CodexGlmAdapterError("Duplicate Codex tool name")

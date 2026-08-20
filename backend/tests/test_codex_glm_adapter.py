@@ -68,6 +68,21 @@ def test_converts_instructions_messages_and_function_custom_tools():
     assert tool_kinds == {"read_file": "function", "apply_patch": "custom"}
 
 
+def test_omits_openai_hosted_web_search_but_keeps_local_tools():
+    payload, tool_kinds = responses_request_to_anthropic(_request(tools=[
+        {"type": "web_search", "external_web_access": True},
+        {
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run a command",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]))
+
+    assert [tool["name"] for tool in payload["tools"]] == ["exec_command"]
+    assert tool_kinds == {"exec_command": "function"}
+
+
 def test_reconstructs_prior_tool_call_and_result_for_next_turn():
     payload, tool_kinds = responses_request_to_anthropic(_request(
         tools=[{

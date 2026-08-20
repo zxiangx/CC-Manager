@@ -43,7 +43,9 @@ def _stream_message_start():
             "id": "msg-stream",
             "model": "glm-5.3",
             "content": [],
-            "usage": {"input_tokens": 11, "cache_read_input_tokens": 3},
+            # Apex sends placeholders here and the authoritative counts in
+            # the terminal message_delta.
+            "usage": {"input_tokens": 0, "output_tokens": 0},
         },
     }
 
@@ -81,7 +83,11 @@ def test_streams_text_deltas_before_message_completion():
     adapter.feed({
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn"},
-        "usage": {"output_tokens": 2},
+        "usage": {
+            "input_tokens": 11,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 3,
+        },
     })
     completed = _events(adapter.feed({"type": "message_stop"}))
     adapter.finish()

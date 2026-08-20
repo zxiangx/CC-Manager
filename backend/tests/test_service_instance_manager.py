@@ -11158,6 +11158,56 @@ async def test_process_event_codex_window_backfill(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_process_event_glm_overrides_generic_codex_context_window(db_factory):
+    """Custom-provider GLM must use its capability table, not Codex's generic window."""
+    async with db_factory() as db:
+        inst = Instance(name="glm-ctx-inst")
+        task = Task(title="glm ctx", provider="codex", model="glm-5.3")
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    event = {
+        "event_type": "system_event",
+        "role": None,
+        "content": "turn.completed",
+        "tool_name": None,
+        "tool_input": None,
+        "tool_output": None,
+        "raw_json": "{}",
+        "is_error": False,
+        "timestamp": "2024-01-01T00:00:00",
+        "context_usage": {
+            "input_tokens": 2_700,
+            "cache_read_input_tokens": 20_000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 500,
+            "total_input_tokens": 22_700,
+            "context_tokens": 23_200,
+            "context_window": 258_400,
+        },
+    }
+
+    await im._process_event(inst_id, task_id, event)
+
+    ctx_calls = [
+        call for call in broadcaster.broadcast.call_args_list
+        if call[0][0] == f"task:{task_id}"
+        and call[0][1].get("event_type") == "context_usage"
+    ]
+    assert len(ctx_calls) == 1
+    assert ctx_calls[0][0][1]["context_window"] == 204_800
+    async with db_factory() as db:
+        stored = await db.get(Task, task_id)
+        assert stored.context_window_usage["context_window"] == 204_800
+
+
+@pytest.mark.asyncio
 async def test_process_event_codex_exec_uses_rollout_last_usage(
     db_factory,
     tmp_path,

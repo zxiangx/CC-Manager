@@ -9858,6 +9858,28 @@ class InstanceManager:
                 context_usage["context_window"] = claude_context_window(model_name)
         if context_usage and task_id:
             async with self.db_factory() as db:
+                task_model = (
+                    await db.execute(
+                        select(Task.provider, Task.model).where(
+                            *task_event_predicates()
+                        )
+                    )
+                ).one_or_none()
+                if (
+                    task_model is not None
+                    and (task_model.provider or "").lower() == "codex"
+                    and (task_model.model or "").lower().startswith("glm-")
+                ):
+                    # Codex app-server assigns its generic custom-provider
+                    # window (currently 258,400) to GLM.  The selected CCM
+                    # model capability is authoritative for persistence,
+                    # compaction thresholds, and the frontend meter.
+                    from backend.services.codex_models import codex_context_window
+
+                    context_usage = dict(context_usage)
+                    context_usage["context_window"] = codex_context_window(
+                        task_model.model
+                    )
                 context_updated = await db.execute(
                     update(Task)
                     .where(*task_event_predicates())

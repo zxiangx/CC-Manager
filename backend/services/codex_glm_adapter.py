@@ -738,6 +738,14 @@ class AnthropicMessagesStreamAdapter:
         if usage is not None and not isinstance(usage, dict):
             raise CodexGlmAdapterError("Invalid Anthropic message_delta usage")
         usage = usage or {}
+        if "input_tokens" in usage:
+            self.input_tokens = self._token_count(
+                usage.get("input_tokens"), field="input token usage"
+            )
+        if "cache_read_input_tokens" in usage:
+            self.cached_tokens = self._token_count(
+                usage.get("cache_read_input_tokens"), field="cached token usage"
+            )
         if "output_tokens" in usage:
             self.output_tokens = self._token_count(
                 usage.get("output_tokens"), field="output token usage"

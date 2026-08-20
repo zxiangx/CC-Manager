@@ -1127,6 +1127,7 @@ async def test_context_usage_window_only_merges_into_stored(client, session_fact
 
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
+        "model": "gpt-5.6-sol",
     })
     task_id = create_resp.json()["id"]
 

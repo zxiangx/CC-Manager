@@ -1215,7 +1215,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/dispatcher.py` | `backend/tests/test_service_dispatcher.py` |
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
 | `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
-| `backend/services/codex_tool_sanitizer.py`（GLM request-blocked 输出脱敏） | `backend/tests/test_codex_tool_sanitizer.py` + `backend/tests/test_service_instance_manager.py::test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle` |
+| `backend/services/codex_tool_sanitizer.py` + `backend/services/instance_manager.py`（GLM request-blocked 输出脱敏/批次选择） | `backend/tests/test_codex_tool_sanitizer.py` + `backend/tests/test_request_blocked_tool_summary.py` + `backend/tests/test_service_instance_manager.py::test_codex_request_blocked_quarantines_thread_but_keeps_worker_idle` |
 | `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |

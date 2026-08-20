@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -7218,34 +7218,31 @@ class InstanceManager:
                 ).scalars().all()
                 if not rows:
                     return None
-                # Find the last contiguous result batch; if a model message or
-                # another user turn consumed it, its raw text is no longer the
-                # obvious trigger. Stay one-shot and do not guess in that case.
-                contiguous: list[LogEntry] = []
-                for row in rows:
-                    if contiguous and row.id != contiguous[-1].id - 1:
-                        break
-                    contiguous.append(row)
-                contiguous.reverse()
-                source_ids = {row.id for row in contiguous}
-                if source_ids:
-                    later = (
-                        await db.execute(
-                            select(LogEntry.id)
-                            .where(
-                                LogEntry.task_id == task_id,
-                                LogEntry.id > max(source_ids),
-                                LogEntry.id.not_in(source_ids),
-                                LogEntry.event_type.in_({
-                                    "user_message", "message", "tool_result"
-                                }),
-                            )
-                            .order_by(LogEntry.id)
-                            .limit(1)
+                # A terminal policy block follows the most recent model turn.
+                # Select every result after the last human input or completed
+                # assistant message. Tool calls themselves are separated by
+                # persisted tool_use rows, so result ids need not be adjacent.
+                # An intervening assistant message proves the model safely
+                # consumed an earlier result; a later user turn changes the
+                # triggering request. In either case stay conservative rather
+                # than guessing that stale output caused this failure.
+                boundary = (
+                    await db.execute(
+                        select(func.max(LogEntry.id))
+                        .where(
+                            LogEntry.task_id == task_id,
+                            LogEntry.event_type.in_({"user_message", "message"}),
+                            LogEntry.role.in_({"user", "assistant"}),
                         )
-                    ).scalar_one_or_none()
-                    if later is not None:
-                        return None
+                    )
+                ).scalar_one_or_none()
+                if boundary is None:
+                    boundary = -1
+                contiguous = [
+                    row for row in reversed(rows) if row.id > int(boundary)
+                ]
+                if not contiguous:
+                    return None
                 raw_rows = [
                     {
                         "id": row.id,

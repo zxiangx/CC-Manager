@@ -416,6 +416,7 @@ uv run alembic history         # 查看历史
 - **Goal 显式暂停/恢复（覆盖低延迟链路旧约定）**: 普通 Standard 消息不再表示恢复 Goal；`paused`、`blocked`、`usageLimited`、`budgetLimited` 和 complete 均保持原状态。只有用户 Goal 面板或主 Agent 的 `ccm_resume_goal` 产生的内部控制 continuation 才可执行 owner → `thread/goal/set active` → exact `turn/started` → steer。用户暂停会停止当前 turn，Agent 暂停让当前 turn 收尾；两者都保留 Goal 且阻止后续自动 push。
 - **Codex Goal lineage 闸门（覆盖旧的提前释放约定）**: active Goal 发现 native descendant 后必须立即以 `thread/goal/set paused` 阻止下一 root turn；旧 root identity 与 exact CCM owner 保留到全部 descendant 权威 idle，随后才释放 identity、恢复 Goal 并接住 Codex 原生 continuation。暂停/恢复 RPC 不可确认时持续持有 owner 重试，绝不能在 child 收尾时提前放行。
 - **注入消息编辑（覆盖旧的 inject 禁止约定）**: Fork/编辑允许真实人类 `source=inject` 消息。它不是原生 item 边界：新注入必须持久化 race-fenced `turn/steer` 回包的 exact turn id；旧注入取下一条普通用户消息前的首个可映射 native event 作为 containing turn，后续 Goal 自动 turn 不得造成假歧义。Fork 到 containing turn 的前一 completed turn，只回放映射到同一 containing turn 且位于注入前的用户输入；既无 exact id 又无安全后继事件时 409，禁止按消息序号或最后一个 Goal turn 猜测。Monitor/Sub-Agent/模型/tool/system 仍禁止编辑。
+- **助手回复 Side Fork 与活动折叠**: 已落库助手回复可用 exact native `turn_id` 从包含该回复的 completed turn 之后 fork；源 Task 即使有更新的 active turn 也不得阻止历史锚点。Side Task 标记 `ccm_side_branch` 且 archived，不参与普通 Task 列表/自动分享；前端只在明确删除时永久删除。聊天只在 turn 终态后折叠 commentary/thinking/tool/compact activity，当前运行过程保持展开，注入用户消息永远独立可见；选择助手正文只把 Markdown quote 写入 composer，不自动发送。
 
 ## 2026-08-13 global Codex routing and display time
 

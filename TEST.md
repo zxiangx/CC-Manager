@@ -657,6 +657,8 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_service_instance_manager.py::test_launch_codex_app_server_routes_turn_to_canonical_home` | `turn/start` 准入后把 exact native `thread_id + turn_id` 原子回写到对应用户消息，供压缩/换号后的 Fork 使用 |
 | `ChatView.test.tsx` unavailable Fork anchor 用例 | 无法证明原生边界的消息显示具体原因且不可选，Create fork 保持禁用 |
 | `ChatView.test.tsx` 消息编辑分支用例 | 已落库普通/注入用户消息的铅笔入口以 `message_branch=true` 创建 Fork；注入编辑从 containing turn 开头重放；`‹ n/m ›` 左右箭头加载对应 Task，而不是只替换显示文本 |
+| `test_api_chat_plan.py::test_assistant_fork_resolver_*` | 助手回复 Side Fork 使用包含该回复的已完成原生 turn，并复制到该 turn 的末尾；运行中 turn 明确返回 409 |
+| `ChatView.test.tsx` Side/activity/selection 用例 | 已完成回复按钮创建 archived Side Task 并持久化悬浮窗；完成过程与 compact 标志可折叠、运行中过程保持展开；选中文本只引用到 composer 而不自动发送 |
 | `ChatView.test.tsx` Live turn injection 用例 | 普通发送框在本地 Codex/Claude turn 运行时自动走 inject/steer，无模式开关；附件确认、失败保留和 Worker 队列回退保持不变 |
 | `test_codex_app_server.py::test_steer_turn_with_id_returns_the_exact_active_turn` / `test_registry_steer_with_id_preserves_exact_turn_identity` / `test_service_instance_manager.py::test_inject_codex_message_forwards_native_attachment_inputs` | Codex app-server → registry → InstanceManager 完整保留 race-fenced `turn/steer` 的 exact turn id，供注入日志持久化与后续编辑 |
 | 前端 `skillCapabilities.test.ts` | Claude 不变；Codex Monitor 仅在主 MCP 与 Monitor capability 均确认且任务为本地范围时开放，Worker/Shared/未知/kill switch 关闭时只保留安全子集 |

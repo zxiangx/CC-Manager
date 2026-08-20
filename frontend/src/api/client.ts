@@ -264,6 +264,9 @@ export interface Task {
     message_branch_version_id?: number;
     ccm_worker_managed_task?: boolean;
     ccm_user_skill_snapshots?: unknown[];
+    ccm_side_branch?: boolean;
+    side_parent_task_id?: number;
+    side_anchor_log_id?: number;
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -334,6 +337,8 @@ export interface ChatMessage {
   /** Native item metadata used for narrowly-scoped compatibility filtering. */
   native_item_type?: string | null;
   native_item_status?: string | null;
+  /** Codex presentation phase (for example commentary or final_answer). */
+  phase?: string | null;
   /** Stable per-turn identity and latest snapshot for a Codex plan checklist. */
   todo_id?: string | null;
   todo_explanation?: string | null;
@@ -355,7 +360,7 @@ export interface UserMessageIndexEntry {
 }
 
 export interface CodexForkAnchor {
-  type: 'initial' | 'latest' | 'user_message';
+  type: 'initial' | 'latest' | 'user_message' | 'assistant_message';
   id: number | null;
   content: string;
   timestamp: string | null;
@@ -1383,9 +1388,10 @@ export const api = {
     }),
   forkTask: (
     id: number,
-    anchor: { type: 'initial' | 'latest'; id?: never } | { type: 'user_message'; id: number },
+    anchor: { type: 'initial' | 'latest'; id?: never } | { type: 'user_message' | 'assistant_message'; id: number },
     title?: string,
     messageBranch = false,
+    sideBranch = false,
   ) =>
     request<Task>(`/api/tasks/${id}/fork`, {
       method: 'POST',
@@ -1393,6 +1399,7 @@ export const api = {
         anchor,
         ...(title?.trim() ? { title: title.trim() } : {}),
         ...(messageBranch ? { message_branch: true } : {}),
+        ...(sideBranch ? { side_branch: true } : {}),
       }),
     }),
   distillTask: (id: number, customInstruction?: string, expectedRouting?: TaskRoutingExpectation) =>

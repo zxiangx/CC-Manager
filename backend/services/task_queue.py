@@ -2,7 +2,7 @@ import errno
 import os
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, case, delete as sa_delete, func, select, update
+from sqlalchemy import DateTime, Float, and_, case, delete as sa_delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
@@ -21,12 +21,19 @@ PR_REVIEW_SUPERSEDED_METADATA_KEY = "pr_review_superseded"
 
 
 def _visible_task_predicate():
-    """Keep implementation-only edited-message Tasks out of the sidebar."""
+    """Keep implementation-only branch Tasks out of the sidebar."""
 
     hidden_branch_task_ids = select(MessageBranchVersion.task_id).where(
         MessageBranchVersion.ordinal > 0
     )
-    return Task.id.not_in(hidden_branch_task_ids)
+    side_branch = func.coalesce(
+        Task.metadata_["ccm_side_branch"].as_boolean(),
+        False,
+    )
+    return and_(
+        Task.id.not_in(hidden_branch_task_ids),
+        side_branch.is_(False),
+    )
 
 
 def _effective_task_status_expr():

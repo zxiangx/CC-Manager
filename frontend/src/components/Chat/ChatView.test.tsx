@@ -23,6 +23,7 @@ vi.mock('../../api/client', () => ({
     selectMessageBranchSession: vi.fn().mockResolvedValue({}),
     forkTask: vi.fn().mockResolvedValue({}),
     getTask: vi.fn().mockResolvedValue({}),
+    deleteTask: vi.fn().mockResolvedValue({ ok: true }),
     uploadImages: vi.fn().mockResolvedValue([]),
     listMonitorSessions: vi.fn().mockResolvedValue([]),
     getAskUserPending: vi.fn().mockResolvedValue({ pending: [] }),
@@ -193,7 +194,7 @@ describe('ChatView', () => {
   });
 
   describe('native context compaction', () => {
-    it('renders a durable context-compaction divider prominently', async () => {
+    it('folds a durable context-compaction divider into completed activity', async () => {
       (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([{
         id: 701,
         role: 'system',
@@ -217,10 +218,32 @@ describe('ChatView', () => {
         />,
       );
 
+      const activity = await screen.findByRole('button', { name: /Codex activity/ });
+      expect(activity).toHaveTextContent('context compacted');
+      expect(screen.queryByTestId('context-compaction-marker')).not.toBeInTheDocument();
+      await userEvent.click(activity);
       const marker = await screen.findByTestId('context-compaction-marker');
       expect(marker).toHaveAttribute('role', 'separator');
       expect(marker).toHaveTextContent('Context compacted · Automatic');
       expect(marker).toHaveTextContent('Codex compressed the active conversation history.');
+    });
+
+    it('keeps trailing activity expanded while Codex is still running', async () => {
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: 702,
+        role: 'assistant',
+        event_type: 'thinking',
+        content: 'Still investigating',
+        phase: 'commentary',
+        persisted: true,
+        is_error: false,
+        timestamp: null,
+      }]);
+
+      render(<ChatView task={makeTask({ provider: 'codex', status: 'executing' })} projects={projects} onBack={onBack} />);
+
+      expect(await screen.findByText('Still investigating')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Codex activity/ })).not.toBeInTheDocument();
     });
 
     it('starts Codex native compaction from the composer toolbar', async () => {
@@ -1610,6 +1633,75 @@ describe('ChatView', () => {
         );
         expect(onTaskForked).toHaveBeenCalledWith(forked);
       });
+    });
+
+    it('opens a persistent floating side conversation from an assistant response', async () => {
+      const task = makeTask({ id: 120, provider: 'codex', status: 'executing' });
+      const response: ChatMessage = {
+        id: 900,
+        role: 'assistant',
+        event_type: 'message',
+        content: 'Stable completed answer',
+        phase: 'final_answer',
+        turn_id: 'turn-stable',
+        persisted: true,
+        is_error: false,
+        timestamp: null,
+      };
+      const side = makeTask({
+        id: 121,
+        provider: 'codex',
+        status: 'completed',
+        title: 'Side of #120',
+        metadata_: { ccm_side_branch: true, side_parent_task_id: 120 },
+      });
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce([response]).mockResolvedValue([]);
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(side);
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await screen.findByText(response.content!);
+      await userEvent.click(screen.getByRole('button', { name: 'Open side conversation' }));
+
+      await waitFor(() => expect(api.forkTask).toHaveBeenCalledWith(
+        task.id,
+        { type: 'assistant_message', id: response.id },
+        `Side of #${task.id}`,
+        false,
+        true,
+      ));
+      expect(await screen.findByText(`Side conversation · #${side.id}`)).toBeInTheDocument();
+      expect(localStorage.getItem(`ccm-side-branch-${task.id}`)).toBe(String(side.id));
+    });
+
+    it('quotes selected assistant text into the composer without sending it', async () => {
+      const response: ChatMessage = {
+        id: 901,
+        role: 'assistant',
+        event_type: 'message',
+        content: 'select this phrase',
+        phase: 'final_answer',
+        turn_id: 'turn-1',
+        persisted: true,
+        is_error: false,
+        timestamp: null,
+      };
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([response]);
+      render(<ChatView task={makeTask({ provider: 'codex' })} projects={projects} onBack={onBack} />);
+
+      const text = await screen.findByText('select this phrase');
+      const textNode = text.firstChild!;
+      const selectionSpy = vi.spyOn(window, 'getSelection').mockReturnValue({
+        toString: () => 'this phrase',
+        anchorNode: textNode,
+        focusNode: textNode,
+      } as Selection);
+      fireEvent.mouseUp(text);
+      await userEvent.click(screen.getByRole('button', { name: 'Ask' }));
+
+      expect(screen.getByRole('textbox')).toHaveValue('> this phrase\n\n');
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      selectionSpy.mockRestore();
     });
 
     it('keeps Fork available while the source Codex session is executing', async () => {

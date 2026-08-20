@@ -38,12 +38,14 @@ interface ChatViewProps {
   onTaskUpdated?: () => void;
   onTaskForked?: (task: Task) => void;
   inline?: boolean;
+  sideMode?: boolean;
 }
 
 interface ChatRuntimeViewProps extends ChatViewProps {
   canonicalTask: Task;
   onInternalBranchSelected: (task: Task) => Promise<void>;
   onAutomaticBranchSelected: () => Promise<void>;
+  onOpenSideBranch?: (message: ChatMessage) => Promise<void>;
 }
 
 interface UserMessageNavigationItem {
@@ -144,6 +146,7 @@ function loadStoredUploadResults(key: string): UploadResult[] {
 
 type MessageGroup =
   | { type: 'tool-group'; messages: ChatMessage[] }
+  | { type: 'activity-group'; messages: ChatMessage[] }
   | { type: 'single'; message: ChatMessage };
 
 /** Deduplicate consecutive system events with the same event_type AND content.
@@ -168,9 +171,10 @@ function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
   return result;
 }
 
-function groupMessages(messages: ChatMessage[]): MessageGroup[] {
+function groupMessages(messages: ChatMessage[], keepTrailingActivityOpen = false): MessageGroup[] {
   const groups: MessageGroup[] = [];
   let toolBuf: ChatMessage[] = [];
+  let activityBuf: ChatMessage[] = [];
 
   const flushTools = () => {
     if (toolBuf.length > 0) {
@@ -179,16 +183,39 @@ function groupMessages(messages: ChatMessage[]): MessageGroup[] {
     }
   };
 
+  const pushLegacy = (items: ChatMessage[]) => {
+    for (const item of items) {
+      const isTool = item.event_type === 'tool_use' || item.event_type === 'tool_result';
+      if (isTool) toolBuf.push(item);
+      else {
+        flushTools();
+        groups.push({ type: 'single', message: item });
+      }
+    }
+    flushTools();
+  };
+
+  const flushActivity = (collapsed: boolean) => {
+    if (activityBuf.length === 0) return;
+    if (collapsed) groups.push({ type: 'activity-group', messages: [...activityBuf] });
+    else pushLegacy(activityBuf);
+    activityBuf = [];
+  };
+
   for (const msg of messages) {
-    const isTool = msg.event_type === 'tool_use' || msg.event_type === 'tool_result';
-    if (isTool) {
-      toolBuf.push(msg);
-    } else {
-      flushTools();
-      groups.push({ type: 'single', message: msg });
+    const isProcess = msg.phase === 'commentary' || [
+      'thinking', 'tool_use', 'tool_result', 'context_compaction',
+    ].includes(msg.event_type) || (
+      msg.event_type === 'system_event'
+      && (msg.content || '').startsWith('[Context compacted')
+    );
+    if (isProcess) activityBuf.push(msg);
+    else {
+      flushActivity(!keepTrailingActivityOpen);
+      pushLegacy([msg]);
     }
   }
-  flushTools();
+  flushActivity(!keepTrailingActivityOpen);
   return groups;
 }
 
@@ -257,11 +284,77 @@ function injectAttachments(uploadResults: UploadResult[]): InjectTaskAttachments
 }
 
 export function ChatView(props: ChatViewProps) {
-  const { task: canonicalTask } = props;
+  const { task: canonicalTask, sideMode = false } = props;
   const [runtimeSelection, setRuntimeSelection] = useState({
     canonicalTaskId: canonicalTask.id,
     task: canonicalTask,
   });
+  const sideStorageKey = `ccm-side-branch-${canonicalTask.id}`;
+  const [sideTask, setSideTask] = useState<Task | null>(null);
+  const [sideMinimized, setSideMinimized] = useState(false);
+  const [sideBusy, setSideBusy] = useState(false);
+  const [sideError, setSideError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (sideMode) return;
+    const stored = localStorage.getItem(sideStorageKey);
+    if (!stored) return;
+    const id = Number(stored);
+    if (!Number.isFinite(id)) return;
+    api.getTask(id).then(setSideTask).catch(() => {
+      localStorage.removeItem(sideStorageKey);
+    });
+  }, [sideMode, sideStorageKey]);
+
+  const openSideBranch = useCallback(async (message: ChatMessage) => {
+    if (sideBusy) return;
+    if (sideTask) {
+      setSideMinimized(false);
+      setSideError('Delete the current side conversation before opening another one.');
+      return;
+    }
+    setSideBusy(true);
+    setSideError(null);
+    try {
+      const created = await api.forkTask(
+        canonicalTask.id,
+        { type: 'assistant_message', id: message.id },
+        `Side of #${canonicalTask.id}`,
+        false,
+        true,
+      );
+      localStorage.setItem(sideStorageKey, String(created.id));
+      setSideTask(created);
+      setSideMinimized(false);
+    } catch (error) {
+      setSideError(error instanceof Error ? error.message : 'Could not create side conversation');
+    } finally {
+      setSideBusy(false);
+    }
+  }, [canonicalTask.id, sideBusy, sideStorageKey, sideTask]);
+
+  const deleteSideBranch = useCallback(async () => {
+    if (!sideTask || sideBusy) return;
+    setSideBusy(true);
+    setSideError(null);
+    try {
+      if (taskHasActiveStream(sideTask)) {
+        await api.stopTaskSession(sideTask.id).catch(() => undefined);
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const current = await api.getTask(sideTask.id).catch(() => null);
+          if (!current || !taskHasActiveStream(current)) break;
+          await new Promise((resolve) => window.setTimeout(resolve, 150));
+        }
+      }
+      await api.deleteTask(sideTask.id);
+      localStorage.removeItem(sideStorageKey);
+      setSideTask(null);
+    } catch (error) {
+      setSideError(error instanceof Error ? error.message : 'Could not delete side conversation');
+    } finally {
+      setSideBusy(false);
+    }
+  }, [sideBusy, sideStorageKey, sideTask]);
   const selectedTask = runtimeSelection.canonicalTaskId === canonicalTask.id
     ? runtimeSelection.task
     : canonicalTask;
@@ -310,6 +403,7 @@ export function ChatView(props: ChatViewProps) {
   }, [canonicalTask.id]);
 
   return (
+    <>
     <ChatRuntimeView
       key={runtimeTask.id}
       {...props}
@@ -317,7 +411,45 @@ export function ChatView(props: ChatViewProps) {
       canonicalTask={canonicalTask}
       onInternalBranchSelected={selectInternalBranch}
       onAutomaticBranchSelected={restoreMessageBranch}
+      onOpenSideBranch={sideMode ? undefined : openSideBranch}
     />
+    {!sideMode && sideTask && (
+      <div className={`fixed z-[70] right-3 bottom-3 sm:right-6 sm:bottom-6 overflow-hidden border border-indigo-400/30 bg-gray-950 shadow-2xl shadow-black/60 ${sideMinimized ? 'w-72 rounded-xl' : 'w-[min(92vw,560px)] h-[min(78vh,760px)] rounded-2xl'}`}>
+        <div className="h-10 px-3 flex items-center gap-2 border-b border-gray-800 bg-gray-900/95">
+          <GitBranch size={14} className="text-indigo-300" />
+          <span className="text-xs text-gray-200 truncate flex-1">Side conversation · #{sideTask.id}</span>
+          {sideBusy && <Loader2 size={13} className="animate-spin text-gray-400" />}
+          <button type="button" onClick={() => setSideMinimized((value) => !value)} className="p-1 text-gray-500 hover:text-gray-200" title={sideMinimized ? 'Restore side conversation' : 'Minimize side conversation'}>
+            {sideMinimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </button>
+          <button type="button" onClick={() => void deleteSideBranch()} disabled={sideBusy} className="p-1 text-gray-500 hover:text-red-300 disabled:opacity-40" title="Delete side conversation">
+            <X size={14} />
+          </button>
+        </div>
+        {!sideMinimized && (
+          <div className="h-[calc(100%_-_2.5rem)]">
+            <ChatView
+              task={sideTask}
+              projects={props.projects}
+              onBack={() => setSideMinimized(true)}
+              onTaskUpdated={async () => {
+                const refreshed = await api.getTask(sideTask.id);
+                setSideTask(refreshed);
+              }}
+              inline
+              sideMode
+            />
+          </div>
+        )}
+      </div>
+    )}
+    {!sideMode && sideError && (
+      <div className="fixed z-[75] right-3 bottom-16 sm:right-6 max-w-sm rounded-lg border border-red-500/30 bg-gray-950 px-3 py-2 text-xs text-red-300 shadow-xl">
+        <button type="button" onClick={() => setSideError(null)} className="float-right ml-2 text-gray-500 hover:text-gray-200" aria-label="Dismiss side conversation error"><X size={13} /></button>
+        {sideError}
+      </div>
+    )}
+    </>
   );
 }
 
@@ -330,7 +462,9 @@ function ChatRuntimeView({
   onTaskForked,
   onInternalBranchSelected,
   onAutomaticBranchSelected,
+  onOpenSideBranch,
   inline,
+  sideMode,
 }: ChatRuntimeViewProps) {
   const projectName = useMemo(() => {
     if (!canonicalTask.project_id) return null;
@@ -1662,7 +1796,19 @@ function ChatRuntimeView({
     && !workerManagedTask
   );
 
-  const grouped = useMemo(() => groupMessages(deduplicateSystemEvents(messages)), [messages]);
+  const grouped = useMemo(
+    () => groupMessages(deduplicateSystemEvents(messages), isProcessing),
+    [isProcessing, messages],
+  );
+  const askAboutSelection = useCallback((selection: string) => {
+    const quoted = selection
+      .trim()
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n');
+    setInput((current) => `${current ? `${current}\n\n` : ''}${quoted}\n\n`);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
 
   // Reset scroll flag when switching tasks
   const hasScrolledRef = useRef(false);
@@ -1674,6 +1820,7 @@ function ChatRuntimeView({
   // iOS Safari (especially PWA) ignores overflow:hidden on body — setting
   // position:fixed is the only reliable way to prevent background scrolling.
   useEffect(() => {
+    if (sideMode) return;
     const scrollY = window.scrollY;
     const { body } = document;
     body.style.position = 'fixed';
@@ -1689,7 +1836,7 @@ function ChatRuntimeView({
       body.style.overflow = '';
       window.scrollTo(0, scrollY);
     };
-  }, []);
+  }, [sideMode]);
 
 
   const loadMoreRef = useRef(loadMoreHistory);
@@ -1931,9 +2078,9 @@ function ChatRuntimeView({
     try {
       const forked = await api.forkTask(
         task.id,
-        selectedForkAnchor.type !== 'user_message'
+        selectedForkAnchor.type === 'initial' || selectedForkAnchor.type === 'latest'
           ? { type: selectedForkAnchor.type }
-          : { type: 'user_message', id: selectedForkAnchor.id! },
+          : { type: selectedForkAnchor.type, id: selectedForkAnchor.id! },
         forkTitle,
       );
       setForkOpen(false);
@@ -2695,6 +2842,12 @@ function ChatRuntimeView({
               messages={group.messages}
               taskId={task.id}
             />
+          ) : group.type === 'activity-group' ? (
+            <TurnActivityGroup
+              key={`activity-${group.messages[0]?.id ?? i}`}
+              messages={group.messages}
+              taskId={task.id}
+            />
           ) : (
             <MessageBubble
               key={group.message.id}
@@ -2728,6 +2881,8 @@ function ChatRuntimeView({
                 const branch = messageBranchByLogId.get(group.message.id);
                 if (branch) void switchMessageBranch(branch, index);
               }}
+              onAskSelection={askAboutSelection}
+              onOpenSideBranch={onOpenSideBranch}
             />
           )
         )}
@@ -3232,6 +3387,58 @@ function ToolGroup({
         <div className="ml-3 border-l border-gray-800 pl-3 space-y-1 mt-1">
           {messages.map((msg) => (
             <ToolItem key={msg.id} message={msg} taskId={taskId} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TurnActivityGroup({ messages, taskId }: { messages: ChatMessage[]; taskId: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const toolCount = messages.filter((message) => message.event_type === 'tool_use').length;
+  const compacted = messages.some((message) => (
+    message.event_type === 'context_compaction'
+    || (message.content || '').startsWith('[Context compacted')
+  ));
+  const hasError = messages.some((message) => message.is_error);
+
+  return (
+    <div className="mx-4 rounded-lg border border-gray-800/80 bg-gray-900/35">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs text-gray-500 hover:text-gray-300"
+        aria-expanded={expanded}
+      >
+        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="text-gray-400">Codex activity</span>
+        <span>{messages.length} steps</span>
+        {toolCount > 0 && <span>· {toolCount} tools</span>}
+        {compacted && <span className="text-emerald-400/80">· context compacted</span>}
+        {hasError && <span className="text-red-400/80">· error</span>}
+      </button>
+      {expanded && (
+        <div className="space-y-2 border-t border-gray-800 px-1 py-2">
+          {messages.map((message) => (
+            message.event_type === 'tool_use' || message.event_type === 'tool_result'
+              ? <ToolItem key={message.id} message={message} taskId={taskId} />
+              : <MessageBubble
+                  key={message.id}
+                  message={message}
+                  taskId={taskId}
+                  branch={null}
+                  canEditBranch={false}
+                  editingBranch={false}
+                  editDraft=""
+                  editSubmitting={false}
+                  switchingBranch={false}
+                  onEditBranch={() => undefined}
+                  onEditDraftChange={() => undefined}
+                  onSubmitEdit={() => undefined}
+                  onCancelEdit={() => undefined}
+                  onSwitchBranch={() => undefined}
+                />
           ))}
         </div>
       )}
@@ -3853,6 +4060,8 @@ const MessageBubble = memo(function MessageBubble({
   onSubmitEdit,
   onCancelEdit,
   onSwitchBranch,
+  onAskSelection,
+  onOpenSideBranch,
 }: {
   message: ChatMessage;
   taskId: number;
@@ -3868,8 +4077,36 @@ const MessageBubble = memo(function MessageBubble({
   onSubmitEdit: () => void;
   onCancelEdit: () => void;
   onSwitchBranch: (index: number) => void;
+  onAskSelection?: (selection: string) => void;
+  onOpenSideBranch?: (message: ChatMessage) => Promise<void>;
 }) {
   const isUser = message.role === 'user';
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const [selectedText, setSelectedText] = useState('');
+  const [openingSide, setOpeningSide] = useState(false);
+  const canOpenSide = (
+    !isUser
+    && message.persisted === true
+    && Boolean(message.turn_id)
+    && ['message', 'result'].includes(message.event_type)
+    && message.phase !== 'commentary'
+  );
+
+  const captureSelection = () => {
+    if (isUser || !onAskSelection) return;
+    const selection = window.getSelection();
+    const text = selection?.toString().trim() || '';
+    const anchorNode = selection?.anchorNode;
+    const focusNode = selection?.focusNode;
+    if (
+      text
+      && anchorNode
+      && focusNode
+      && bubbleRef.current?.contains(anchorNode)
+      && bubbleRef.current?.contains(focusNode)
+    ) setSelectedText(text);
+    else setSelectedText('');
+  };
 
   if (message.event_type === 'permission_request') {
     return <PermissionCard message={message} taskId={taskId} />;
@@ -4064,6 +4301,8 @@ const MessageBubble = memo(function MessageBubble({
 
   return (
     <div
+      ref={bubbleRef}
+      onMouseUp={captureSelection}
       className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
       {...(isUser ? {
         'data-user-msg': '',
@@ -4137,6 +4376,32 @@ const MessageBubble = memo(function MessageBubble({
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} />}
           {message.content && <MessageCopyButton text={isUser ? (message.raw_content ?? stripSenderPrefix(message.content)) : message.content} />}
+          {!isUser && selectedText && onAskSelection && (
+            <button
+              type="button"
+              onClick={() => { onAskSelection(selectedText); setSelectedText(''); }}
+              className="px-1.5 py-0.5 rounded text-[11px] text-indigo-300 hover:bg-indigo-500/10"
+              title="Ask Codex about selected text"
+            >
+              Ask
+            </button>
+          )}
+          {canOpenSide && onOpenSideBranch && (
+            <button
+              type="button"
+              disabled={openingSide}
+              onClick={async () => {
+                setOpeningSide(true);
+                try { await onOpenSideBranch(message); }
+                finally { setOpeningSide(false); }
+              }}
+              className="copy-btn opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto p-1 rounded hover:bg-indigo-500/10 text-gray-600 hover:text-indigo-300 transition-opacity disabled:opacity-40"
+              title="Open side conversation from this response"
+              aria-label="Open side conversation"
+            >
+              {openingSide ? <Loader2 size={14} className="animate-spin" /> : <GitBranch size={14} />}
+            </button>
+          )}
           {isUser && (!message.source || message.source === 'inject') && (
             <MessageBranchControls
               branch={branch}

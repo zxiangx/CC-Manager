@@ -101,13 +101,15 @@ class ChatMessage(BaseModel):
 
 
 class ForkAnchor(BaseModel):
-    type: Literal["initial", "latest", "user_message"]
+    type: Literal["initial", "latest", "user_message", "assistant_message"]
     id: int | None = None
 
     @model_validator(mode="after")
     def validate_anchor(self):
-        if self.type == "user_message" and (self.id is None or self.id <= 0):
-            raise ValueError("user message fork anchors require a positive id")
+        if self.type in {"user_message", "assistant_message"} and (
+            self.id is None or self.id <= 0
+        ):
+            raise ValueError(f"{self.type} fork anchors require a positive id")
         if self.type in {"initial", "latest"} and self.id is not None:
             raise ValueError(f"{self.type} fork anchors cannot include an id")
         return self
@@ -117,11 +119,14 @@ class CodexForkRequest(BaseModel):
     anchor: ForkAnchor
     title: str | None = None
     message_branch: bool = False
+    side_branch: bool = False
 
     @model_validator(mode="after")
     def validate_message_branch(self):
         if self.message_branch and self.anchor.type == "latest":
             raise ValueError("full-copy forks cannot be message branches")
+        if self.message_branch and self.side_branch:
+            raise ValueError("message branches and side branches are mutually exclusive")
         return self
 
 
@@ -524,6 +529,47 @@ def _resolve_fork_turn(
         raise HTTPException(409, "The preceding Codex turn is still running")
 
     return target_turn_id, selected.id - 1
+
+
+def _resolve_assistant_fork_turn(
+    *,
+    anchor: ForkAnchor,
+    rows: list[LogEntry],
+    turns: list[dict],
+    index: "_ForkTurnIndex | None" = None,
+) -> tuple[str, int]:
+    """Resolve the completed native turn containing an assistant response."""
+
+    resolved_index = index or _build_fork_turn_index(rows, turns)
+    selected_index = resolved_index.row_index.get(anchor.id)
+    if selected_index is None:
+        raise HTTPException(404, "Fork anchor response not found")
+    selected = rows[selected_index]
+    if selected.role == "user" or selected.event_type not in {"message", "result"}:
+        raise HTTPException(400, "Side forks require an assistant response")
+
+    selected_turn_id = resolved_index.row_turns.get(selected.id)
+    if selected_turn_id is None:
+        raise HTTPException(
+            409,
+            "This assistant response cannot be mapped safely to one Codex turn",
+        )
+    turn_position = resolved_index.turn_index.get(selected_turn_id)
+    if turn_position is None:
+        raise HTTPException(409, "The response turn is no longer available")
+    status = str(turns[turn_position].get("status") or "")
+    if status in {"inProgress", "in_progress", "running"}:
+        raise HTTPException(409, "Wait for this response to finish before forking")
+
+    # Copy every CCM row belonging to the completed turn, including its final
+    # answer/compaction marker, but never copy the next human instruction.
+    cutoff = selected.id
+    for candidate in rows[selected_index + 1:]:
+        if _is_ordinary_user_message(candidate):
+            break
+        if resolved_index.row_turns.get(candidate.id) == selected_turn_id:
+            cutoff = candidate.id
+    return selected_turn_id, cutoff
 
 
 @dataclass(frozen=True)
@@ -1389,22 +1435,23 @@ async def fork_codex_task(
             raise HTTPException(404, "Initial prompt not found")
         seed_message = source.description
         selected_metadata = source.metadata_ or {}
-    elif body.anchor.type == "user_message":
+    elif body.anchor.type in {"user_message", "assistant_message"}:
         selected = next(
             (row for row in rows if row.id == body.anchor.id),
             None,
         )
         if selected is None:
             raise HTTPException(404, "Fork anchor message not found")
-        if not _is_forkable_user_message(selected):
-            raise HTTPException(
-                400,
-                "Fork anchors must be human user messages",
-            )
+        if body.anchor.type == "user_message":
+            if not _is_forkable_user_message(selected):
+                raise HTTPException(400, "Fork anchors must be human user messages")
+        elif selected.role == "user" or selected.event_type not in {"message", "result"}:
+            raise HTTPException(400, "Side forks require an assistant response")
         selected_metadata = _raw_log_metadata(selected)
-        seed_message = (
-            selected_metadata.get("raw_content") or selected.content or ""
-        )
+        if body.anchor.type == "user_message":
+            seed_message = (
+                selected_metadata.get("raw_content") or selected.content or ""
+            )
 
     native_source = source
     native_rows = rows
@@ -1461,6 +1508,13 @@ async def fork_codex_task(
             ]
             if body.anchor.type == "latest":
                 last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
+            elif body.anchor.type == "assistant_message":
+                last_turn_id, cutoff = await asyncio.to_thread(
+                    _resolve_assistant_fork_turn,
+                    anchor=native_anchor,
+                    rows=native_rows,
+                    turns=turns,
+                )
             else:
                 native_selected = next(
                     row for row in native_rows if row.id == native_anchor.id
@@ -1509,13 +1563,23 @@ async def fork_codex_task(
             metadata["codex_account_id"] = account_id
         metadata["forked_from_task_id"] = source.id
         metadata["forked_from_log_id"] = (
-            body.anchor.id if body.anchor.type == "user_message" else None
+            body.anchor.id
+            if body.anchor.type in {"user_message", "assistant_message"}
+            else None
         )
         metadata["forked_from_turn_id"] = last_turn_id
         metadata["forked_from_native_task_id"] = native_source.id
         metadata["fork_mode"] = (
             "full_copy" if body.anchor.type == "latest" else "branch"
         )
+        if body.side_branch:
+            metadata["ccm_side_branch"] = True
+            metadata["side_parent_task_id"] = source.id
+            metadata["side_anchor_log_id"] = body.anchor.id
+        else:
+            metadata.pop("ccm_side_branch", None)
+            metadata.pop("side_parent_task_id", None)
+            metadata.pop("side_anchor_log_id", None)
         if seed_message is not None:
             metadata["fork_seed_message"] = seed_message
             metadata["fork_seed_log_id"] = (
@@ -1574,6 +1638,7 @@ async def fork_codex_task(
             selected_user_skills=deepcopy(source.selected_user_skills),
             tags=deepcopy(source.tags),
             attention_tag=source.attention_tag,
+            archived=body.side_branch,
             metadata_=metadata,
             message_branch_root_task_id=(
                 source.message_branch_root_task_id or source.id
@@ -1705,7 +1770,7 @@ async def fork_codex_task(
             cleanup.result()
         raise
 
-    if forked_task.project_id and not body.message_branch:
+    if forked_task.project_id and not body.message_branch and not body.side_branch:
         try:
             from backend.services.task_sharing import auto_share_new_task
             await auto_share_new_task(
@@ -2159,6 +2224,7 @@ async def get_chat_history(
         turn_id = None
         native_item_type = None
         native_item_status = None
+        phase = None
         todo_id = None
         todo_explanation = None
         todo_items = None
@@ -2191,6 +2257,10 @@ async def get_chat_history(
                             if item_status not in (None, "")
                             else None
                         )
+                    raw_phase = raw.get("phase")
+                    if raw_phase in (None, "") and isinstance(item, dict):
+                        raw_phase = item.get("phase")
+                    phase = str(raw_phase) if raw_phase not in (None, "") else None
                     if row.event_type == "todo_list":
                         raw_todo_id = raw.get("todo_id")
                         todo_id = (
@@ -2255,6 +2325,7 @@ async def get_chat_history(
             "turn_id": turn_id,
             "native_item_type": native_item_type,
             "native_item_status": native_item_status,
+            "phase": phase,
             "todo_id": todo_id,
             "todo_explanation": todo_explanation,
             "todo_items": todo_items,

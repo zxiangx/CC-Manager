@@ -825,6 +825,99 @@ def test_codex_fork_resolver_does_not_guess_by_message_ordinal():
     )
 
 
+def test_assistant_fork_resolver_uses_containing_completed_turn_and_full_cutoff():
+    from backend.api.chat import ForkAnchor, _resolve_assistant_fork_turn
+
+    rows = [
+        LogEntry(id=1, event_type="user_message", role="user", content="do it", is_error=False),
+        LogEntry(
+            id=2,
+            event_type="message",
+            role="assistant",
+            content="working",
+            raw_json='{"turn_id":"turn-1","phase":"commentary"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=3,
+            event_type="message",
+            role="assistant",
+            content="done",
+            raw_json='{"turn_id":"turn-1","phase":"final_answer"}',
+            is_error=False,
+        ),
+        LogEntry(
+            id=4,
+            event_type="system_event",
+            role="system",
+            content="turn.completed",
+            raw_json='{"turn_id":"turn-1","type":"turn.completed"}',
+            is_error=False,
+        ),
+        LogEntry(id=5, event_type="user_message", role="user", content="next", is_error=False),
+    ]
+
+    turn_id, cutoff = _resolve_assistant_fork_turn(
+        anchor=ForkAnchor(type="assistant_message", id=3),
+        rows=rows,
+        turns=[{"id": "turn-1", "status": "completed"}],
+    )
+
+    assert turn_id == "turn-1"
+    assert cutoff == 4
+
+
+def test_assistant_fork_resolver_rejects_running_turn():
+    from backend.api.chat import ForkAnchor, _resolve_assistant_fork_turn
+
+    rows = [LogEntry(
+        id=1,
+        event_type="message",
+        role="assistant",
+        content="still working",
+        raw_json='{"turn_id":"turn-live"}',
+        is_error=False,
+    )]
+
+    with pytest.raises(HTTPException) as exc_info:
+        _resolve_assistant_fork_turn(
+            anchor=ForkAnchor(type="assistant_message", id=1),
+            rows=rows,
+            turns=[{"id": "turn-live", "status": "inProgress"}],
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_side_branch_tasks_stay_out_of_all_sidebar_lists(client, session_factory):
+    async with session_factory() as db:
+        visible = Task(
+            title="Main",
+            description="main",
+            status="completed",
+            provider="codex",
+            archived=False,
+        )
+        side = Task(
+            title="Side",
+            description=None,
+            status="completed",
+            provider="codex",
+            archived=True,
+            metadata_={"ccm_side_branch": True, "side_parent_task_id": 1},
+        )
+        db.add_all([visible, side])
+        await db.commit()
+        await db.refresh(visible)
+
+    listed = (await client.get("/api/tasks?include_archived=true")).json()
+    assert [task["id"] for task in listed] == [visible.id]
+    assert (await client.get(
+        "/api/tasks/count?include_archived=true"
+    )).json() == {"total": 1}
+
+
 def test_codex_fork_turn_index_is_reused_across_anchors():
     from backend.api.chat import (
         ForkAnchor,

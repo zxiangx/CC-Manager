@@ -1356,7 +1356,14 @@ class CodexActualTierProxy:
             or len(api_key.encode("utf-8")) > _MAX_AUTH_BYTES
         ):
             raise CodexGlmAdapterError("Missing Apex bearer credential")
-        payload, tool_kinds = responses_request_to_anthropic(request_body)
+        try:
+            payload, tool_kinds = responses_request_to_anthropic(request_body)
+        except CodexGlmAdapterError as exc:
+            # Adapter request errors are fixed validation messages and never
+            # include prompt/tool contents.  Keep the reason observable so a
+            # local conversion bug is not mistaken for an Apex/tier outage.
+            logger.warning("Codex GLM request conversion failed: %s", exc)
+            raise
         upstream_url = f"{self.route.upstream_base_url.rstrip('/')}/messages"
         request = client.build_request(
             "POST",

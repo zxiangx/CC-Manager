@@ -121,6 +121,23 @@ def _namespace_tool_name(namespace: str, name: str) -> str:
     return f"namespace_{digest}__{suffix}"[:128]
 
 
+def _historical_tool_name(name: str) -> str:
+    """Return a safe Anthropic name for a call replayed from Codex history.
+
+    Codex's pre-sampling compaction requests intentionally omit the current
+    tool catalog while retaining historical function_call items.  Those calls
+    are context, not tools the model may invoke in this request, so conversion
+    must not require a live definition for them.
+    """
+
+    if not name or len(name) > 128:
+        raise CodexGlmAdapterError("Invalid historical tool call name")
+    normalized = _ANTHROPIC_TOOL_NAME_RE.sub("_", name)
+    if not normalized:
+        raise CodexGlmAdapterError("Invalid historical tool call name")
+    return normalized
+
+
 def _tool_input(item: dict[str, Any], kind: str) -> dict[str, Any]:
     if kind == "custom":
         return {"input": _bounded_text(item.get("input", ""), field="custom tool input")}
@@ -251,8 +268,20 @@ def responses_request_to_anthropic(
             )
             route = tool_kinds.get(lookup_name) if isinstance(lookup_name, str) else None
             route_kind = route.get("kind") if isinstance(route, dict) else route
-            if not isinstance(name, str) or route is None:
-                raise CodexGlmAdapterError("Unknown tool call name")
+            if not isinstance(name, str):
+                raise CodexGlmAdapterError("Invalid historical tool call name")
+            if route is None:
+                # Cold-resume/pre-sampling compact requests preserve historical
+                # calls but omit tools because the model cannot call anything
+                # during compaction.  Keep the historical call/result pair in
+                # context without adding it to tool_kinds, which remains the
+                # allow-list for new model-emitted tool calls.
+                lookup_name = (
+                    _namespace_tool_name(namespace, name)
+                    if isinstance(namespace, str)
+                    else _historical_tool_name(name)
+                )
+                route_kind = kind
             if route_kind != kind:
                 raise CodexGlmAdapterError("Tool call type mismatch")
             if not isinstance(call_id, str) or not call_id:

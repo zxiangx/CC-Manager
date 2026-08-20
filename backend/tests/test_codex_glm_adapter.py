@@ -308,6 +308,61 @@ def test_replays_namespace_tool_call_and_result():
     assert payload["messages"][2]["content"][0]["tool_use_id"] == "call-1"
 
 
+def test_replays_historical_tool_pairs_when_compaction_omits_tool_catalog():
+    payload, tool_kinds = responses_request_to_anthropic(_request(
+        tools=[],
+        input_items=[
+            {"type": "message", "role": "user", "content": "Earlier request"},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call-history",
+                "arguments": '{"cmd":"true"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-history",
+                "output": "completed",
+            },
+            {"type": "message", "role": "user", "content": "Compact now"},
+        ],
+    ))
+
+    assert "tools" not in payload
+    assert tool_kinds == {}
+    assert payload["messages"][1]["content"][0] == {
+        "type": "tool_use",
+        "id": "call-history",
+        "name": "exec_command",
+        "input": {"cmd": "true"},
+    }
+    assert payload["messages"][2]["content"][0] == {
+        "type": "tool_result",
+        "tool_use_id": "call-history",
+        "content": "completed",
+    }
+
+
+def test_live_tool_definition_still_enforces_call_kind():
+    with pytest.raises(CodexGlmAdapterError, match="Tool call type mismatch"):
+        responses_request_to_anthropic(_request(
+            tools=[{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+            }],
+            input_items=[
+                {"type": "message", "role": "user", "content": "Patch"},
+                {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "call_id": "call-wrong-kind",
+                    "arguments": "{}",
+                },
+            ],
+        ))
+
+
 def test_reconstructs_prior_tool_call_and_result_for_next_turn():
     payload, tool_kinds = responses_request_to_anthropic(_request(
         tools=[{

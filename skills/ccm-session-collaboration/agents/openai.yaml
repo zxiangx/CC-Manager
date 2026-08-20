@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCM Session Collaboration"
+  short_description: "Read and message other CCM tasks safely"
+  default_prompt: "Use CCM task tools to inspect or contact another CCM session."

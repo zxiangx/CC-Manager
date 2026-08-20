@@ -23,6 +23,14 @@ _GOAL_CONTROL_TOOL_NAMES = (
     "ccm_resume_goal",
     "ccm_update_goal",
 )
+_ACTIVE_TASK_STATUSES = frozenset({"in_progress", "executing"})
+_HISTORY_EVENT_TYPES = frozenset({
+    "user_message",
+    "message",
+    "result",
+    "system_event",
+    "process_exit",
+})
 
 
 def _api_url(path: str) -> str:
@@ -50,6 +58,49 @@ async def _get_task_data() -> dict:
         resp.raise_for_status()
         data = resp.json()
     return data if isinstance(data, dict) else {}
+
+
+def _can_access_peer_task(source: dict, target: dict) -> bool:
+    """Keep cross-task tools inside the source task owner's CCM workspace."""
+
+    if source.get("id") == target.get("id"):
+        return True
+    source_owner = source.get("created_by")
+    target_owner = target.get("created_by")
+    if source_owner is not None:
+        return source_owner == target_owner
+    # Legacy single-user tasks predate created_by. Keep those scoped to the
+    # same project and execution location instead of exposing every legacy row.
+    return (
+        target_owner is None
+        and source.get("project_id") == target.get("project_id")
+        and source.get("worker_id") == target.get("worker_id")
+    )
+
+
+async def _get_peer_task(task_id: int) -> tuple[dict, dict]:
+    source = await _get_task_data()
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(
+            f"{_API_BASE}/api/tasks/{task_id}",
+            headers=_headers(),
+        )
+        response.raise_for_status()
+        target = response.json()
+    if not isinstance(target, dict) or not _can_access_peer_task(source, target):
+        raise PermissionError(
+            f"Task #{task_id} is outside the current task owner's CCM workspace"
+        )
+    return source, target
+
+
+def _trim_text(value: object, limit: int = 12_000) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(truncated by CCM collaboration tool)"
 
 
 async def _monitor_enabled(task_data: dict) -> bool:
@@ -131,7 +182,7 @@ async def ccm_command_help() -> str:
             skill_list.append({
                 "name": name,
                 "description": skill.description.strip()[:150],
-                "enabled": enabled_skills.get(name, False),
+                "enabled": enabled_skills.get(name, False) or skill.ccm.always,
                 "commands": [c["name"] for c in skill.ccm.commands],
                 "type": "skill",
             })
@@ -144,6 +195,202 @@ async def ccm_command_help() -> str:
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def ccm_list_tasks(
+    query: str = "",
+    current_project_only: bool = True,
+    include_archived: bool = False,
+    limit: int = 50,
+) -> str:
+    """列出当前用户可访问的其他 CCM tasks，用于解析 #编号或标题。
+
+    这是 CCM 主会话之间协作的第一步。它列出既有 task，而不是创建
+    Sub-Agent 或新的 Codex thread。默认只返回当前 project 的 task。
+
+    Args:
+        query: 可选的标题或 #task-id 过滤文本。
+        current_project_only: 是否只看当前 task 所属 project。
+        include_archived: 是否包含已归档 task。
+        limit: 最多返回数量，范围 1-100。
+    """
+    try:
+        source = await _get_task_data()
+        safe_limit = max(1, min(int(limit), 100))
+        params = {
+            "include_archived": str(bool(include_archived)).lower(),
+            "limit": 100,
+            "offset": 0,
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                f"{_API_BASE}/api/tasks",
+                headers=_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+            candidates = response.json()
+        if not isinstance(candidates, list):
+            candidates = []
+
+        normalized_query = query.strip().lower().lstrip("#")
+        tasks = []
+        for task in candidates:
+            if not isinstance(task, dict) or not _can_access_peer_task(source, task):
+                continue
+            if (
+                current_project_only
+                and task.get("project_id") != source.get("project_id")
+            ):
+                continue
+            if normalized_query:
+                haystack = f"{task.get('id', '')} {task.get('title', '')}".lower()
+                if normalized_query not in haystack:
+                    continue
+            tasks.append({
+                "task_id": task.get("id"),
+                "title": task.get("title"),
+                "status": task.get("status"),
+                "provider": task.get("provider"),
+                "model": task.get("model"),
+                "project_id": task.get("project_id"),
+                "archived": bool(task.get("archived")),
+                "is_current_task": task.get("id") == _TASK_ID,
+                "updated_at": task.get("completed_at") or task.get("started_at")
+                or task.get("created_at"),
+            })
+            if len(tasks) >= safe_limit:
+                break
+        return json.dumps({
+            "success": True,
+            "current_task_id": _TASK_ID,
+            "tasks": tasks,
+            "count": len(tasks),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def ccm_read_task(
+    task_id: int,
+    limit: int = 100,
+    before_id: int = 0,
+    include_tool_events: bool = False,
+) -> str:
+    """读取另一个既有 CCM task 的对话记录，不会向它发送消息。
+
+    Args:
+        task_id: CCM 界面中的数字 task 编号（例如 #48 的 48）。
+        limit: 返回最近消息数量，范围 1-200。
+        before_id: 可选分页游标，只读取该消息 id 之前的内容。
+        include_tool_events: 是否包含工具调用摘要；深度排查时才开启。
+    """
+    try:
+        _, target = await _get_peer_task(int(task_id))
+        safe_limit = max(1, min(int(limit), 200))
+        params = {"compact": "true", "limit": safe_limit}
+        if before_id > 0:
+            params["before_id"] = int(before_id)
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{_API_BASE}/api/tasks/{task_id}/chat/history",
+                headers=_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+            history = response.json()
+        if not isinstance(history, list):
+            history = []
+
+        messages = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            event_type = item.get("event_type")
+            if not include_tool_events and event_type not in _HISTORY_EVENT_TYPES:
+                continue
+            messages.append({
+                "id": item.get("id"),
+                "role": item.get("role"),
+                "event_type": event_type,
+                "content": _trim_text(item.get("content")),
+                "tool_name": item.get("tool_name") if include_tool_events else None,
+                "tool_input": _trim_text(item.get("tool_input"), 2_000)
+                if include_tool_events else None,
+                "is_error": bool(item.get("is_error")),
+                "timestamp": item.get("timestamp"),
+                "source": item.get("source"),
+            })
+        return json.dumps({
+            "success": True,
+            "task": {
+                "task_id": target.get("id"),
+                "title": target.get("title"),
+                "status": target.get("status"),
+                "provider": target.get("provider"),
+                "model": target.get("model"),
+                "session_id": target.get("session_id"),
+                "error_message": target.get("error_message"),
+            },
+            "messages": messages,
+            "count": len(messages),
+            "oldest_message_id": messages[0].get("id") if messages else None,
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def ccm_send_task_message(task_id: int, message: str) -> str:
+    """向另一个既有 CCM task 发送用户明确要求的消息。
+
+    活跃 task 使用执行中注入，空闲 task 使用普通 follow-up。此工具不会
+    创建 Sub-Agent 或 fork。不要仅因“查看/分析另一个会话”而调用它。
+
+    Args:
+        task_id: 目标 CCM task 的数字编号。
+        message: 要原样交给目标 task 的自包含消息。
+    """
+    try:
+        if int(task_id) == _TASK_ID:
+            raise ValueError("Use the current conversation instead of messaging itself")
+        _, target = await _get_peer_task(int(task_id))
+        normalized_message = message.strip()
+        if not normalized_message:
+            raise ValueError("message must not be empty")
+
+        status = str(target.get("status") or "").lower()
+        endpoint = "inject" if status in _ACTIVE_TASK_STATUSES else "chat"
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{_API_BASE}/api/tasks/{task_id}/{endpoint}",
+                headers=_headers(),
+                json={"message": normalized_message},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        delivery = (
+            payload.get("delivery") or "inject"
+            if endpoint == "inject"
+            else "follow_up"
+        )
+        accepted = bool(payload.get("ok", True))
+        return json.dumps({
+            "success": accepted,
+            "task_id": int(task_id),
+            "title": target.get("title"),
+            "delivery": delivery,
+            "accepted": accepted,
+            "message": (
+                "Message accepted by the target CCM task."
+                if accepted
+                else "The target CCM task did not accept the message."
+            ),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
 @mcp.tool()

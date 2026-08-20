@@ -24,6 +24,101 @@ def test_mcp_server_tools_registered():
     assert "ccm_pause_goal" in names
     assert "ccm_resume_goal" in names
     assert "ccm_update_goal" in names
+    assert "ccm_list_tasks" in names
+    assert "ccm_read_task" in names
+    assert "ccm_send_task_message" in names
+
+
+def test_peer_task_access_is_owner_scoped_with_legacy_project_fallback():
+    assert mcp_mod._can_access_peer_task(
+        {"id": 42, "created_by": 7, "project_id": 1},
+        {"id": 48, "created_by": 7, "project_id": 2},
+    )
+    assert not mcp_mod._can_access_peer_task(
+        {"id": 42, "created_by": 7, "project_id": 1},
+        {"id": 48, "created_by": 8, "project_id": 1},
+    )
+    assert mcp_mod._can_access_peer_task(
+        {"id": 42, "created_by": None, "project_id": 1, "worker_id": None},
+        {"id": 48, "created_by": None, "project_id": 1, "worker_id": None},
+    )
+    assert not mcp_mod._can_access_peer_task(
+        {"id": 42, "created_by": None, "project_id": 1, "worker_id": None},
+        {"id": 48, "created_by": None, "project_id": 2, "worker_id": None},
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_filters_by_owner_project_and_query():
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = [
+        {"id": 48, "title": "Broken GLM", "status": "completed", "created_by": 7, "project_id": 3},
+        {"id": 49, "title": "Other project", "status": "completed", "created_by": 7, "project_id": 4},
+        {"id": 50, "title": "Other owner GLM", "status": "completed", "created_by": 8, "project_id": 3},
+    ]
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=response)
+
+    source = {"id": 42, "created_by": 7, "project_id": 3}
+    with patch.object(mcp_mod, "_get_task_data", AsyncMock(return_value=source)), patch(
+        "backend.mcp.ccm_skills_server.httpx.AsyncClient", return_value=client
+    ):
+        result = json.loads(await mcp_mod.ccm_list_tasks(query="GLM"))
+
+    assert result["success"] is True
+    assert [task["task_id"] for task in result["tasks"]] == [48]
+
+
+@pytest.mark.asyncio
+async def test_read_task_returns_conversation_without_tool_noise_by_default():
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = [
+        {"id": 1, "role": "user", "event_type": "user_message", "content": "check it"},
+        {"id": 2, "role": "assistant", "event_type": "tool_use", "tool_name": "Bash", "tool_input": "pwd"},
+        {"id": 3, "role": "assistant", "event_type": "message", "content": "fixed"},
+    ]
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=response)
+    target = {"id": 48, "title": "Broken GLM", "status": "completed"}
+
+    with patch.object(mcp_mod, "_get_peer_task", AsyncMock(return_value=({}, target))), patch(
+        "backend.mcp.ccm_skills_server.httpx.AsyncClient", return_value=client
+    ):
+        result = json.loads(await mcp_mod.ccm_read_task(48))
+
+    assert [message["id"] for message in result["messages"]] == [1, 3]
+    assert result["task"]["task_id"] == 48
+
+
+@pytest.mark.asyncio
+async def test_send_task_message_injects_into_active_target():
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {"ok": True, "delivery": "steer"}
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(return_value=response)
+    target = {"id": 48, "title": "Active", "status": "in_progress"}
+
+    with patch.object(mcp_mod, "_get_peer_task", AsyncMock(return_value=({}, target))), patch(
+        "backend.mcp.ccm_skills_server.httpx.AsyncClient", return_value=client
+    ):
+        result = json.loads(await mcp_mod.ccm_send_task_message(48, "report status"))
+
+    assert result["success"] is True
+    assert result["delivery"] == "steer"
+    client.post.assert_awaited_once_with(
+        "http://localhost:9999/api/tasks/48/inject",
+        headers={},
+        json={"message": "report status"},
+    )
 
 
 def test_goal_control_tools_are_removed_without_codex_launch_flag():

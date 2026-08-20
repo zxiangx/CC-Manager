@@ -89,7 +89,12 @@ def parse_skill(skill_md_path: Path) -> Skill | None:
     body = match.group(2).strip()
 
     # Parse CCM extension
-    ccm_raw = fm.get("ccm", {}) or {}
+    metadata_raw = fm.get("metadata", {}) or {}
+    ccm_raw = fm.get("ccm", {}) or (
+        metadata_raw.get("ccm", {})
+        if isinstance(metadata_raw, dict)
+        else {}
+    )
     ccm = SkillCCM(
         always=ccm_raw.get("always", False),
         priority=ccm_raw.get("priority", 0),

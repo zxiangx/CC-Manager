@@ -5,6 +5,32 @@ from unittest.mock import patch
 from backend.services import skill_loader
 
 
+def test_parse_skill_accepts_standard_metadata_ccm_extension(tmp_path):
+    skill_dir = tmp_path / "skills" / "peer"
+    skill_dir.mkdir(parents=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(
+        "---\n"
+        "name: peer\n"
+        "description: peer task guidance\n"
+        "metadata:\n"
+        "  ccm:\n"
+        "    always: true\n"
+        "    priority: 10\n"
+        "    tools: [ccm_read_task]\n"
+        "---\n"
+        "Read the peer first.\n",
+        encoding="utf-8",
+    )
+
+    skill = skill_loader.parse_skill(skill_path)
+
+    assert skill is not None
+    assert skill.ccm.always is True
+    assert skill.ccm.priority == 10
+    assert skill.ccm.tools == ["ccm_read_task"]
+
+
 def test_discover_skills_reuses_parsed_metadata_within_ttl(tmp_path):
     skill_dir = tmp_path / "repo" / "skills" / "fast-skill"
     skill_dir.mkdir(parents=True)

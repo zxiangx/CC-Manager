@@ -21,7 +21,13 @@ def _handler(request: httpx.Request) -> httpx.Response:
         "stop_reason": "end_turn",
         "content": [{
             "type": "text",
-            "text": "One command failed at fixture.py:77. Bearer abcdefghijklmnopqrstuv was exposed.",
+            "text": (
+                "Likely policy trigger: full traceback with expanded source "
+                "and model-provider protocol fields. Avoidance guidance: "
+                "rerun with --tb=short and inspect only the named fixture. "
+                "One command failed at fixture.py:77. Bearer "
+                "abcdefghijklmnopqrstuv was exposed."
+            ),
         }],
         "usage": {"input_tokens": 10, "output_tokens": 4},
     })
@@ -49,6 +55,8 @@ async def test_summarize_tool_outputs_with_glm_redacts_secrets_and_adds_audit():
     assert result.content.startswith("[CCM sanitized tool-output summary]")
     assert "Raw output log IDs: 524062" in result.content
     assert "do not rerun side-effecting commands" in result.content
+    assert "Likely policy trigger" in result.content
+    assert "Avoidance guidance" in result.content
 
 
 def test_sanitizer_prompt_treats_embedded_output_as_untrusted():
